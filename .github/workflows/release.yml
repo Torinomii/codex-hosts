@@ -1,4 +1,4 @@
-name: Build Windows release
+name: Build release
 
 on:
   workflow_dispatch:
@@ -10,7 +10,8 @@ permissions:
   contents: write
 
 jobs:
-  build-windows:
+  build-release:
+    name: Build release
     runs-on: windows-latest
 
     steps:
@@ -24,6 +25,33 @@ jobs:
           rustup default 1.92.0
           rustc --version
           cargo --version
+
+      - name: Resolve release tag from Cargo.toml
+        id: release
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $metadataJson = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo metadata failed"
+          }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $packages = @($metadata.packages | Where-Object { $_.name -eq "codex-hosts" })
+          if ($packages.Count -ne 1) {
+            throw "Expected exactly one codex-hosts package in Cargo metadata"
+          }
+          $tag = "v$($packages[0].version)"
+          if ($tag -notmatch '^v\d+\.\d+\.\d+$') {
+            throw "Cargo.toml version must use the MAJOR.MINOR.PATCH format"
+          }
+          if ($env:EVENT_NAME -eq "push" -and $env:REF_NAME -ne $tag) {
+            throw "Pushed tag '$env:REF_NAME' does not match Cargo.toml version tag '$tag'"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Output "Release tag: $tag"
 
       - name: Verify source
         shell: pwsh
@@ -103,14 +131,15 @@ jobs:
           archive: false
           if-no-files-found: error
 
-      - name: Publish tagged GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish GitHub Release
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >-
-          gh release create "${{ github.ref_name }}"
-          ".\dist\codex-hosts-windows-x86_64.zip"
-          --verify-tag
-          --generate-notes
-          --title "codex-hosts ${{ github.ref_name }}"
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          gh release create "$env:RELEASE_TAG" `
+            ".\dist\codex-hosts-windows-x86_64.zip" `
+            --target "$env:TARGET_SHA" `
+            --generate-notes `
+            --title "$env:RELEASE_TAG"
