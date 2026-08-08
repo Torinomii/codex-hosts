@@ -1,0 +1,28 @@
+[package]
+name = "codex-hosts"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+description = "A small, auditable GUI for stable Codex-managed SSH and Telnet hosts on Windows."
+readme = "README.md"
+build = "build.rs"
+
+[dependencies]
+eframe = { version = "0.35.0", default-features = false, features = ["wgpu"] }
+keyring = "4.1.6"
+russh = "0.62.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sys-locale = "0.3.2"
+thiserror = "2"
+tokio = { version = "1", features = ["net", "rt", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = "1"
+
+[build-dependencies]
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"

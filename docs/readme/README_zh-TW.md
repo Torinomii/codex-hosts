@@ -1,0 +1,85 @@
+# codex-hosts
+
+[English](../../README.md) | [简体中文](README_zh-CN.md) | [繁體中文](README_zh-TW.md) | [日本語](README_ja.md)
+
+`codex-hosts` 是供 Codex 使用的 Windows SSH / Telnet 主機管理工具，讓 Codex 不必接觸或輸入明文密碼即可安全地發起連線。
+
+![Codex Hosts 主視窗](../../Main.png)
+
+## 主要功能
+
+- 儲存別名、位址、連接埠、使用者名稱、通訊協定、驗證方式、選填私密金鑰路徑、已信任的 SSH 主機金鑰和選填跳板主機。
+- 支援 SSH 密碼與鍵盤互動驗證，以及含選填密碼片語的 OpenSSH 私密金鑰。
+- 密碼與私密金鑰密碼片語僅儲存在 Windows 認證管理員中。
+- 使用已儲存且驗證成功的 SSH 主機建立多層跳板鏈。
+- 可用於已明確接受風險的傳統 Telnet 環境；Telnet 認證與流量都不會加密。
+- Codex 可以預先建立指定別名的草稿並等候儲存、信任或取消，不必在對話中詢問認證。
+
+## 安裝
+
+### 下載 GitHub Actions Release
+
+預先建置的套件支援 64 位元 Windows 10 或更新版本。推送 `v*` 標籤後，GitHub 託管的 Windows runner 會建置 `codex-hosts-windows-x86_64.zip` 並發佈到 [Releases 頁面](https://github.com/Torinomii/codex-hosts/releases/latest)。手動啟動工作流程時，也可以從 [Actions 頁面](https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml)下載相同的 ZIP。
+
+這個最小 ZIP 只包含：
+
+- `bin\codex-hosts.exe`
+- `skill\codex-hosts\SKILL.md`
+- `skill\codex-hosts\agents\openai.yaml`
+
+可以直接執行 `bin\codex-hosts.exe`。安裝 Codex skill 時，請將 `skill\codex-hosts` 複製到 `%USERPROFILE%\.codex\skills\codex-hosts`，再將 EXE 複製到 `%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe`。
+
+### 從原始碼安裝
+
+原始碼建置需要 Rust 1.92 或更新版本以及 MSVC 工具鏈：
+
+```
+git clone https://github.com/Torinomii/codex-hosts.git
+cd codex-hosts
+cargo build --locked --release
+```
+
+將 `target\release\codex-hosts.exe` 複製到 `skill\codex-hosts\bin\codex-hosts.exe`，然後把完整的 `skill\codex-hosts` 目錄安裝為 `%USERPROFILE%\.codex\skills\codex-hosts`。
+
+### Codex 通用安裝提示詞
+
+```text
+請在這台 Windows 電腦上安裝 codex-hosts。優先從 https://github.com/Torinomii/codex-hosts/releases/latest 下載由 GitHub Actions 建置的最新 `codex-hosts-windows-x86_64.zip`。解壓縮後，將 `skill\codex-hosts` 複製到 `$env:USERPROFILE\.codex\skills\codex-hosts`，並將 `bin\codex-hosts.exe` 複製到 `$env:USERPROFILE\.codex\skills\codex-hosts\bin\codex-hosts.exe`；確認 EXE、`SKILL.md` 和 `agents\openai.yaml` 都存在。如果沒有相容的 Release，或我明確要求從原始碼安裝，則複製存放庫，使用 Rust 1.92 或更新版本及 MSVC 工具鏈執行 `cargo build --locked --release`，把建置出的 EXE 放到 `skill\codex-hosts\bin\codex-hosts.exe`，再安裝完整的 skill 目錄。不要在對話、命令列引數、指令碼、檔案或日誌中索取、儲存或回顯密碼或私密金鑰密碼片語；不要建立自動啟動項目、排程工作、服務或背景常駐程式。安裝後只啟動一次可見 GUI 進行驗收，並回報安裝來源、最終 EXE 路徑和檔案 SHA-256。
+```
+
+## Codex 整合
+
+存放庫在 `skill\codex-hosts` 中提供可攜式 Codex skill。安裝後，`SKILL.md` 會相對於已安裝的 skill 目錄尋找 `bin\codex-hosts.exe`，不需要修改與存放庫位置相關的絕對路徑。
+
+GUI 編輯模式允許傳入非機密的預填資訊：
+
+```
+.\bin\codex-hosts.exe --codex-edit `
+  --alias example `
+  --host server.example.com `
+  --port 22 `
+  --user operator `
+  --protocol ssh `
+  --auth password `
+  --result-file result.json
+```
+
+切勿透過對話、命令列引數、JSON、指令碼或日誌傳遞密碼或私密金鑰密碼片語。使用者只能在 GUI 的遮罩輸入欄位中輸入認證。
+
+工具模式透過同一個執行檔讀取不含認證的要求檔案並寫入結果檔案：
+
+```json
+{"action":"list_hosts"}
+{"action":"probe","alias":"example"}
+{"action":"exec","alias":"example","command":"hostname"}
+```
+
+`probe` 和 `exec` 可以針對單次作業設定 `connect_timeout_ms` 與 `command_timeout_ms`；不需要應用程式層級逾時時應省略。已儲存的主機不包含固定逾時值，遠端命令會原樣傳送，不會猜測遠端作業系統。
+
+## 安全界線
+
+- 密碼與私密金鑰密碼片語只會儲存在 Windows 認證管理員中，絕不會傳回 Codex。
+- SSH 指紋必須明確固定，應用程式不會自動取代。
+- 只有已驗證的 SSH 設定檔才能作為跳板；跳板鏈會檢查循環並限制為最多八台主機。
+- Telnet 是明文通訊協定，只應在明確接受該風險的受信任網路中使用。
+- 每個輸出資料流最多擷取一 MiB 的命令輸出。
