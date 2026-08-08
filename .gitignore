@@ -1,0 +1,7 @@
+/target/
+/dist/
+/bin/*.exe
+*.pdb
+*.tmp
+*.bak
+assist.md

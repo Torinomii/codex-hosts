@@ -1,0 +1,116 @@
+name: Build Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+
+      - name: Install Rust 1.92
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.92.0
+          rustc --version
+          cargo --version
+
+      - name: Verify source
+        shell: pwsh
+        run: |
+          cargo fmt --all --check
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Build release executable
+        shell: pwsh
+        run: cargo build --locked --release
+
+      - name: Create minimal distribution ZIP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stagingRoot = Join-Path $PWD "dist\staging"
+          $archivePath = Join-Path $PWD "dist\codex-hosts-windows-x86_64.zip"
+
+          if (Test-Path -LiteralPath $stagingRoot) {
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+          }
+          if (Test-Path -LiteralPath $archivePath) {
+            Remove-Item -LiteralPath $archivePath -Force
+          }
+
+          $binDirectory = Join-Path $stagingRoot "bin"
+          $skillDirectory = Join-Path $stagingRoot "skill\codex-hosts"
+          $agentDirectory = Join-Path $skillDirectory "agents"
+          New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
+          New-Item -ItemType Directory -Path $agentDirectory -Force | Out-Null
+          New-Item -ItemType Directory -Path (Split-Path -Parent $archivePath) -Force | Out-Null
+
+          Copy-Item -LiteralPath ".\target\release\codex-hosts.exe" -Destination $binDirectory
+          Copy-Item -LiteralPath ".\skill\codex-hosts\SKILL.md" -Destination $skillDirectory
+          Copy-Item -LiteralPath ".\skill\codex-hosts\agents\openai.yaml" -Destination $agentDirectory
+
+          $expectedFiles = @(
+            "bin/codex-hosts.exe",
+            "skill/codex-hosts/SKILL.md",
+            "skill/codex-hosts/agents/openai.yaml"
+          ) | Sort-Object
+          $actualFiles = @(
+            Get-ChildItem -LiteralPath $stagingRoot -Recurse -File | ForEach-Object {
+              [System.IO.Path]::GetRelativePath($stagingRoot, $_.FullName).Replace("\", "/")
+            }
+          ) | Sort-Object
+          if (@(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $actualFiles).Count -ne 0) {
+            throw "Unexpected release staging layout"
+          }
+
+          Compress-Archive -Path (Join-Path $stagingRoot "*") -DestinationPath $archivePath -CompressionLevel Optimal
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
+          try {
+            $archiveFiles = @(
+              $archive.Entries | Where-Object { $_.Name } | ForEach-Object {
+                $_.FullName.Replace("\", "/")
+              }
+            ) | Sort-Object
+          } finally {
+            $archive.Dispose()
+          }
+          if (@(Compare-Object -ReferenceObject $expectedFiles -DifferenceObject $archiveFiles).Count -ne 0) {
+            throw "Unexpected ZIP contents"
+          }
+
+          Write-Output "ZIP files: $($archiveFiles -join ', ')"
+          Write-Output "Executable SHA-256: $((Get-FileHash -Algorithm SHA256 -LiteralPath '.\target\release\codex-hosts.exe').Hash)"
+          Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/codex-hosts-windows-x86_64.zip
+          archive: false
+          if-no-files-found: error
+
+      - name: Publish tagged GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}"
+          ".\dist\codex-hosts-windows-x86_64.zip"
+          --verify-tag
+          --generate-notes
+          --title "codex-hosts ${{ github.ref_name }}"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Hosts"
+  short_description: "Use stable SSH and Telnet hosts safely"
+  default_prompt: "Use $codex-hosts to create, edit, verify, or use a saved remote host without exposing passwords or key passphrases."
