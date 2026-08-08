@@ -19,7 +19,7 @@
 
 ### 下載 Release
 
-預先建置的套件支援 64 位元 Windows 10 或更新版本。[Releases](https://github.com/Torinomii/codex-hosts/releases/latest)。手動啟動工作流程時，也可以在
+預先建置的套件支援 64 位元 Windows 10 或更新版本，可從 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下載。手動執行 `Build release` 工作流程時，會直接讀取 `Cargo.toml` 的版本並產生對應標籤（例如 `version = "0.1.0"` 產生 `v0.1.0`）；建置成功後會自動建立 GitHub Release。
 
 ### 從原始碼安裝
 

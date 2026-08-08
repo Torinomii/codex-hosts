@@ -19,7 +19,7 @@
 
 ### Download a Release
 
-The prebuilt package supports 64-bit Windows 10 or newer. [Releases](https://github.com/Torinomii/codex-hosts/releases/latest). Manually started workflow runs are also available from
+The prebuilt package supports 64-bit Windows 10 or newer and can be downloaded from [Releases](https://github.com/Torinomii/codex-hosts/releases/latest). When manually running the `Build release` workflow, it reads the version directly from `Cargo.toml` and creates the corresponding tag (for example, `version = "0.1.0"` becomes `v0.1.0`); after a successful build, it automatically creates the GitHub Release.
 
 ### Build from source
 

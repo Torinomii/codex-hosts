@@ -19,7 +19,7 @@
 
 ### Release をダウンロード
 
-ビルド済みパッケージは 64 ビット版 Windows 10 以降に対応します。[Releases](https://github.com/Torinomii/codex-hosts/releases/latest)。手動でワークフローを開始した場合は、
+ビルド済みパッケージは 64 ビット版 Windows 10 以降に対応し、[Releases](https://github.com/Torinomii/codex-hosts/releases/latest) からダウンロードできます。`Build release` ワークフローを手動で実行すると、`Cargo.toml` からバージョンを直接読み取り、対応するタグを生成します（たとえば `version = "0.1.0"` から `v0.1.0` を生成します）。ビルドに成功すると、GitHub Release が自動的に作成されます。
 
 ### ソースからインストール
 
