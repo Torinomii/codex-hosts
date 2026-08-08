@@ -17,17 +17,9 @@
 
 ## インストール
 
-### GitHub Actions Release をダウンロード
+### Release をダウンロード
 
-ビルド済みパッケージは 64 ビット版 Windows 10 以降に対応します。`v*` タグをプッシュすると、GitHub がホストする Windows runner で `codex-hosts-windows-x86_64.zip` をビルドし、[Releases ページ](https://github.com/Torinomii/codex-hosts/releases/latest)に公開します。手動でワークフローを開始した場合も、[Actions ページ](https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml)から同じ ZIP をダウンロードできます。
-
-最小構成の ZIP に含まれるのは次のファイルだけです。
-
-- `bin\codex-hosts.exe`
-- `skill\codex-hosts\SKILL.md`
-- `skill\codex-hosts\agents\openai.yaml`
-
-GUI は `bin\codex-hosts.exe` から直接実行できます。Codex skill をインストールするには、`skill\codex-hosts` を `%USERPROFILE%\.codex\skills\codex-hosts` にコピーし、EXE を `%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe` にコピーします。
+ビルド済みパッケージは 64 ビット版 Windows 10 以降に対応します。[Releases](https://github.com/Torinomii/codex-hosts/releases/latest)。手動でワークフローを開始した場合は、
 
 ### ソースからインストール
 
@@ -44,7 +36,7 @@ cargo build --locked --release
 ### Codex 用の汎用インストールプロンプト
 
 ```text
-この Windows コンピューターに codex-hosts をインストールしてください。まず https://github.com/Torinomii/codex-hosts/releases/latest から、GitHub Actions でビルドされた最新の `codex-hosts-windows-x86_64.zip` を使用してください。展開後、`skill\codex-hosts` を `$env:USERPROFILE\.codex\skills\codex-hosts` にコピーし、`bin\codex-hosts.exe` を `$env:USERPROFILE\.codex\skills\codex-hosts\bin\codex-hosts.exe` にコピーしてください。EXE、`SKILL.md`、`agents\openai.yaml` がすべて存在することを確認してください。互換性のある Release がない場合、または私がソースからのインストールを明示的に指定した場合は、リポジトリをクローンし、Rust 1.92 以降と MSVC ツールチェーンで `cargo build --locked --release` を実行し、生成した EXE を `skill\codex-hosts\bin\codex-hosts.exe` に配置して、その skill ディレクトリ全体をインストールしてください。会話、コマンド引数、スクリプト、ファイル、ログでパスワードや秘密鍵のパスフレーズを要求、保存、表示しないでください。自動起動項目、スケジュールタスク、サービス、バックグラウンドデーモンを作成しないでください。インストール後は表示される GUI を 1 回だけ起動して確認し、インストール元、最終的な EXE のパス、ファイルの SHA-256 を報告してください。
+codex-hosts をインストールしてください。現在の環境の Skill インストールディレクトリを自動的に特定し、完全な codex-hosts Skill を正しい場所にインストールして、実行ファイルと必要な設定ファイルが存在することを確認してください。
 ```
 
 ## Codex との連携

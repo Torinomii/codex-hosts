@@ -17,17 +17,9 @@
 
 ## Installation
 
-### Download a GitHub Actions release
+### Download a Release
 
-The prebuilt package supports 64-bit Windows 10 or newer. A pushed `v*` tag builds `codex-hosts-windows-x86_64.zip` on a GitHub-hosted Windows runner and publishes it on the [Releases page](https://github.com/Torinomii/codex-hosts/releases/latest). Manually started runs also provide the same ZIP on the [Actions page](https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml).
-
-The minimal ZIP contains only:
-
-- `bin\codex-hosts.exe`
-- `skill\codex-hosts\SKILL.md`
-- `skill\codex-hosts\agents\openai.yaml`
-
-Run the GUI directly from `bin\codex-hosts.exe`. To install the Codex skill, copy `skill\codex-hosts` to `%USERPROFILE%\.codex\skills\codex-hosts`, then copy the EXE to `%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe`.
+The prebuilt package supports 64-bit Windows 10 or newer. [Releases](https://github.com/Torinomii/codex-hosts/releases/latest). Manually started workflow runs are also available from
 
 ### Build from source
 
@@ -44,7 +36,7 @@ Copy `target\release\codex-hosts.exe` to `skill\codex-hosts\bin\codex-hosts.exe`
 ### General Codex installation prompt
 
 ```text
-Install codex-hosts on this Windows computer. Prefer the latest GitHub Actions-built `codex-hosts-windows-x86_64.zip` from https://github.com/Torinomii/codex-hosts/releases/latest. Extract it, copy `skill\codex-hosts` to `$env:USERPROFILE\.codex\skills\codex-hosts`, and copy `bin\codex-hosts.exe` to `$env:USERPROFILE\.codex\skills\codex-hosts\bin\codex-hosts.exe`. Confirm that the EXE, `SKILL.md`, and `agents\openai.yaml` exist. If no compatible Release is available, or I explicitly request a source installation, clone the repository, use Rust 1.92 or newer with the MSVC toolchain, run `cargo build --locked --release`, place the built EXE at `skill\codex-hosts\bin\codex-hosts.exe`, and install that complete skill directory. Never request, store, or echo passwords or private-key passphrases in chat, command arguments, scripts, files, or logs. Do not create startup entries, scheduled tasks, services, or background daemons. After installation, launch the visible GUI once for acceptance and report the installation source, final EXE path, and file SHA-256.
+Install codex-hosts: automatically identify the Skill installation directory in the current environment, install the complete codex-hosts Skill in the correct location, and confirm that the executable and required configuration files exist.
 ```
 
 ## Codex integration

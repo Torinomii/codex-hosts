@@ -17,17 +17,9 @@
 
 ## 安裝
 
-### 下載 GitHub Actions Release
+### 下載 Release
 
-預先建置的套件支援 64 位元 Windows 10 或更新版本。推送 `v*` 標籤後，GitHub 託管的 Windows runner 會建置 `codex-hosts-windows-x86_64.zip` 並發佈到 [Releases 頁面](https://github.com/Torinomii/codex-hosts/releases/latest)。手動啟動工作流程時，也可以從 [Actions 頁面](https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml)下載相同的 ZIP。
-
-這個最小 ZIP 只包含：
-
-- `bin\codex-hosts.exe`
-- `skill\codex-hosts\SKILL.md`
-- `skill\codex-hosts\agents\openai.yaml`
-
-可以直接執行 `bin\codex-hosts.exe`。安裝 Codex skill 時，請將 `skill\codex-hosts` 複製到 `%USERPROFILE%\.codex\skills\codex-hosts`，再將 EXE 複製到 `%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe`。
+預先建置的套件支援 64 位元 Windows 10 或更新版本。[Releases](https://github.com/Torinomii/codex-hosts/releases/latest)。手動啟動工作流程時，也可以在
 
 ### 從原始碼安裝
 
@@ -44,7 +36,7 @@ cargo build --locked --release
 ### Codex 通用安裝提示詞
 
 ```text
-請在這台 Windows 電腦上安裝 codex-hosts。優先從 https://github.com/Torinomii/codex-hosts/releases/latest 下載由 GitHub Actions 建置的最新 `codex-hosts-windows-x86_64.zip`。解壓縮後，將 `skill\codex-hosts` 複製到 `$env:USERPROFILE\.codex\skills\codex-hosts`，並將 `bin\codex-hosts.exe` 複製到 `$env:USERPROFILE\.codex\skills\codex-hosts\bin\codex-hosts.exe`；確認 EXE、`SKILL.md` 和 `agents\openai.yaml` 都存在。如果沒有相容的 Release，或我明確要求從原始碼安裝，則複製存放庫，使用 Rust 1.92 或更新版本及 MSVC 工具鏈執行 `cargo build --locked --release`，把建置出的 EXE 放到 `skill\codex-hosts\bin\codex-hosts.exe`，再安裝完整的 skill 目錄。不要在對話、命令列引數、指令碼、檔案或日誌中索取、儲存或回顯密碼或私密金鑰密碼片語；不要建立自動啟動項目、排程工作、服務或背景常駐程式。安裝後只啟動一次可見 GUI 進行驗收，並回報安裝來源、最終 EXE 路徑和檔案 SHA-256。
+安裝 codex-hosts：自動識別目前環境的 Skill 安裝目錄，將完整的 codex-hosts Skill 安裝到正確位置，並確認執行檔及必要的設定檔存在。
 ```
 
 ## Codex 整合
