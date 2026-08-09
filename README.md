@@ -20,7 +20,6 @@
 - Use SSH password and keyboard-interactive authentication, or an OpenSSH private key with an optional passphrase.
 - Store passwords and private-key passphrases only in Windows Credential Manager.
 - Build multi-hop SSH chains from saved, verified SSH hosts.
-- Use Telnet in legacy environments where its risks have been explicitly accepted; Telnet credentials and traffic are not encrypted.
 - Let Codex pre-create an alias-specific draft and wait for Save, Trust, or Cancel without asking for credentials in chat.
 
 ## Installation
