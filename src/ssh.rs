@@ -15,9 +15,12 @@ const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OperationLimits {
+    pub total_timeout: Option<Duration>,
     pub connect_timeout: Option<Duration>,
     pub command_timeout: Option<Duration>,
 }
+
+pub const TOTAL_TIMEOUT_CODE: &str = "OPERATION_TIMEOUT";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct RemoteResult {
@@ -118,7 +121,18 @@ pub fn execute(
         .enable_all()
         .build()
         .map_err(|error| RemoteFailure::new("RUNTIME_CREATE_FAILED", error.to_string()))?;
-    runtime.block_on(execute_async(profile, hosts, command, limits))
+    let result = runtime.block_on(run_with_optional_timeout(
+        limits.total_timeout,
+        TOTAL_TIMEOUT_CODE,
+        "The complete SSH operation exceeded its time limit.",
+        execute_async(profile, hosts, command, limits),
+    ));
+    if limits.total_timeout.is_some() {
+        runtime.shutdown_timeout(Duration::from_millis(50));
+    } else {
+        drop(runtime);
+    }
+    result
 }
 
 async fn execute_async(
@@ -413,4 +427,27 @@ where
 fn append_limited(output: &mut Vec<u8>, data: &[u8]) {
     let remaining = MAX_CAPTURE_BYTES.saturating_sub(output.len());
     output.extend_from_slice(&data[..data.len().min(remaining)]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_timeout_cancels_the_wrapped_operation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = runtime.block_on(run_with_optional_timeout(
+            Some(Duration::from_millis(1)),
+            TOTAL_TIMEOUT_CODE,
+            "timed out",
+            async {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(())
+            },
+        ));
+        assert_eq!(result.unwrap_err().code, TOTAL_TIMEOUT_CODE);
+    }
 }

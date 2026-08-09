@@ -1,8 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,7 +19,7 @@ use crate::credentials::{self, CredentialKind};
 use crate::i18n::Catalog;
 use crate::import;
 use crate::model::{HostProfile, Prefill, Protocol, SshAuth, can_use_as_jump};
-use crate::ssh::{OperationLimits, RemoteFailure, RemoteResult};
+use crate::ssh::{OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE};
 use crate::storage::HostStore;
 
 #[derive(Debug, Clone, Default)]
@@ -54,9 +57,14 @@ impl HostEditor {
     fn connection_changed(&self) -> bool {
         !self.profile.connection_details_equal(&self.original)
     }
+
+    fn test_result_is_stale(&self) -> bool {
+        self.connection_changed() || !self.password.is_empty() || !self.key_passphrase.is_empty()
+    }
 }
 
 const GUI_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_CONCURRENT_TESTS: usize = 8;
 const TEST_SUCCESS_FILL: Color32 = Color32::from_rgb(36, 105, 67);
 const TEST_FAILURE_FILL: Color32 = Color32::from_rgb(132, 48, 53);
 const SELECTED_ROW_STROKE: Color32 = Color32::from_rgb(230, 230, 230);
@@ -101,6 +109,8 @@ pub struct HostsApp {
     editor: Option<HostEditor>,
     status: String,
     test_operations: HashMap<Uuid, TestOperation>,
+    pending_tests: VecDeque<Uuid>,
+    test_hosts_snapshot: Option<Arc<Vec<HostProfile>>>,
     test_states: HashMap<Uuid, HostTestState>,
     testing_all: bool,
     fingerprint_prompt: Option<FingerprintPrompt>,
@@ -180,6 +190,8 @@ impl HostsApp {
             editor,
             status,
             test_operations: HashMap::new(),
+            pending_tests: VecDeque::new(),
+            test_hosts_snapshot: None,
             test_states: HashMap::new(),
             testing_all: false,
             fingerprint_prompt,
@@ -237,6 +249,7 @@ impl HostsApp {
         if needs_password && editor.password.is_empty() && !editor.has_password {
             return Err(self.catalog.text("password_required").to_owned());
         }
+        let invalidate_test_state = editor.test_result_is_stale();
         if !editor.password.is_empty() {
             credentials::store(
                 editor.profile.id,
@@ -263,8 +276,9 @@ impl HostsApp {
             editor.has_key_passphrase = true;
             editor.key_passphrase.clear();
         }
-        if editor.connection_changed() {
+        if invalidate_test_state {
             editor.profile.verified = false;
+            self.test_states.remove(&editor.profile.id);
         }
         editor.profile.alias = editor.profile.alias.trim().to_owned();
         editor.profile.address = editor.profile.address.trim().to_owned();
@@ -320,21 +334,23 @@ impl HostsApp {
     }
 
     fn start_test_host(&mut self, id: Uuid) {
-        if self.test_operations.contains_key(&id) {
+        if self.testing_all
+            || self.test_operations.contains_key(&id)
+            || self.pending_tests.contains(&id)
+        {
             return;
         }
-        let Some(profile) = self.store.hosts.iter().find(|host| host.id == id).cloned() else {
+        self.start_test_worker(id, Arc::new(self.store.hosts.clone()));
+    }
+
+    fn start_test_worker(&mut self, id: Uuid, hosts: Arc<Vec<HostProfile>>) {
+        let Some(profile) = hosts.iter().find(|host| host.id == id).cloned() else {
             return;
         };
-        let hosts = self.store.hosts.clone();
         let (sender, receiver) = mpsc::channel();
         let started_at = Instant::now();
         thread::spawn(move || {
-            let limits = OperationLimits {
-                connect_timeout: Some(GUI_TEST_TIMEOUT),
-                command_timeout: Some(GUI_TEST_TIMEOUT),
-            };
-            let result = connection::probe(&profile, &hosts, limits);
+            let result = connection::probe(&profile, hosts.as_ref(), gui_test_limits());
             let _ = sender.send((Instant::now(), result));
         });
         self.test_operations.insert(
@@ -347,8 +363,24 @@ impl HostsApp {
         self.test_states.insert(id, HostTestState::Testing);
     }
 
+    fn start_pending_tests(&mut self) {
+        let Some(hosts) = self.test_hosts_snapshot.clone() else {
+            return;
+        };
+        while self.test_operations.len() < MAX_CONCURRENT_TESTS {
+            let Some(id) = self.pending_tests.pop_front() else {
+                break;
+            };
+            self.start_test_worker(id, Arc::clone(&hosts));
+        }
+    }
+
+    fn tests_idle(&self) -> bool {
+        self.test_operations.is_empty() && self.pending_tests.is_empty()
+    }
+
     fn start_all_tests(&mut self) {
-        if !self.test_operations.is_empty() {
+        if !self.tests_idle() {
             return;
         }
         if self.editor.as_ref().is_some_and(|editor| {
@@ -371,10 +403,12 @@ impl HostsApp {
             return;
         }
         self.test_states.clear();
+        self.test_states
+            .extend(ids.iter().copied().map(|id| (id, HostTestState::Testing)));
+        self.pending_tests = ids.into_iter().collect();
+        self.test_hosts_snapshot = Some(Arc::new(self.store.hosts.clone()));
         self.testing_all = true;
-        for id in ids {
-            self.start_test_host(id);
-        }
+        self.start_pending_tests();
         self.status = self.catalog.text("testing_all").to_owned();
     }
 
@@ -420,8 +454,12 @@ impl HostsApp {
             self.test_operations.remove(&id);
             self.finish_test(id, result);
         }
-        if self.testing_all && self.test_operations.is_empty() {
+        if self.testing_all {
+            self.start_pending_tests();
+        }
+        if self.testing_all && self.tests_idle() {
             self.testing_all = false;
+            self.test_hosts_snapshot = None;
             let succeeded = self
                 .test_states
                 .values()
@@ -487,7 +525,7 @@ impl HostsApp {
             Err(error) => {
                 self.test_states.insert(id, HostTestState::Failed);
                 if !self.testing_all && self.selected == Some(id) {
-                    self.status = if error.code == "TEST_TIMEOUT" {
+                    self.status = if matches!(error.code, "TEST_TIMEOUT" | TOTAL_TIMEOUT_CODE) {
                         self.catalog.text("status_test_timeout").to_owned()
                     } else {
                         self.catalog
@@ -559,6 +597,7 @@ impl HostsApp {
             return;
         }
         self.test_operations.remove(&id);
+        self.pending_tests.retain(|pending| *pending != id);
         self.test_states.remove(&id);
         self.store.hosts.retain(|host| host.id != id);
         let _ = self.store.save();
@@ -606,26 +645,55 @@ impl HostsApp {
 
     fn remove_batch(&mut self) {
         let ids = self.batch_selected.iter().copied().collect::<Vec<_>>();
-        for id in &ids {
-            if let Err(error) = credentials::delete_all(*id) {
+        let credential_snapshots = match ids
+            .iter()
+            .map(|id| credentials::snapshot(*id).map(|snapshot| (*id, snapshot)))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
                 self.status = self
                     .catalog
                     .format("credential_error", &[("error", &error.to_string())]);
                 return;
             }
-        }
+        };
         for id in &ids {
-            self.test_operations.remove(id);
-            self.test_states.remove(id);
+            if let Err(error) = credentials::delete_all(*id) {
+                let error = with_rollback_error(
+                    error.to_string(),
+                    restore_credential_snapshots(&credential_snapshots).err(),
+                );
+                self.status = self
+                    .catalog
+                    .format("credential_error", &[("error", &error)]);
+                return;
+            }
         }
+        let original_hosts = self.store.hosts.clone();
         self.store
             .hosts
             .retain(|host| !self.batch_selected.contains(&host.id));
         if let Err(error) = self.store.save() {
-            self.status = self
-                .catalog
-                .format("storage_error", &[("error", &error.to_string())]);
+            self.store.hosts = original_hosts;
+            let mut rollback_errors = Vec::new();
+            if let Err(rollback_error) = restore_credential_snapshots(&credential_snapshots) {
+                rollback_errors.push(rollback_error);
+            }
+            if let Err(rollback_error) = self.store.save() {
+                rollback_errors.push(format!("host metadata: {rollback_error}"));
+            }
+            let error = with_rollback_error(
+                error.to_string(),
+                (!rollback_errors.is_empty()).then(|| rollback_errors.join("; ")),
+            );
+            self.status = self.catalog.format("storage_error", &[("error", &error)]);
             return;
+        }
+        for id in &ids {
+            self.test_operations.remove(id);
+            self.pending_tests.retain(|pending| pending != id);
+            self.test_states.remove(id);
         }
         self.selected = self.store.hosts.first().map(|host| host.id);
         self.editor = self
@@ -635,6 +703,10 @@ impl HostsApp {
             .map(HostEditor::load);
         self.batch_mode = false;
         self.batch_selected.clear();
+        if self.testing_all && self.tests_idle() {
+            self.testing_all = false;
+            self.test_hosts_snapshot = None;
+        }
         self.status = self.catalog.text("batch_deleted").to_owned();
     }
 
@@ -885,7 +957,7 @@ impl HostsApp {
                     }
                     if ui
                         .add_enabled(
-                            self.test_operations.is_empty(),
+                            self.tests_idle(),
                             egui::Button::new(self.catalog.text("test_all"))
                                 .min_size([112.0, 34.0].into()),
                         )
@@ -1093,9 +1165,10 @@ impl HostsApp {
     fn editor_panel(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let catalog = self.catalog.clone();
         let hosts = self.store.hosts.clone();
-        let testing = self
-            .selected
-            .is_some_and(|id| self.test_operations.contains_key(&id));
+        let testing = self.testing_all
+            || self.selected.is_some_and(|id| {
+                self.test_operations.contains_key(&id) || self.pending_tests.contains(&id)
+            });
         let codex_edit = self.launch.codex_edit;
         let mut action = None;
         let editor_scroll = egui::ScrollArea::vertical().id_salt("host_editor_scroll");
@@ -1339,7 +1412,10 @@ impl HostsApp {
                     action = Some(EditorAction::Test);
                 }
                 if ui
-                    .add(egui::Button::new(catalog.text("save")).min_size([100.0, 38.0].into()))
+                    .add_enabled(
+                        !testing,
+                        egui::Button::new(catalog.text("save")).min_size([100.0, 38.0].into()),
+                    )
                     .clicked()
                 {
                     action = Some(EditorAction::Save);
@@ -1700,7 +1776,7 @@ impl eframe::App for HostsApp {
         self.batch_export_window(&context);
         self.delete_modal(&context);
         self.batch_delete_modal(&context);
-        if !self.test_operations.is_empty() {
+        if !self.tests_idle() {
             context.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -1722,6 +1798,14 @@ fn test_timed_out(elapsed: Duration) -> bool {
     elapsed >= GUI_TEST_TIMEOUT
 }
 
+fn gui_test_limits() -> OperationLimits {
+    OperationLimits {
+        total_timeout: Some(GUI_TEST_TIMEOUT),
+        connect_timeout: Some(GUI_TEST_TIMEOUT),
+        command_timeout: Some(GUI_TEST_TIMEOUT),
+    }
+}
+
 fn host_row_fill(state: Option<HostTestState>) -> Option<Color32> {
     match state {
         Some(HostTestState::Succeeded) => Some(TEST_SUCCESS_FILL),
@@ -1733,6 +1817,29 @@ fn host_row_fill(state: Option<HostTestState>) -> Option<Color32> {
 fn rollback_import_credentials(ids: &[Uuid]) {
     for id in ids {
         let _ = credentials::delete_all(*id);
+    }
+}
+
+fn restore_credential_snapshots(
+    snapshots: &[(Uuid, credentials::CredentialSnapshot)],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for (id, snapshot) in snapshots {
+        if let Err(error) = credentials::restore(*id, snapshot) {
+            errors.push(format!("{id}: {error}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn with_rollback_error(primary: String, rollback: Option<String>) -> String {
+    match rollback {
+        Some(rollback) => format!("{primary}; rollback failed: {rollback}"),
+        None => primary,
     }
 }
 
@@ -1856,6 +1963,44 @@ mod tests {
     fn connection_test_timeout_is_capped_at_ten_seconds() {
         assert!(!test_timed_out(Duration::from_millis(9_999)));
         assert!(test_timed_out(Duration::from_secs(10)));
+        assert_eq!(gui_test_limits().total_timeout, Some(GUI_TEST_TIMEOUT));
+    }
+
+    #[test]
+    fn connection_changes_and_new_credentials_invalidate_test_results() {
+        let profile = HostProfile {
+            address: "127.0.0.1".to_owned(),
+            ..HostProfile::default()
+        };
+        let mut editor = HostEditor {
+            profile: profile.clone(),
+            original: profile,
+            password: Zeroizing::new(String::new()),
+            key_passphrase: Zeroizing::new(String::new()),
+            has_password: true,
+            has_key_passphrase: false,
+        };
+        assert!(!editor.test_result_is_stale());
+        editor.password.push_str("replacement");
+        assert!(editor.test_result_is_stale());
+        editor.password.clear();
+        editor.profile.address = "127.0.0.2".to_owned();
+        assert!(editor.test_result_is_stale());
+    }
+
+    #[test]
+    fn rollback_errors_preserve_the_primary_failure() {
+        assert_eq!(
+            with_rollback_error("delete failed".to_owned(), None),
+            "delete failed"
+        );
+        assert_eq!(
+            with_rollback_error(
+                "delete failed".to_owned(),
+                Some("restore failed".to_owned())
+            ),
+            "delete failed; rollback failed: restore failed"
+        );
     }
 
     #[test]
