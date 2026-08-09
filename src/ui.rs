@@ -576,6 +576,14 @@ impl HostsApp {
         self.status = self.catalog.text("batch_select_hint").to_owned();
     }
 
+    fn toggle_batch_selection(&mut self) {
+        if batch_all_selected(&self.store.hosts, &self.batch_selected) {
+            self.batch_selected.clear();
+        } else {
+            self.batch_selected = self.store.hosts.iter().map(|host| host.id).collect();
+        }
+    }
+
     fn cancel_batch_mode(&mut self) {
         self.batch_mode = false;
         self.batch_selected.clear();
@@ -813,6 +821,7 @@ impl HostsApp {
         let mut open_import = false;
         let mut test_all = false;
         let mut begin_batch = false;
+        let mut toggle_batch_selection = false;
         let mut delete_batch = false;
         let mut export_batch = false;
         let mut cancel_batch = false;
@@ -822,6 +831,21 @@ impl HostsApp {
             |ui| {
                 ui.add_space(18.0);
                 if self.batch_mode {
+                    let all_selected = batch_all_selected(&self.store.hosts, &self.batch_selected);
+                    if ui
+                        .add_enabled(
+                            !self.store.hosts.is_empty(),
+                            egui::Button::new(self.catalog.text(if all_selected {
+                                "deselect_all"
+                            } else {
+                                "select_all"
+                            }))
+                            .min_size([92.0, 34.0].into()),
+                        )
+                        .clicked()
+                    {
+                        toggle_batch_selection = true;
+                    }
                     if ui
                         .add(
                             egui::Button::new(self.catalog.text("delete"))
@@ -922,6 +946,9 @@ impl HostsApp {
         if begin_batch {
             self.begin_batch_mode();
         }
+        if toggle_batch_selection {
+            self.toggle_batch_selection();
+        }
         if delete_batch {
             self.request_batch_delete();
         }
@@ -1006,10 +1033,8 @@ impl HostsApp {
                             } else {
                                 ""
                             };
-                            let selection_marker = if selected { "▶ " } else { "" };
                             let text = RichText::new(format!(
-                                "{}{}\n{} · {}:{}{}",
-                                selection_marker,
+                                "{}\n{} · {}:{}{}",
                                 alias,
                                 protocol.stable_name().to_ascii_uppercase(),
                                 address,
@@ -1017,7 +1042,7 @@ impl HostsApp {
                                 verified_marker
                             ))
                             .line_height(Some(20.0));
-                            let mut button = egui::Button::new(text);
+                            let mut button = egui::Button::new(()).left_text(text);
                             if let Some(fill) = host_row_fill(test_state) {
                                 button = button.fill(fill);
                             }
@@ -1025,7 +1050,11 @@ impl HostsApp {
                                 button = button.stroke(egui::Stroke::new(2.0, SELECTED_ROW_STROKE));
                             }
                             let size = [ui.available_width(), 62.0];
-                            ui.add_sized(size, button)
+                            ui.scope(|ui| {
+                                ui.spacing_mut().button_padding.x = 12.0;
+                                ui.add_sized(size, button)
+                            })
+                            .inner
                         })
                         .inner;
                     if response.clicked() || response.secondary_clicked() {
@@ -1100,8 +1129,8 @@ impl HostsApp {
                 .show(ui, |ui| {
                     egui::Grid::new("host_form")
                         .num_columns(2)
-                        .min_col_width(150.0)
-                        .spacing([20.0, 14.0])
+                        .min_col_width(160.0)
+                        .spacing([24.0, 14.0])
                         .show(ui, |ui| {
                             form_label(ui, catalog.text("alias"));
                             ui.add(
@@ -1177,7 +1206,7 @@ impl HostsApp {
                             if editor.profile.protocol == Protocol::Telnet
                                 || editor.profile.ssh_auth == SshAuth::Password
                             {
-                                form_label(ui, catalog.text("password"));
+                                form_label_with_hint(ui, catalog.text("password"));
                                 ui.vertical(|ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut *editor.password)
@@ -1192,7 +1221,7 @@ impl HostsApp {
                                 });
                                 ui.end_row();
                             } else {
-                                form_label(ui, catalog.text("private_key"));
+                                form_label_with_hint(ui, catalog.text("private_key"));
                                 ui.vertical(|ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(
@@ -1204,7 +1233,7 @@ impl HostsApp {
                                 });
                                 ui.end_row();
 
-                                form_label(ui, catalog.text("key_passphrase"));
+                                form_label_with_hint(ui, catalog.text("key_passphrase"));
                                 ui.vertical(|ui| {
                                     ui.add(
                                         egui::TextEdit::singleline(&mut *editor.key_passphrase)
@@ -1221,7 +1250,7 @@ impl HostsApp {
                             }
 
                             if editor.profile.protocol == Protocol::Ssh {
-                                form_label(ui, catalog.text("host_chain"));
+                                form_label_with_hint(ui, catalog.text("host_chain"));
                                 ui.vertical(|ui| {
                                     let selected_name = editor
                                         .profile
@@ -1644,7 +1673,7 @@ impl eframe::App for HostsApp {
         self.top_bar(ui, &context);
         ui.separator();
         let body = ui.available_rect_before_wrap();
-        let divider_x = body.min.x + 300.0;
+        let divider_x = body.min.x + 340.0;
         let sidebar = egui::Rect::from_min_max(body.min, egui::pos2(divider_x, body.max.y));
         let editor = egui::Rect::from_min_max(egui::pos2(divider_x + 10.0, body.min.y), body.max);
         ui.scope_builder(
@@ -1755,8 +1784,28 @@ fn batch_has_external_dependents(hosts: &[HostProfile], selected: &HashSet<Uuid>
     })
 }
 
+fn batch_all_selected(hosts: &[HostProfile], selected: &HashSet<Uuid>) -> bool {
+    !hosts.is_empty() && hosts.iter().all(|host| selected.contains(&host.id))
+}
+
 fn form_label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).strong());
+    ui.add_sized(
+        [160.0, 24.0],
+        egui::Label::new(RichText::new(text).strong()).halign(egui::Align::Min),
+    );
+}
+
+fn form_label_with_hint(ui: &mut egui::Ui, text: &str) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(160.0, 48.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.add_sized(
+                [160.0, 24.0],
+                egui::Label::new(RichText::new(text).strong()).halign(egui::Align::Min),
+            );
+        },
+    );
 }
 
 fn configure_fonts(context: &egui::Context) {
@@ -1816,6 +1865,21 @@ mod tests {
         target.jump_host = Some(jump.id);
         let selected = HashSet::from([jump.id]);
         assert!(batch_has_external_dependents(&[jump, target], &selected));
+    }
+
+    #[test]
+    fn batch_select_all_requires_every_saved_host() {
+        let first = HostProfile::default();
+        let second = HostProfile::default();
+        assert!(!batch_all_selected(&[], &HashSet::new()));
+        assert!(!batch_all_selected(
+            &[first.clone(), second.clone()],
+            &HashSet::from([first.id])
+        ));
+        assert!(batch_all_selected(
+            &[first.clone(), second.clone()],
+            &HashSet::from([first.id, second.id])
+        ));
     }
 
     #[test]

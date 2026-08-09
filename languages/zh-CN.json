@@ -9,6 +9,8 @@
     "import_hosts": "导入主机",
     "test_all": "全部测试",
     "batch_manage": "批量管理",
+    "select_all": "全选",
+    "deselect_all": "取消全选",
     "editor_new_title": "添加主机",
     "editor_edit_title": "主机详情",
     "editor_subtitle": "连接凭据仅保存在 Windows 凭据管理器中。",
