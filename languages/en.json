@@ -76,7 +76,7 @@
     "delete_message": "The host entry will be removed. Credentials will also be deleted from Windows Credential Manager.",
     "confirm_delete": "Delete host",
     "import_title": "Import hosts",
-    "import_hint": "Download a JSON template, complete the non-secret host fields, then import it. Passwords and passphrases are never imported.",
+    "import_hint": "Download the CSV template, complete the host fields, then import it. Extra spreadsheet columns are ignored; passwords and passphrases are never imported.",
     "download_template": "Download template",
     "import_template": "Import template",
     "template_saved": "Import template saved to {path}.",

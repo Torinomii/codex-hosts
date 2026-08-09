@@ -58,7 +58,7 @@ impl HostEditor {
 const GUI_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const TEST_SUCCESS_FILL: Color32 = Color32::from_rgb(36, 105, 67);
 const TEST_FAILURE_FILL: Color32 = Color32::from_rgb(132, 48, 53);
-const TEST_FAILURE_SELECTED_FILL: Color32 = Color32::from_rgb(105, 62, 158);
+const SELECTED_ROW_STROKE: Color32 = Color32::from_rgb(230, 230, 230);
 
 struct TestOperation {
     receiver: Receiver<(Instant, Result<RemoteResult, RemoteFailure>)>,
@@ -621,8 +621,8 @@ impl HostsApp {
 
     fn download_import_template(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
-            .set_file_name("codex-hosts-import-template.json")
+            .add_filter("CSV", &["csv"])
+            .set_file_name("codex-hosts-import-template.csv")
             .save_file()
         else {
             return;
@@ -644,7 +644,7 @@ impl HostsApp {
 
     fn import_hosts_from_template(&mut self) {
         let Some(path) = rfd::FileDialog::new()
-            .add_filter("JSON", &["json"])
+            .add_filter("CSV", &["csv"])
             .pick_file()
         else {
             return;
@@ -863,6 +863,7 @@ impl HostsApp {
         let mut deletion_request = None;
         let mut batch_toggle_request = None;
         egui::ScrollArea::vertical()
+            .id_salt("host_list_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -885,8 +886,10 @@ impl HostsApp {
                             } else {
                                 ""
                             };
+                            let selection_marker = if selected { "▶ " } else { "" };
                             let text = RichText::new(format!(
-                                "{}\n{} · {}:{}{}",
+                                "{}{}\n{} · {}:{}{}",
+                                selection_marker,
                                 alias,
                                 protocol.stable_name().to_ascii_uppercase(),
                                 address,
@@ -894,21 +897,15 @@ impl HostsApp {
                                 verified_marker
                             ))
                             .line_height(Some(20.0));
-                            let mut button = egui::Button::new(text).selected(selected);
-                            let row_fill = host_row_fill(test_state, selected);
-                            if !selected && let Some(fill) = row_fill {
+                            let mut button = egui::Button::new(text);
+                            if let Some(fill) = host_row_fill(test_state) {
                                 button = button.fill(fill);
                             }
-                            let size = [ui.available_width(), 62.0];
-                            if selected && row_fill.is_some() {
-                                ui.scope(|ui| {
-                                    ui.visuals_mut().selection.bg_fill = row_fill.unwrap();
-                                    ui.add_sized(size, button)
-                                })
-                                .inner
-                            } else {
-                                ui.add_sized(size, button)
+                            if selected {
+                                button = button.stroke(egui::Stroke::new(2.0, SELECTED_ROW_STROKE));
                             }
+                            let size = [ui.available_width(), 62.0];
+                            ui.add_sized(size, button)
                         })
                         .inner;
                     if response.clicked() || response.secondary_clicked() {
@@ -952,7 +949,8 @@ impl HostsApp {
             .is_some_and(|id| self.test_operations.contains_key(&id));
         let codex_edit = self.launch.codex_edit;
         let mut action = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
+        let editor_scroll = egui::ScrollArea::vertical().id_salt("host_editor_scroll");
+        editor_scroll.show(ui, |ui| {
             ui.set_max_width(760.0);
             ui.add_space(24.0);
             let Some(editor) = self.editor.as_mut() else {
@@ -1461,11 +1459,10 @@ fn test_timed_out(elapsed: Duration) -> bool {
     elapsed >= GUI_TEST_TIMEOUT
 }
 
-fn host_row_fill(state: Option<HostTestState>, selected: bool) -> Option<Color32> {
-    match (state, selected) {
-        (Some(HostTestState::Succeeded), false) => Some(TEST_SUCCESS_FILL),
-        (Some(HostTestState::Failed), false) => Some(TEST_FAILURE_FILL),
-        (Some(HostTestState::Failed), true) => Some(TEST_FAILURE_SELECTED_FILL),
+fn host_row_fill(state: Option<HostTestState>) -> Option<Color32> {
+    match state {
+        Some(HostTestState::Succeeded) => Some(TEST_SUCCESS_FILL),
+        Some(HostTestState::Failed) => Some(TEST_FAILURE_FILL),
         _ => None,
     }
 }
@@ -1517,18 +1514,14 @@ mod tests {
     #[test]
     fn test_rows_use_requested_result_colors() {
         assert_eq!(
-            host_row_fill(Some(HostTestState::Succeeded), false),
+            host_row_fill(Some(HostTestState::Succeeded)),
             Some(TEST_SUCCESS_FILL)
         );
-        assert_eq!(host_row_fill(Some(HostTestState::Succeeded), true), None);
         assert_eq!(
-            host_row_fill(Some(HostTestState::Failed), false),
+            host_row_fill(Some(HostTestState::Failed)),
             Some(TEST_FAILURE_FILL)
         );
-        assert_eq!(
-            host_row_fill(Some(HostTestState::Failed), true),
-            Some(TEST_FAILURE_SELECTED_FILL)
-        );
+        assert_eq!(host_row_fill(Some(HostTestState::Testing)), None);
     }
 
     #[test]
