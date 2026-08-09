@@ -10,7 +10,7 @@
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/LINUX-DO-FFB003" alt="LINUX DO 社群" /></a>
 </p>
 
-`codex-hosts` 是供 Codex 使用的 Windows SSH / Telnet 主機管理工具，讓 Codex 不必接觸或輸入明文密碼即可安全地發起連線。
+`codex-hosts` 是供 Codex 使用的 Windows SSH / Telnet 主機管理工具，讓 Codex 不必接觸密碼或金鑰即可安全地發起連線。
 
 ![Codex Hosts 主視窗](../../Main.png)
 
@@ -27,7 +27,17 @@
 
 ### 下載 Release
 
-預先建置的套件支援 64 位元 Windows 10 或更新版本，可從 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下載。手動執行 `Build release` 工作流程時，會直接讀取 `Cargo.toml` 的版本並產生對應標籤（例如 `version = "0.1.0"` 產生 `v0.1.0`）；建置成功後會自動建立 GitHub Release。
+預先建置的套件支援 64 位元 Windows 10 或更新版本，可從 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下載。
+
+### 安裝
+
+將 `bin\codex-hosts.exe` 複製到 `skill\codex-hosts\bin\codex-hosts.exe`，然後把 `skill\codex-hosts` 目錄複製到 `%USERPROFILE%\.codex\skills\codex-hosts`。
+
+### 使用 Codex 提示詞安裝
+
+```text
+從 https://github.com/Torinomii/codex-hosts/releases/latest 下載最新版本並安裝 codex-hosts：自動識別目前環境的 Skill 安裝目錄，將完整的 codex-hosts Skill 和執行檔安裝到正確位置，並確認 Skill、執行檔及必要的設定檔存在。
+```
 
 ### 從原始碼安裝
 
@@ -41,11 +51,10 @@ cargo build --locked --release
 
 將 `target\release\codex-hosts.exe` 複製到 `skill\codex-hosts\bin\codex-hosts.exe`，然後把完整的 `skill\codex-hosts` 目錄安裝為 `%USERPROFILE%\.codex\skills\codex-hosts`。
 
-### Codex 通用安裝提示詞
+### 如何使用
 
-```text
-安裝 codex-hosts：自動識別目前環境的 Skill 安裝目錄，將完整的 codex-hosts Skill 安裝到正確位置，並確認執行檔及必要的設定檔存在。
-```
+1. 正確安裝 skill 和執行檔後，Codex 遇到新的遠端連線需求時會開啟 codex-hosts，要求輸入密碼。
+2. 也可以事先在 codex-hosts 中輸入連線資訊，再讓 Codex 識別並使用已儲存的資訊進行連線。
 
 ## Codex 整合
 

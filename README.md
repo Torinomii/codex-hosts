@@ -10,7 +10,7 @@
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/LINUX-DO-FFB003" alt="LINUX DO Community" /></a>
 </p>
 
-`codex-hosts` is a Windows SSH / Telnet host manager for Codex, allowing Codex to initiate connections securely without accessing or entering plaintext passwords.
+`codex-hosts` is a Windows SSH / Telnet host manager for Codex, allowing Codex to initiate connections securely without accessing passwords or private keys.
 
 ![Codex Hosts main window](Main.png)
 
@@ -27,7 +27,17 @@
 
 ### Download a Release
 
-The prebuilt package supports 64-bit Windows 10 or newer and can be downloaded from [Releases](https://github.com/Torinomii/codex-hosts/releases/latest). When manually running the `Build release` workflow, it reads the version directly from `Cargo.toml` and creates the corresponding tag (for example, `version = "0.1.0"` becomes `v0.1.0`); after a successful build, it automatically creates the GitHub Release.
+The prebuilt package supports 64-bit Windows 10 or newer and can be downloaded from [Releases](https://github.com/Torinomii/codex-hosts/releases/latest).
+
+### Install
+
+Copy `bin\codex-hosts.exe` to `skill\codex-hosts\bin\codex-hosts.exe`, then copy the `skill\codex-hosts` directory to `%USERPROFILE%\.codex\skills\codex-hosts`.
+
+### Install with a Codex prompt
+
+```text
+Download the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest and install it: automatically identify the Skill installation directory in the current environment, install the complete codex-hosts Skill and executable in the correct location, and confirm that the Skill, executable, and required configuration files exist.
+```
 
 ### Build from source
 
@@ -41,11 +51,10 @@ cargo build --locked --release
 
 Copy `target\release\codex-hosts.exe` to `skill\codex-hosts\bin\codex-hosts.exe`, then install the complete `skill\codex-hosts` directory as `%USERPROFILE%\.codex\skills\codex-hosts`.
 
-### General Codex installation prompt
+### How to use
 
-```text
-Install codex-hosts: automatically identify the Skill installation directory in the current environment, install the complete codex-hosts Skill in the correct location, and confirm that the executable and required configuration files exist.
-```
+1. After the skill and executable are installed correctly, Codex opens codex-hosts and asks you to enter a password when it needs a new remote connection.
+2. You can also enter the connection details in codex-hosts beforehand, then ask Codex to identify and use the saved information to connect.
 
 ## Codex integration
 
