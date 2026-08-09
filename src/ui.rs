@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -82,6 +83,11 @@ struct FingerprintPrompt {
     close_after_choice: bool,
 }
 
+struct ImportCleanupPrompt {
+    path: PathBuf,
+    imported_count: usize,
+}
+
 enum EditorAction {
     Save,
     Test,
@@ -100,9 +106,11 @@ pub struct HostsApp {
     fingerprint_prompt: Option<FingerprintPrompt>,
     delete_prompt: bool,
     import_window_open: bool,
+    import_cleanup_prompt: Option<ImportCleanupPrompt>,
     batch_mode: bool,
     batch_selected: HashSet<Uuid>,
     batch_delete_prompt: bool,
+    batch_export_window_open: bool,
     launch: LaunchOptions,
     callback_written: bool,
 }
@@ -177,9 +185,11 @@ impl HostsApp {
             fingerprint_prompt,
             delete_prompt: false,
             import_window_open: false,
+            import_cleanup_prompt: None,
             batch_mode: false,
             batch_selected: HashSet::new(),
             batch_delete_prompt: false,
+            batch_export_window_open: false,
             launch,
             callback_written: false,
         }
@@ -570,6 +580,7 @@ impl HostsApp {
         self.batch_mode = false;
         self.batch_selected.clear();
         self.batch_delete_prompt = false;
+        self.batch_export_window_open = false;
         self.status = self.catalog.text("status_ready").to_owned();
     }
 
@@ -649,13 +660,15 @@ impl HostsApp {
         else {
             return;
         };
-        let imported = fs::read(&path)
+        let batch = fs::read(&path)
+            .map(Zeroizing::new)
             .map_err(|error| error.to_string())
             .and_then(|bytes| {
-                import::parse_template(&bytes, &self.store.hosts).map_err(|error| error.to_string())
+                import::parse_template(bytes.as_slice(), &self.store.hosts)
+                    .map_err(|error| error.to_string())
             });
-        let imported = match imported {
-            Ok(imported) => imported,
+        let batch = match batch {
+            Ok(batch) => batch,
             Err(error) => {
                 self.status = self
                     .catalog
@@ -663,11 +676,31 @@ impl HostsApp {
                 return;
             }
         };
-        let first_id = imported.first().map(|host| host.id);
-        let count = imported.len();
-        self.store.hosts.extend(imported);
+        let imported_ids = batch
+            .hosts
+            .iter()
+            .map(|item| item.profile.id)
+            .collect::<Vec<_>>();
+        for item in &batch.hosts {
+            if let Some((kind, secret)) = imported_credential(item)
+                && let Err(error) = credentials::store(item.profile.id, kind, secret)
+            {
+                rollback_import_credentials(&imported_ids);
+                self.status = self
+                    .catalog
+                    .format("credential_error", &[("error", &error.to_string())]);
+                return;
+            }
+        }
+        let first_id = batch.hosts.first().map(|item| item.profile.id);
+        let count = batch.hosts.len();
+        let contains_sensitive_values = batch.contains_sensitive_values;
+        self.store
+            .hosts
+            .extend(batch.hosts.into_iter().map(|item| item.profile));
         if let Err(error) = self.store.save() {
             self.store.hosts.truncate(self.store.hosts.len() - count);
+            rollback_import_credentials(&imported_ids);
             self.status = self
                 .catalog
                 .format("storage_error", &[("error", &error.to_string())]);
@@ -677,9 +710,83 @@ impl HostsApp {
             self.select(id);
         }
         self.import_window_open = false;
-        self.status = self
-            .catalog
-            .format("import_succeeded", &[("count", &count.to_string())]);
+        if contains_sensitive_values {
+            self.status = self.catalog.format(
+                "import_succeeded_with_credentials",
+                &[("count", &count.to_string())],
+            );
+            self.import_cleanup_prompt = Some(ImportCleanupPrompt {
+                path,
+                imported_count: count,
+            });
+        } else {
+            self.status = self
+                .catalog
+                .format("import_succeeded", &[("count", &count.to_string())]);
+        }
+    }
+
+    fn request_batch_export(&mut self) {
+        if self.batch_selected.is_empty() {
+            self.status = self.catalog.text("batch_nothing_selected").to_owned();
+            return;
+        }
+        self.batch_export_window_open = true;
+    }
+
+    fn selected_export_bytes(&self) -> Result<Vec<u8>, String> {
+        let selected = self
+            .store
+            .hosts
+            .iter()
+            .filter(|host| self.batch_selected.contains(&host.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        import::export_bytes(&selected, &self.store.hosts).map_err(|error| error.to_string())
+    }
+
+    fn export_batch_to_directory(&mut self) {
+        let Some(directory) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let result = self
+            .selected_export_bytes()
+            .and_then(|bytes| write_unique_export(&directory, &bytes).map_err(|e| e.to_string()));
+        self.finish_batch_export(result);
+    }
+
+    fn export_batch_to_file(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("codex-hosts-export.csv")
+            .save_file()
+        else {
+            return;
+        };
+        let result = self
+            .selected_export_bytes()
+            .and_then(|bytes| fs::write(&path, bytes).map_err(|error| error.to_string()))
+            .map(|()| path);
+        self.finish_batch_export(result);
+    }
+
+    fn finish_batch_export(&mut self, result: Result<PathBuf, String>) {
+        match result {
+            Ok(path) => {
+                let path = path.display().to_string();
+                self.status = self
+                    .catalog
+                    .format("batch_export_succeeded", &[("path", path.as_str())]);
+                self.batch_export_window_open = false;
+                self.batch_mode = false;
+                self.batch_selected.clear();
+            }
+            Err(error) => {
+                self.status = self
+                    .catalog
+                    .format("batch_export_failed", &[("error", error.as_str())]);
+            }
+        }
     }
 
     fn write_callback(&mut self, status: &'static str, alias: Option<&str>) {
@@ -707,6 +814,7 @@ impl HostsApp {
         let mut test_all = false;
         let mut begin_batch = false;
         let mut delete_batch = false;
+        let mut export_batch = false;
         let mut cancel_batch = false;
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 48.0),
@@ -722,6 +830,15 @@ impl HostsApp {
                         .clicked()
                     {
                         delete_batch = true;
+                    }
+                    if ui
+                        .add(
+                            egui::Button::new(self.catalog.text("export"))
+                                .min_size([92.0, 34.0].into()),
+                        )
+                        .clicked()
+                    {
+                        export_batch = true;
                     }
                     if ui
                         .add(
@@ -807,6 +924,9 @@ impl HostsApp {
         }
         if delete_batch {
             self.request_batch_delete();
+        }
+        if export_batch {
+            self.request_batch_export();
         }
         if cancel_batch {
             self.cancel_batch_mode();
@@ -1335,6 +1455,118 @@ impl HostsApp {
         }
     }
 
+    fn import_cleanup_modal(&mut self, context: &egui::Context) {
+        let Some(prompt) = self.import_cleanup_prompt.as_ref() else {
+            return;
+        };
+        let path = prompt.path.display().to_string();
+        let choice = egui::Modal::new(egui::Id::new("import_cleanup_confirmation"))
+            .show(context, |ui| {
+                ui.set_max_width(480.0);
+                ui.heading(self.catalog.text("import_cleanup_title"));
+                ui.add_space(8.0);
+                ui.label(
+                    self.catalog
+                        .format("import_cleanup_message", &[("path", path.as_str())]),
+                );
+                ui.add_space(16.0);
+                let mut result = None;
+                ui.horizontal(|ui| {
+                    if ui.button(self.catalog.text("delete_import_file")).clicked() {
+                        result = Some(true);
+                    }
+                    if ui.button(self.catalog.text("keep_import_file")).clicked() {
+                        result = Some(false);
+                    }
+                });
+                result
+            })
+            .inner;
+        if let Some(delete_file) = choice {
+            let prompt = self.import_cleanup_prompt.take().unwrap();
+            let path_text = prompt.path.display().to_string();
+            if delete_file {
+                match fs::remove_file(&prompt.path) {
+                    Ok(()) => {
+                        self.status = self.catalog.format(
+                            "import_file_deleted",
+                            &[
+                                ("count", &prompt.imported_count.to_string()),
+                                ("path", path_text.as_str()),
+                            ],
+                        );
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        self.status = self.catalog.format(
+                            "import_file_deleted",
+                            &[
+                                ("count", &prompt.imported_count.to_string()),
+                                ("path", path_text.as_str()),
+                            ],
+                        );
+                    }
+                    Err(error) => {
+                        self.status = self.catalog.format(
+                            "import_file_delete_failed",
+                            &[("error", &error.to_string()), ("path", path_text.as_str())],
+                        );
+                    }
+                }
+            } else {
+                self.status = self
+                    .catalog
+                    .format("import_file_kept_warning", &[("path", path_text.as_str())]);
+            }
+        }
+    }
+
+    fn batch_export_window(&mut self, context: &egui::Context) {
+        if !self.batch_export_window_open {
+            return;
+        }
+        enum ExportAction {
+            Directory,
+            File,
+        }
+        let mut open = self.batch_export_window_open;
+        let mut action = None;
+        egui::Window::new(self.catalog.text("batch_export_title"))
+            .id(egui::Id::new("batch_export_window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.set_min_width(420.0);
+                ui.label(self.catalog.text("batch_export_hint"));
+                ui.add_space(12.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 40.0],
+                        egui::Button::new(self.catalog.text("export_to_directory")),
+                    )
+                    .clicked()
+                {
+                    action = Some(ExportAction::Directory);
+                }
+                ui.add_space(8.0);
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 40.0],
+                        egui::Button::new(self.catalog.text("export_to_file")),
+                    )
+                    .clicked()
+                {
+                    action = Some(ExportAction::File);
+                }
+            });
+        self.batch_export_window_open = open;
+        match action {
+            Some(ExportAction::Directory) => self.export_batch_to_directory(),
+            Some(ExportAction::File) => self.export_batch_to_file(),
+            None => {}
+        }
+    }
+
     fn delete_modal(&mut self, context: &egui::Context) {
         if !self.delete_prompt {
             return;
@@ -1435,6 +1667,8 @@ impl eframe::App for HostsApp {
         ui.allocate_rect(body, egui::Sense::hover());
         self.fingerprint_modal(&context);
         self.import_window(&context);
+        self.import_cleanup_modal(&context);
+        self.batch_export_window(&context);
         self.delete_modal(&context);
         self.batch_delete_modal(&context);
         if !self.test_operations.is_empty() {
@@ -1465,6 +1699,51 @@ fn host_row_fill(state: Option<HostTestState>) -> Option<Color32> {
         Some(HostTestState::Failed) => Some(TEST_FAILURE_FILL),
         _ => None,
     }
+}
+
+fn rollback_import_credentials(ids: &[Uuid]) {
+    for id in ids {
+        let _ = credentials::delete_all(*id);
+    }
+}
+
+fn imported_credential(item: &import::ImportedHost) -> Option<(CredentialKind, &str)> {
+    if item.profile.protocol == Protocol::Telnet || item.profile.ssh_auth == SshAuth::Password {
+        (!item.password.is_empty()).then_some((CredentialKind::Password, item.password.as_str()))
+    } else {
+        (!item.key_passphrase.is_empty())
+            .then_some((CredentialKind::KeyPassphrase, item.key_passphrase.as_str()))
+    }
+}
+
+fn export_file_name(index: u32) -> String {
+    if index == 0 {
+        "codex-hosts-export.csv".to_owned()
+    } else {
+        format!("codex-hosts-export-{index}.csv")
+    }
+}
+
+fn write_unique_export(directory: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+    for index in 0..=u32::MAX {
+        let path = directory.join(export_file_name(index));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(bytes) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(error);
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "no available export file name",
+    ))
 }
 
 fn batch_has_external_dependents(hosts: &[HostProfile], selected: &HashSet<Uuid>) -> bool {
@@ -1537,5 +1816,55 @@ mod tests {
         target.jump_host = Some(jump.id);
         let selected = HashSet::from([jump.id]);
         assert!(batch_has_external_dependents(&[jump, target], &selected));
+    }
+
+    #[test]
+    fn export_file_names_advance_without_reusing_the_default() {
+        assert_eq!(export_file_name(0), "codex-hosts-export.csv");
+        assert_eq!(export_file_name(1), "codex-hosts-export-1.csv");
+        assert_eq!(export_file_name(2), "codex-hosts-export-2.csv");
+    }
+
+    #[test]
+    fn directory_export_advances_without_overwriting() {
+        let directory = std::env::temp_dir().join(format!("codex-hosts-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let original = directory.join(export_file_name(0));
+        fs::write(&original, b"original").unwrap();
+
+        let exported = write_unique_export(&directory, b"new").unwrap();
+        assert_eq!(exported, directory.join(export_file_name(1)));
+        assert_eq!(fs::read(&original).unwrap(), b"original");
+        assert_eq!(fs::read(&exported).unwrap(), b"new");
+
+        fs::remove_file(original).unwrap();
+        fs::remove_file(exported).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn imported_credentials_follow_the_selected_authentication_method() {
+        let password_host = import::ImportedHost {
+            profile: HostProfile::default(),
+            password: Zeroizing::new("example-password".to_owned()),
+            key_passphrase: Zeroizing::new("ignored-passphrase".to_owned()),
+        };
+        assert_eq!(
+            imported_credential(&password_host),
+            Some((CredentialKind::Password, "example-password"))
+        );
+
+        let key_host = import::ImportedHost {
+            profile: HostProfile {
+                ssh_auth: SshAuth::PrivateKey,
+                ..HostProfile::default()
+            },
+            password: Zeroizing::new("ignored-password".to_owned()),
+            key_passphrase: Zeroizing::new("example-passphrase".to_owned()),
+        };
+        assert_eq!(
+            imported_credential(&key_host),
+            Some((CredentialKind::KeyPassphrase, "example-passphrase"))
+        );
     }
 }

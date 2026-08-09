@@ -17,9 +17,9 @@
 ## Highlights
 
 - Save an alias, address, port, user name, protocol, authentication method, optional private-key path, trusted SSH host key, and optional jump host.
-- Download a CSV template and import multiple host profiles without overwriting existing aliases or credentials; extra spreadsheet columns are ignored.
+- Download a CSV template and import multiple host profiles, optionally moving passwords and key passphrases into Windows Credential Manager; sensitive source files can be deleted immediately after import, and extra spreadsheet columns are ignored.
 - Test every saved host at once with a 10-second limit per host and clear success or failure colors.
-- Select multiple hosts for batch deletion while preserving jump hosts that are still in use.
+- Select multiple hosts for batch deletion or credential-free CSV export; directory exports choose a new numbered file instead of overwriting an existing one.
 - Use SSH password and keyboard-interactive authentication, or an OpenSSH private key with an optional passphrase.
 - Store passwords and private-key passphrases only in Windows Credential Manager.
 - Build multi-hop SSH chains from saved, verified SSH hosts.
@@ -75,7 +75,7 @@ GUI edit mode accepts non-secret prefill values:
   --result-file result.json
 ```
 
-Never pass a password or private-key passphrase through chat, command-line arguments, JSON, scripts, or logs. The user enters credentials only in the masked GUI fields.
+Never pass a password or private-key passphrase through chat, command-line arguments, JSON, scripts, or logs. The only file-based exception is a CSV the user explicitly selects for import; it is treated as sensitive and the app offers to delete it immediately after moving credentials into Windows Credential Manager.
 
 Tool mode uses the same executable to read a no-credential request file and write a result file:
 
