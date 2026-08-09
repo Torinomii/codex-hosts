@@ -1,7 +1,5 @@
 # codex-hosts
 
-[English](../../README.md) | [简体中文](README_zh-CN.md) | [繁體中文](README_zh-TW.md) | [日本語](README_ja.md)
-
 <p align="center">
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="构建 Release" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 许可证" /></a>
@@ -9,6 +7,8 @@
   <img src="https://img.shields.io/badge/Rust-1.92%2B-000000?logo=rust&logoColor=white" alt="Rust 1.92 或更高版本" />
   <a href="https://linux.do/"><img src="https://img.shields.io/badge/LINUX-DO-FFB003" alt="LINUX DO 社区" /></a>
 </p>
+
+[English](../../README.md) | [简体中文](README_zh-CN.md) | [繁體中文](README_zh-TW.md) | [日本語](README_ja.md)
 
 `codex-hosts` 是一个供 Codex 使用的 Windows SSH / Telnet 主机管理工具，让 Codex 无需接触密码或密钥即可安全发起连接。
 
