@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 
 use crate::credentials::{self, CredentialKind};
 use crate::model::HostProfile;
-use crate::ssh::{OperationLimits, RemoteFailure, RemoteResult};
+use crate::ssh::{OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE};
 
 const IAC: u8 = 255;
 const DONT: u8 = 254;
@@ -35,7 +35,18 @@ pub fn execute(
         .enable_all()
         .build()
         .map_err(|error| RemoteFailure::new("RUNTIME_CREATE_FAILED", error.to_string()))?;
-    runtime.block_on(execute_async(profile, command, limits))
+    let result = runtime.block_on(bounded(
+        limits.total_timeout,
+        TOTAL_TIMEOUT_CODE,
+        "The complete Telnet operation exceeded its time limit.",
+        execute_async(profile, command, limits),
+    ));
+    if limits.total_timeout.is_some() {
+        runtime.shutdown_timeout(Duration::from_millis(50));
+    } else {
+        drop(runtime);
+    }
+    result
 }
 
 async fn execute_async(

@@ -12,6 +12,11 @@ pub enum CredentialKind {
     KeyPassphrase,
 }
 
+pub struct CredentialSnapshot {
+    password: Option<Zeroizing<String>>,
+    key_passphrase: Option<Zeroizing<String>>,
+}
+
 impl CredentialKind {
     fn account_suffix(self) -> &'static str {
         match self {
@@ -41,14 +46,50 @@ pub fn has(id: Uuid, kind: CredentialKind) -> Result<bool, CredentialError> {
     Ok(load(id, kind)?.is_some())
 }
 
-pub fn delete_all(id: Uuid) -> Result<(), CredentialError> {
-    for kind in [CredentialKind::Password, CredentialKind::KeyPassphrase] {
-        match entry(id, kind)?.delete_credential() {
-            Ok(()) | Err(KeyringError::NoEntry) => {}
-            Err(error) => return Err(error.into()),
+pub fn snapshot(id: Uuid) -> Result<CredentialSnapshot, CredentialError> {
+    Ok(CredentialSnapshot {
+        password: load(id, CredentialKind::Password)?,
+        key_passphrase: load(id, CredentialKind::KeyPassphrase)?,
+    })
+}
+
+pub fn restore(id: Uuid, snapshot: &CredentialSnapshot) -> Result<(), CredentialError> {
+    let mut first_error = None;
+    for (kind, secret) in [
+        (CredentialKind::Password, snapshot.password.as_ref()),
+        (
+            CredentialKind::KeyPassphrase,
+            snapshot.key_passphrase.as_ref(),
+        ),
+    ] {
+        let result = match secret {
+            Some(secret) => store(id, kind, secret.as_str()),
+            None => delete(id, kind),
+        };
+        if first_error.is_none()
+            && let Err(error) = result
+        {
+            first_error = Some(error);
         }
     }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+pub fn delete_all(id: Uuid) -> Result<(), CredentialError> {
+    for kind in [CredentialKind::Password, CredentialKind::KeyPassphrase] {
+        delete(id, kind)?;
+    }
     Ok(())
+}
+
+fn delete(id: Uuid, kind: CredentialKind) -> Result<(), CredentialError> {
+    match entry(id, kind)?.delete_credential() {
+        Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn entry(id: Uuid, kind: CredentialKind) -> Result<Entry, CredentialError> {

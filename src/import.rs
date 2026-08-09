@@ -72,7 +72,7 @@ pub fn parse_template(
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .flexible(true)
-        .trim(csv::Trim::All)
+        .trim(csv::Trim::Headers)
         .from_reader(bytes);
     let headers = reader.headers()?.clone();
     let columns = ImportColumns::from_headers(&headers)?;
@@ -276,8 +276,8 @@ impl ImportColumns {
     }
 
     fn read(&self, record: &csv::StringRecord) -> Result<ImportHost, ImportError> {
-        let raw_value = |index: usize| record.get(index).unwrap_or_default().trim();
-        let value = |index: usize| decode_excel_safe_cell(raw_value(index));
+        let raw_value = |index: usize| record.get(index).unwrap_or_default();
+        let value = |index: usize| decode_excel_safe_cell(raw_value(index).trim());
         let optional = |index: Option<usize>| index.map(&value).unwrap_or_default();
         let raw_optional = |index: Option<usize>| index.map(&raw_value).unwrap_or_default();
         let alias = value(self.alias).to_owned();
@@ -426,6 +426,16 @@ mod tests {
         let stored_profile = serde_json::to_string(&host.profile).unwrap();
         assert!(!stored_profile.contains("example-password"));
         assert!(!stored_profile.contains("example-passphrase"));
+    }
+
+    #[test]
+    fn preserves_credential_whitespace_exactly() {
+        let bytes = b"alias,address,username,password,key_passphrase\nserver,127.0.0.1,root,\" password \",\"  passphrase  \"\nspaces,127.0.0.2,root,\"   \",\n";
+        let batch = parse_template(bytes, &[]).unwrap();
+        assert!(batch.contains_sensitive_values);
+        assert_eq!(batch.hosts[0].password.as_str(), " password ");
+        assert_eq!(batch.hosts[0].key_passphrase.as_str(), "  passphrase  ");
+        assert_eq!(batch.hosts[1].password.as_str(), "   ");
     }
 
     #[test]

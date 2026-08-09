@@ -160,6 +160,7 @@ fn execute_request(path: &Path) -> Result<serde_json::Value, RemoteFailure> {
 
 fn limits(connect_timeout_ms: Option<u64>, command_timeout_ms: Option<u64>) -> OperationLimits {
     OperationLimits {
+        total_timeout: None,
         connect_timeout: connect_timeout_ms.map(Duration::from_millis),
         command_timeout: command_timeout_ms.map(Duration::from_millis),
     }
