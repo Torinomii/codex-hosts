@@ -70,12 +70,6 @@ impl HostStore {
             .find(|host| host.alias.eq_ignore_ascii_case(alias.trim()))
     }
 
-    pub fn find_alias_mut(&mut self, alias: &str) -> Option<&mut HostProfile> {
-        self.hosts
-            .iter_mut()
-            .find(|host| host.alias.eq_ignore_ascii_case(alias.trim()))
-    }
-
     pub fn next_neutral_alias(&self) -> String {
         let mut number = 1_u32;
         loop {

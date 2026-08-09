@@ -3,6 +3,7 @@
 mod connection;
 mod credentials;
 mod i18n;
+mod import;
 mod model;
 mod ssh;
 mod storage;
