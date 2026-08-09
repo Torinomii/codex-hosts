@@ -9,6 +9,8 @@
     "import_hosts": "Import hosts",
     "test_all": "Test all",
     "batch_manage": "Batch manage",
+    "select_all": "Select all",
+    "deselect_all": "Clear all",
     "editor_new_title": "Add host",
     "editor_edit_title": "Host details",
     "editor_subtitle": "Connection secrets are stored only in Windows Credential Manager.",

@@ -9,6 +9,8 @@
     "import_hosts": "匯入主機",
     "test_all": "全部測試",
     "batch_manage": "批次管理",
+    "select_all": "全選",
+    "deselect_all": "取消全選",
     "editor_new_title": "新增主機",
     "editor_edit_title": "主機詳細資料",
     "editor_subtitle": "連線認證僅儲存在 Windows 認證管理員中。",

@@ -9,6 +9,8 @@
     "import_hosts": "ホストをインポート",
     "test_all": "すべてテスト",
     "batch_manage": "一括管理",
+    "select_all": "すべて選択",
+    "deselect_all": "選択を解除",
     "editor_new_title": "ホストを追加",
     "editor_edit_title": "ホストの詳細",
     "editor_subtitle": "接続用の秘密情報は Windows 資格情報マネージャーだけに保存されます。",
