@@ -76,7 +76,7 @@
     "delete_message": "此主机条目将被移除，Windows 凭据管理器中的相关凭据也会一并删除。",
     "confirm_delete": "删除主机",
     "import_title": "导入主机",
-    "import_hint": "先下载 JSON 模板并填写非敏感主机信息，再导入模板。密码和私钥口令不会被导入。",
+    "import_hint": "先下载 CSV 模板并填写主机信息，再导入模板。电子表格添加的额外列会被忽略，密码和私钥口令不会被导入。",
     "download_template": "下载模板",
     "import_template": "导入模板",
     "template_saved": "导入模板已保存到 {path}。",
