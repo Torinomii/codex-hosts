@@ -17,6 +17,9 @@
 ## Highlights
 
 - Save an alias, address, port, user name, protocol, authentication method, optional private-key path, trusted SSH host key, and optional jump host.
+- Download a secret-free JSON template and import multiple host profiles without overwriting existing aliases or credentials.
+- Test every saved host at once with a 10-second limit per host and clear success or failure colors.
+- Select multiple hosts for batch deletion while preserving jump hosts that are still in use.
 - Use SSH password and keyboard-interactive authentication, or an OpenSSH private key with an optional passphrase.
 - Store passwords and private-key passphrases only in Windows Credential Manager.
 - Build multi-hop SSH chains from saved, verified SSH hosts.
