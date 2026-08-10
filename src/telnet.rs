@@ -82,13 +82,18 @@ async fn execute_async(
         run_session(&mut stream, &profile.username, password.as_str(), command),
     )
     .await?;
+    let output_truncated = output.len() >= MAX_CAPTURE_BYTES;
     Ok(RemoteResult {
         status: "ok",
         alias: profile.alias.clone(),
         exit_code: 0,
         stdout: output,
         stderr: String::new(),
+        output_truncated,
         host_fingerprint: None,
+        host_key_algorithm: None,
+        auth_key_fingerprint: None,
+        verified_host_keys: Vec::new(),
     })
 }
 

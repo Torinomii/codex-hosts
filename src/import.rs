@@ -16,6 +16,7 @@ struct ImportHost {
     protocol: Protocol,
     ssh_auth: SshAuth,
     private_key_path: String,
+    agent_key_fingerprint: String,
     jump_host: Option<String>,
     password: Zeroizing<String>,
     key_passphrase: Zeroizing<String>,
@@ -44,7 +45,9 @@ pub enum ImportError {
     InvalidPort { alias: String, value: String },
     #[error("host {alias} has an invalid protocol: {value}")]
     InvalidProtocol { alias: String, value: String },
-    #[error("host {alias} has an invalid SSH authentication method: {value}")]
+    #[error(
+        "host {alias} has an invalid SSH authentication method: {value}; use password, private_key/fido_handle (key file or direct FIDO handle), or ssh_agent (running SSH Agent/Pageant)"
+    )]
     InvalidSshAuth { alias: String, value: String },
     #[error("the template contains no hosts")]
     Empty,
@@ -61,7 +64,7 @@ pub enum ImportError {
 }
 
 pub fn template_bytes() -> Vec<u8> {
-    b"\xEF\xBB\xBFalias,address,port,username,protocol,ssh_auth,private_key_path,jump_host,password,key_passphrase\r\nexample,server.example.com,22,operator,ssh,password,,,,\r\n".to_vec()
+    b"\xEF\xBB\xBFalias,address,port,username,protocol,ssh_auth,private_key_path,agent_key_fingerprint,jump_host,password,key_passphrase\r\nexample,server.example.com,22,operator,ssh,password,,,,,\r\n".to_vec()
 }
 
 pub fn parse_template(
@@ -109,7 +112,11 @@ pub fn parse_template(
             protocol: item.protocol,
             ssh_auth: item.ssh_auth,
             private_key_path: item.private_key_path.trim().to_owned(),
+            agent_key_fingerprint: item.agent_key_fingerprint.trim().to_owned(),
             host_fingerprint: None,
+            host_key_algorithm: None,
+            host_key_first_seen_unix: None,
+            host_key_last_verified_unix: None,
             jump_host: None,
             verified: false,
         };
@@ -182,8 +189,12 @@ pub fn export_bytes(selected: &[HostProfile], all_hosts: &[HostProfile]) -> csv:
             "protocol",
             "ssh_auth",
             "private_key_path",
+            "agent_key_fingerprint",
             "jump_host",
             "host_fingerprint",
+            "host_key_algorithm",
+            "host_key_first_seen_unix",
+            "host_key_last_verified_unix",
             "verified",
         ])?;
         for host in selected {
@@ -196,6 +207,7 @@ pub fn export_bytes(selected: &[HostProfile], all_hosts: &[HostProfile]) -> csv:
             let address = excel_safe_cell(&host.address);
             let username = excel_safe_cell(&host.username);
             let private_key_path = excel_safe_cell(&host.private_key_path);
+            let agent_key_fingerprint = excel_safe_cell(&host.agent_key_fingerprint);
             let jump_alias = excel_safe_cell(jump_alias);
             let host_fingerprint =
                 excel_safe_cell(host.host_fingerprint.as_deref().unwrap_or_default());
@@ -207,8 +219,18 @@ pub fn export_bytes(selected: &[HostProfile], all_hosts: &[HostProfile]) -> csv:
                 host.protocol.stable_name(),
                 host.ssh_auth.stable_name(),
                 private_key_path.as_ref(),
+                agent_key_fingerprint.as_ref(),
                 jump_alias.as_ref(),
                 host_fingerprint.as_ref(),
+                host.host_key_algorithm.as_deref().unwrap_or_default(),
+                &host
+                    .host_key_first_seen_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                &host
+                    .host_key_last_verified_unix
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
                 if host.verified { "true" } else { "false" },
             ])?;
         }
@@ -226,6 +248,7 @@ struct ImportColumns {
     protocol: Option<usize>,
     ssh_auth: Option<usize>,
     private_key_path: Option<usize>,
+    agent_key_fingerprint: Option<usize>,
     jump_host: Option<usize>,
     password: Option<usize>,
     key_passphrase: Option<usize>,
@@ -245,6 +268,7 @@ impl ImportColumns {
                     | "protocol"
                     | "ssh_auth"
                     | "private_key_path"
+                    | "agent_key_fingerprint"
                     | "jump_host"
                     | "password"
                     | "key_passphrase"
@@ -269,6 +293,7 @@ impl ImportColumns {
             protocol: known.get("protocol").copied(),
             ssh_auth: known.get("ssh_auth").copied(),
             private_key_path: known.get("private_key_path").copied(),
+            agent_key_fingerprint: known.get("agent_key_fingerprint").copied(),
             jump_host: known.get("jump_host").copied(),
             password: known.get("password").copied(),
             key_passphrase: known.get("key_passphrase").copied(),
@@ -295,7 +320,10 @@ impl ImportColumns {
         let ssh_auth_text = optional(self.ssh_auth);
         let ssh_auth = match ssh_auth_text.to_ascii_lowercase().as_str() {
             "" | "password" => SshAuth::Password,
-            "private_key" | "private-key" => SshAuth::PrivateKey,
+            "private_key" | "private-key" | "fido" | "fido_handle" | "fido-handle" => {
+                SshAuth::PrivateKey
+            }
+            "ssh_agent" | "ssh-agent" | "agent" => SshAuth::SshAgent,
             _ => {
                 return Err(ImportError::InvalidSshAuth {
                     alias,
@@ -324,6 +352,7 @@ impl ImportColumns {
             protocol,
             ssh_auth,
             private_key_path: optional(self.private_key_path).to_owned(),
+            agent_key_fingerprint: optional(self.agent_key_fingerprint).to_owned(),
             jump_host: self
                 .jump_host
                 .map(&value)
@@ -457,6 +486,17 @@ mod tests {
     }
 
     #[test]
+    fn fido_handle_alias_maps_to_direct_key_file_authentication() {
+        let bytes = b"alias,address,username,ssh_auth,private_key_path\nsecurity-key,127.0.0.1,root,fido_handle,C:\\keys\\id_ed25519_sk\n";
+        let batch = parse_template(bytes, &[]).unwrap();
+        assert_eq!(batch.hosts[0].profile.ssh_auth, SshAuth::PrivateKey);
+        assert_eq!(
+            batch.hosts[0].profile.private_key_path,
+            r"C:\keys\id_ed25519_sk"
+        );
+    }
+
+    #[test]
     fn requires_only_the_core_columns() {
         let bytes = b"alias,address\nserver,127.0.0.1\n";
         assert!(matches!(
@@ -489,8 +529,17 @@ mod tests {
         let bytes = export_bytes(std::slice::from_ref(&target), &all_hosts).unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with('\u{feff}'));
-        assert!(text.contains("target,10.0.0.2,22,operator,ssh,private_key"));
-        assert!(text.contains(r"C:\keys\target,jump,SHA256:example,true"));
+        let mut reader = csv::Reader::from_reader(text.trim_start_matches('\u{feff}').as_bytes());
+        let headers = reader.headers().unwrap().clone();
+        let record = reader.records().next().unwrap().unwrap();
+        let field = |name: &str| record.get(headers.iter().position(|item| item == name).unwrap());
+        assert_eq!(field("alias"), Some("target"));
+        assert_eq!(field("ssh_auth"), Some("private_key"));
+        assert_eq!(field("private_key_path"), Some(r"C:\keys\target"));
+        assert_eq!(field("agent_key_fingerprint"), Some(""));
+        assert_eq!(field("jump_host"), Some("jump"));
+        assert_eq!(field("host_fingerprint"), Some("SHA256:example"));
+        assert_eq!(field("verified"), Some("true"));
         assert!(!text.contains("password,key_passphrase"));
     }
 

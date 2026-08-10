@@ -2,6 +2,7 @@
 
 mod connection;
 mod credentials;
+mod fido;
 mod i18n;
 mod import;
 mod model;
@@ -89,18 +90,29 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
                 options.prefill.ssh_auth =
                     Some(match next_value(&args, &mut index, flag)?.as_str() {
                         "password" => SshAuth::Password,
-                        "private-key" | "private_key" => SshAuth::PrivateKey,
-                        _ => return Err("invalid authentication method".to_owned()),
+                        "private-key" | "private_key" | "fido" | "fido-handle"
+                        | "fido_handle" => SshAuth::PrivateKey,
+                        "ssh-agent" | "ssh_agent" | "agent" => SshAuth::SshAgent,
+                        _ => return Err(
+                            "invalid authentication method; use password, private-key/fido-handle (key file or direct FIDO handle), or ssh-agent (running SSH Agent/Pageant)"
+                                .to_owned(),
+                        ),
                     })
             }
             "--key-path" => {
                 options.prefill.private_key_path = Some(next_value(&args, &mut index, flag)?)
+            }
+            "--agent-key-fingerprint" => {
+                options.prefill.agent_key_fingerprint = Some(next_value(&args, &mut index, flag)?)
             }
             "--jump-host" => {
                 options.prefill.jump_alias = Some(next_value(&args, &mut index, flag)?)
             }
             "--observed-fingerprint" => {
                 options.observed_fingerprint = Some(next_value(&args, &mut index, flag)?)
+            }
+            "--observed-algorithm" => {
+                options.observed_algorithm = Some(next_value(&args, &mut index, flag)?)
             }
             "--result-file" => {
                 options.result_path = Some(PathBuf::from(next_value(&args, &mut index, flag)?))
@@ -138,5 +150,28 @@ impl From<Prefill> for ui::LaunchOptions {
             prefill,
             ..Self::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fido_handle_cli_alias_selects_direct_key_file_route() {
+        let mode = parse_args(vec!["--auth".to_owned(), "fido-handle".to_owned()]).unwrap();
+        let LaunchMode::Gui(options) = mode else {
+            panic!("expected GUI launch mode");
+        };
+        assert_eq!(options.prefill.ssh_auth, Some(SshAuth::PrivateKey));
+    }
+
+    #[test]
+    fn invalid_authentication_error_explains_agent_and_direct_fido_routes() {
+        let error = parse_args(vec!["--auth".to_owned(), "hardware-key".to_owned()])
+            .err()
+            .expect("invalid authentication must fail");
+        assert!(error.contains("fido-handle"));
+        assert!(error.contains("SSH Agent/Pageant"));
     }
 }

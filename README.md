@@ -10,61 +10,58 @@
 
 [English](README.md) | [简体中文](docs/readme/README_zh-CN.md) | [繁體中文](docs/readme/README_zh-TW.md) | [日本語](docs/readme/README_ja.md)
 
-`codex-hosts` is a Windows SSH / Telnet host manager for Codex, allowing Codex to initiate connections securely without accessing passwords or private keys.
+`codex-hosts` is a Windows SSH / Telnet host manager for Codex. It lets Codex connect safely without handling your passwords or keys.
 
 ![Codex Hosts main window](Main.png)
 
-## Highlights
+## What it does
 
-- Save an alias, address, port, user name, protocol, authentication method, optional private-key path, trusted SSH host key, and optional jump host.
-- Download a CSV template and import multiple host profiles, optionally moving passwords and key passphrases into Windows Credential Manager; sensitive source files can be deleted immediately after import, and extra spreadsheet columns are ignored.
-- Test every saved host at once with a 10-second limit per host and clear success or failure colors.
-- Select multiple hosts for batch deletion or credential-free CSV export; directory exports choose a new numbered file instead of overwriting an existing one.
-- Use SSH password and keyboard-interactive authentication, or an OpenSSH private key with an optional passphrase.
-- Store passwords and private-key passphrases only in Windows Credential Manager.
-- Build multi-hop SSH chains from saved, verified SSH hosts.
-- Let Codex pre-create an alias-specific draft and wait for Save, Trust, or Cancel without asking for credentials in chat.
+- Saves server details for Codex to use when connecting.
+- Supports passwords, ordinary OpenSSH keys, and hardware-backed keys such as FIDO/YubiKey.
+- Supports identities already loaded in Windows OpenSSH Agent or Pageant.
 
 ## Installation
 
-### Download a Release
+### Download a release
 
-The prebuilt package supports 64-bit Windows 10 or newer and can be downloaded from [Releases](https://github.com/Torinomii/codex-hosts/releases/latest).
+The prebuilt version supports 64-bit Windows 10 or newer. Download it from [Releases](https://github.com/Torinomii/codex-hosts/releases/latest).
 
-### Install
+To install it manually:
 
-Copy `bin\codex-hosts.exe` to `skill\codex-hosts\bin\codex-hosts.exe`, then copy the `skill\codex-hosts` directory to `%USERPROFILE%\.codex\skills\codex-hosts`.
+1. Put `bin\codex-hosts.exe` at `skill\codex-hosts\bin\codex-hosts.exe`.
+2. Copy the complete `skill\codex-hosts` folder to `%USERPROFILE%\.codex\skills\codex-hosts`.
 
-### Install with a Codex prompt
+You can also ask Codex to install it:
 
 ```text
-Download the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest and install it: automatically identify the Skill installation directory in the current environment, install the complete codex-hosts Skill and executable in the correct location, and confirm that the Skill, executable, and required configuration files exist.
+Download and install the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest. Automatically find the Skill installation directory for the current environment, install the complete Skill and executable, and confirm that all required files are in place.
 ```
 
 ### Build from source
 
-Source builds require Rust 1.92 or newer with the MSVC toolchain:
+Source builds require Rust 1.92 or newer and the MSVC toolchain:
 
-```
+```powershell
 git clone https://github.com/Torinomii/codex-hosts.git
 cd codex-hosts
 cargo build --locked --release
 ```
 
-Copy `target\release\codex-hosts.exe` to `skill\codex-hosts\bin\codex-hosts.exe`, then install the complete `skill\codex-hosts` directory as `%USERPROFILE%\.codex\skills\codex-hosts`.
+When the build finishes, copy `target\release\codex-hosts.exe` to `skill\codex-hosts\bin\codex-hosts.exe`, then install the complete Skill folder.
 
-### How to use
+## Quick start
 
-1. After the skill and executable are installed correctly, Codex opens codex-hosts and asks you to enter a password when it needs a new remote connection.
-2. You can also enter the connection details in codex-hosts beforehand, then ask Codex to identify and use the saved information to connect.
+1. Open `codex-hosts.exe` and create a host.
+2. Enter an alias, address, port, and user name, then choose how to sign in and save.
 
-## Codex integration
+<details>
+<summary>Interface</summary>
 
-The repository includes a portable Codex skill in `skill\codex-hosts`. After installation, its `SKILL.md` resolves `bin\codex-hosts.exe` relative to the installed skill directory, so no repository-specific path edit is required.
+### Calling from Codex or a script
 
-GUI edit mode accepts non-secret prefill values:
+GUI edit mode can be prefilled with non-secret connection details:
 
-```
+```powershell
 .\bin\codex-hosts.exe --codex-edit `
   --alias example `
   --host server.example.com `
@@ -75,22 +72,35 @@ GUI edit mode accepts non-secret prefill values:
   --result-file result.json
 ```
 
-Never pass a password or private-key passphrase through chat, command-line arguments, JSON, scripts, or logs. The only file-based exception is a CSV the user explicitly selects for import; it is treated as sensitive and the app offers to delete it immediately after moving credentials into Windows Credential Manager.
+Authentication arguments use stable names:
 
-Tool mode uses the same executable to read a no-credential request file and write a result file:
+- `password`: password authentication.
+- `private-key` / `private_key`: a key file or FIDO handle; `fido-handle` is also accepted.
+- `ssh-agent` / `ssh_agent`: a running SSH Agent or Pageant.
+
+Tool mode reads a request file and writes a result file. Neither file may contain credentials:
 
 ```json
+{"action":"capabilities"}
 {"action":"list_hosts"}
+{"action":"agent_identities"}
+{"action":"fido_identities"}
 {"action":"probe","alias":"example"}
 {"action":"exec","alias":"example","command":"hostname"}
+{"action":"exec_many","alias":"example","commands":["hostname","uptime"],"max_concurrency":8}
+{"action":"batch_probe","aliases":["web-1","web-2"],"max_concurrency":8,"batch_timeout_ms":30000}
+{"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
 ```
 
-`probe` and `exec` may include per-operation `connect_timeout_ms` and `command_timeout_ms`. Omit them when no application-level timeout is needed. Saved hosts do not contain fixed timeouts, and remote commands are sent verbatim without guessing the remote operating system.
+`exec_many` authenticates once, then runs several short commands through concurrent channels on the same SSH connection. With a hardware key, this normally reduces a group of commands to one authentication. `agent_identities` and `fido_identities` return only public identity details and public keys. When running remote commands, check `output_truncated` in the result to see whether any output was shortened by the size limit.
+
+</details>
 
 ## Security boundaries
 
-- Passwords and private-key passphrases are stored only in Windows Credential Manager and are never returned to Codex.
-- SSH fingerprints are pinned explicitly and are never replaced automatically.
-- Only verified SSH profiles can be jump hosts; chains are checked for cycles and limited to eight hosts.
-- Telnet is plaintext and should be used only on a trusted network where that risk is explicitly accepted.
-- Captured command output is limited to one MiB per output stream.
+- Passwords and key-file passphrases are stored only in Windows Credential Manager. A FIDO PIN is used only for the current operation and is never saved.
+- SSH host fingerprints must be explicitly confirmed by the user. The app never replaces a saved fingerprint automatically.
+- Direct FIDO signing never starts or enables an Agent service, and Agent forwarding is always disabled.
+- Only verified SSH hosts can be used as jump hosts. A chain can contain at most eight hosts and is checked for loops.
+- Telnet sends accounts and data in plaintext. Use it only on a trusted network where you explicitly accept that risk.
+- A single command can capture at most 1 MiB of output. A complete `exec_many` or batch JSON result is limited to 8 MiB. The budget is applied while output is received, and the result is written directly instead of building several large JSON copies in memory.

@@ -34,6 +34,7 @@ pub enum SshAuth {
     #[default]
     Password,
     PrivateKey,
+    SshAgent,
 }
 
 impl SshAuth {
@@ -41,6 +42,7 @@ impl SshAuth {
         match self {
             Self::Password => "password",
             Self::PrivateKey => "private_key",
+            Self::SshAgent => "ssh_agent",
         }
     }
 }
@@ -56,7 +58,11 @@ pub struct HostProfile {
     pub protocol: Protocol,
     pub ssh_auth: SshAuth,
     pub private_key_path: String,
+    pub agent_key_fingerprint: String,
     pub host_fingerprint: Option<String>,
+    pub host_key_algorithm: Option<String>,
+    pub host_key_first_seen_unix: Option<u64>,
+    pub host_key_last_verified_unix: Option<u64>,
     pub jump_host: Option<Uuid>,
     pub verified: bool,
 }
@@ -72,7 +78,11 @@ impl Default for HostProfile {
             protocol: Protocol::Ssh,
             ssh_auth: SshAuth::Password,
             private_key_path: String::new(),
+            agent_key_fingerprint: String::new(),
             host_fingerprint: None,
+            host_key_algorithm: None,
+            host_key_first_seen_unix: None,
+            host_key_last_verified_unix: None,
             jump_host: None,
             verified: false,
         }
@@ -119,6 +129,7 @@ impl HostProfile {
             && self.protocol == other.protocol
             && self.ssh_auth == other.ssh_auth
             && self.private_key_path.trim() == other.private_key_path.trim()
+            && self.agent_key_fingerprint.trim() == other.agent_key_fingerprint.trim()
             && self.jump_host == other.jump_host
     }
 
@@ -146,6 +157,9 @@ impl HostProfile {
         }
         if let Some(path) = &prefill.private_key_path {
             self.private_key_path.clone_from(path);
+        }
+        if let Some(fingerprint) = &prefill.agent_key_fingerprint {
+            self.agent_key_fingerprint.clone_from(fingerprint);
         }
     }
 }
@@ -184,6 +198,7 @@ pub struct Prefill {
     pub protocol: Option<Protocol>,
     pub ssh_auth: Option<SshAuth>,
     pub private_key_path: Option<String>,
+    pub agent_key_fingerprint: Option<String>,
     pub jump_alias: Option<String>,
 }
 
@@ -277,5 +292,20 @@ mod tests {
             resolve_ssh_chain(&first, &hosts),
             Err(ValidationIssue::Chain)
         );
+    }
+
+    #[test]
+    fn older_profiles_gain_safe_agent_and_host_key_defaults() {
+        let profile: HostProfile = serde_json::from_value(serde_json::json!({
+            "alias": "legacy",
+            "address": "127.0.0.1",
+            "username": "tester"
+        }))
+        .unwrap();
+        assert_eq!(profile.ssh_auth, SshAuth::Password);
+        assert!(profile.agent_key_fingerprint.is_empty());
+        assert!(profile.host_key_algorithm.is_none());
+        assert!(profile.host_key_first_seen_unix.is_none());
+        assert!(profile.host_key_last_verified_unix.is_none());
     }
 }

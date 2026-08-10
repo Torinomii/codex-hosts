@@ -101,4 +101,41 @@ mod tests {
             assert!(!catalog.text("app_title").is_empty());
         }
     }
+
+    #[test]
+    fn authentication_labels_keep_hardware_files_and_agent_routes_distinct() {
+        let expected = [
+            (
+                "en",
+                "Key file / hardware key",
+                "SSH Agent / Pageant",
+                "Find saved hardware-key file",
+            ),
+            (
+                "zh-CN",
+                "密钥文件 / 硬件密钥",
+                "SSH Agent / Pageant",
+                "查找已保存的硬件密钥文件",
+            ),
+            (
+                "zh-TW",
+                "金鑰檔案 / 硬體金鑰",
+                "SSH Agent / Pageant",
+                "尋找已儲存的硬體金鑰檔案",
+            ),
+            (
+                "ja",
+                "鍵ファイル / ハードウェアキー",
+                "SSH Agent / Pageant",
+                "保存済みハードウェアキー用ファイルを検索",
+            ),
+        ];
+        for (locale, direct, agent, find_hardware_file) in expected {
+            let catalog = Catalog::for_locale(Some(locale));
+            assert_eq!(catalog.text("private_key_auth"), direct);
+            assert_eq!(catalog.text("ssh_agent_auth"), agent);
+            assert_eq!(catalog.text("find_fido_key"), find_hardware_file);
+            assert!(catalog.text("fido_setup_hint").contains("SSH"));
+        }
+    }
 }
