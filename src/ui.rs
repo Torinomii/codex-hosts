@@ -16,10 +16,13 @@ use zeroize::Zeroizing;
 
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
+use crate::fido::{self, FidoKeyInfo};
 use crate::i18n::Catalog;
 use crate::import;
 use crate::model::{HostProfile, Prefill, Protocol, SshAuth, can_use_as_jump};
-use crate::ssh::{OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE};
+use crate::ssh::{
+    OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE, VerifiedHostKey,
+};
 use crate::storage::HostStore;
 
 #[derive(Debug, Clone, Default)]
@@ -28,6 +31,7 @@ pub struct LaunchOptions {
     pub prefill: Prefill,
     pub result_path: Option<PathBuf>,
     pub observed_fingerprint: Option<String>,
+    pub observed_algorithm: Option<String>,
 }
 
 struct HostEditor {
@@ -64,6 +68,7 @@ impl HostEditor {
 }
 
 const GUI_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+const GUI_INTERACTIVE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_TESTS: usize = 8;
 const TEST_SUCCESS_FILL: Color32 = Color32::from_rgb(36, 105, 67);
 const TEST_FAILURE_FILL: Color32 = Color32::from_rgb(132, 48, 53);
@@ -72,6 +77,7 @@ const SELECTED_ROW_STROKE: Color32 = Color32::from_rgb(230, 230, 230);
 struct TestOperation {
     receiver: Receiver<(Instant, Result<RemoteResult, RemoteFailure>)>,
     started_at: Instant,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,6 +93,8 @@ struct FingerprintPrompt {
     alias: String,
     expected: Option<String>,
     observed: String,
+    expected_algorithm: Option<String>,
+    observed_algorithm: Option<String>,
     retry_test: bool,
     close_after_choice: bool,
 }
@@ -100,6 +108,23 @@ enum EditorAction {
     Save,
     Test,
     CancelCodex,
+    BrowsePrivateKey,
+    DiscoverFido,
+    OpenFidoSetup,
+}
+
+struct FidoSetupPrompt {
+    pin: Zeroizing<String>,
+    operation: Option<Receiver<Result<Vec<FidoKeyInfo>, String>>>,
+    status: Option<String>,
+    identity: Option<FidoKeyInfo>,
+}
+
+#[derive(Clone, Copy)]
+enum FidoSetupAction {
+    CreateRecommended,
+    CreateCompatible,
+    RecoverResident,
 }
 
 pub struct HostsApp {
@@ -113,10 +138,13 @@ pub struct HostsApp {
     test_hosts_snapshot: Option<Arc<Vec<HostProfile>>>,
     test_states: HashMap<Uuid, HostTestState>,
     testing_all: bool,
+    test_store_dirty: bool,
+    repaint_context: egui::Context,
     fingerprint_prompt: Option<FingerprintPrompt>,
     delete_prompt: bool,
     import_window_open: bool,
     import_cleanup_prompt: Option<ImportCleanupPrompt>,
+    fido_setup_prompt: Option<FidoSetupPrompt>,
     batch_mode: bool,
     batch_selected: HashSet<Uuid>,
     batch_delete_prompt: bool,
@@ -127,11 +155,11 @@ pub struct HostsApp {
 
 impl HostsApp {
     pub fn new(context: &eframe::CreationContext<'_>, launch: LaunchOptions) -> Self {
-        configure_fonts(&context.egui_ctx);
         context.egui_ctx.set_zoom_factor(1.06);
 
         let mut store = HostStore::load().unwrap_or_default();
         let catalog = Catalog::for_locale(store.preferred_locale.as_deref());
+        configure_fonts(&context.egui_ctx, catalog.locale());
         let mut selected = store.hosts.first().map(|host| host.id);
 
         if launch.codex_edit {
@@ -174,6 +202,8 @@ impl HostsApp {
                 alias: editor.profile.alias.clone(),
                 expected: editor.profile.host_fingerprint.clone(),
                 observed: observed.clone(),
+                expected_algorithm: editor.profile.host_key_algorithm.clone(),
+                observed_algorithm: launch.observed_algorithm.clone(),
                 retry_test: false,
                 close_after_choice: true,
             })
@@ -194,10 +224,13 @@ impl HostsApp {
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
             testing_all: false,
+            test_store_dirty: false,
+            repaint_context: context.egui_ctx.clone(),
             fingerprint_prompt,
             delete_prompt: false,
             import_window_open: false,
             import_cleanup_prompt: None,
+            fido_setup_prompt: None,
             batch_mode: false,
             batch_selected: HashSet::new(),
             batch_delete_prompt: false,
@@ -284,9 +317,14 @@ impl HostsApp {
         editor.profile.address = editor.profile.address.trim().to_owned();
         editor.profile.username = editor.profile.username.trim().to_owned();
         editor.profile.private_key_path = editor.profile.private_key_path.trim().to_owned();
+        editor.profile.agent_key_fingerprint =
+            editor.profile.agent_key_fingerprint.trim().to_owned();
         if editor.profile.protocol == Protocol::Telnet {
             editor.profile.jump_host = None;
             editor.profile.host_fingerprint = None;
+            editor.profile.host_key_algorithm = None;
+            editor.profile.host_key_first_seen_unix = None;
+            editor.profile.host_key_last_verified_unix = None;
         }
         let stored = self
             .store
@@ -299,6 +337,9 @@ impl HostsApp {
             self.catalog
                 .format("storage_error", &[("error", &error.to_string())])
         })?;
+        if invalidate_test_state {
+            crate::ssh::invalidate_profile(editor.profile.id);
+        }
         editor.original.clone_from(&editor.profile);
         Ok(())
     }
@@ -349,15 +390,21 @@ impl HostsApp {
         };
         let (sender, receiver) = mpsc::channel();
         let started_at = Instant::now();
+        let timeout = gui_test_timeout(&profile, hosts.as_ref());
+        let repaint_context = self.repaint_context.clone();
+        self.repaint_context.request_repaint_after(timeout);
         thread::spawn(move || {
-            let result = connection::probe(&profile, hosts.as_ref(), gui_test_limits());
-            let _ = sender.send((Instant::now(), result));
+            let result = connection::probe(&profile, hosts.as_ref(), gui_test_limits(timeout));
+            if sender.send((Instant::now(), result)).is_ok() {
+                repaint_context.request_repaint();
+            }
         });
         self.test_operations.insert(
             id,
             TestOperation {
                 receiver,
                 started_at,
+                timeout,
             },
         );
         self.test_states.insert(id, HostTestState::Testing);
@@ -417,12 +464,15 @@ impl HostsApp {
         for (&id, operation) in &self.test_operations {
             match operation.receiver.try_recv() {
                 Ok((finished_at, result)) => {
-                    if test_timed_out(finished_at.duration_since(operation.started_at)) {
+                    if test_timed_out(
+                        finished_at.duration_since(operation.started_at),
+                        operation.timeout,
+                    ) {
                         completed.push((
                             id,
                             Err(RemoteFailure::new(
                                 "TEST_TIMEOUT",
-                                "The connection test exceeded 10 seconds.",
+                                "The connection test exceeded its configured time limit.",
                             )),
                         ));
                     } else {
@@ -437,13 +487,13 @@ impl HostsApp {
                     )),
                 )),
                 Err(mpsc::TryRecvError::Empty)
-                    if test_timed_out(operation.started_at.elapsed()) =>
+                    if test_timed_out(operation.started_at.elapsed(), operation.timeout) =>
                 {
                     completed.push((
                         id,
                         Err(RemoteFailure::new(
                             "TEST_TIMEOUT",
-                            "The connection test exceeded 10 seconds.",
+                            "The connection test exceeded its configured time limit.",
                         )),
                     ));
                 }
@@ -460,6 +510,10 @@ impl HostsApp {
         if self.testing_all && self.tests_idle() {
             self.testing_all = false;
             self.test_hosts_snapshot = None;
+            if self.test_store_dirty {
+                let _ = self.store.save();
+                self.test_store_dirty = false;
+            }
             let succeeded = self
                 .test_states
                 .values()
@@ -484,16 +538,38 @@ impl HostsApp {
             Ok(result) => {
                 self.test_states.insert(id, HostTestState::Succeeded);
                 let identity = result.stdout.trim().to_owned();
-                if let Some(editor) = &mut self.editor
-                    && editor.profile.id == id
-                {
-                    editor.profile.verified = true;
-                    editor.original.verified = true;
+                for verified in &result.verified_host_keys {
+                    if let Some(stored) = self
+                        .store
+                        .hosts
+                        .iter_mut()
+                        .find(|host| host.id == verified.host_id)
+                    {
+                        self.test_store_dirty |= apply_verified_host_key(stored, verified);
+                    }
+                    if let Some(editor) = &mut self.editor
+                        && editor.profile.id == verified.host_id
+                    {
+                        editor.profile.verified = true;
+                        editor.profile.host_key_algorithm = Some(verified.algorithm.clone());
+                        editor.profile.host_key_first_seen_unix = editor
+                            .profile
+                            .host_key_first_seen_unix
+                            .or(Some(verified.verified_at_unix));
+                        editor.profile.host_key_last_verified_unix = Some(
+                            editor
+                                .profile
+                                .host_key_last_verified_unix
+                                .unwrap_or_default()
+                                .max(verified.verified_at_unix),
+                        );
+                        editor.original.clone_from(&editor.profile);
+                    }
                 }
-                if let Some(stored) = self.store.hosts.iter_mut().find(|host| host.id == id) {
-                    stored.verified = true;
+                if !self.testing_all && self.test_store_dirty {
+                    let _ = self.store.save();
+                    self.test_store_dirty = false;
                 }
-                let _ = self.store.save();
                 if !self.testing_all && self.selected == Some(id) {
                     self.status = self
                         .catalog
@@ -502,21 +578,33 @@ impl HostsApp {
             }
             Err(error)
                 if matches!(error.code, "HOSTKEY_UNKNOWN" | "HOSTKEY_MISMATCH")
-                    && error.observed_fingerprint.is_some() =>
+                    && error
+                        .host_key
+                        .as_ref()
+                        .is_some_and(|details| details.observed_fingerprint.is_some()) =>
             {
                 self.test_states.insert(id, HostTestState::Failed);
                 if !self.testing_all && self.selected == Some(id) {
+                    let details = error.host_key.unwrap_or_default();
                     self.fingerprint_prompt = Some(FingerprintPrompt {
                         host_id: id,
                         alias: error
                             .host_alias
                             .map(|value| value.into_string())
                             .unwrap_or_default(),
-                        expected: error.expected_fingerprint.map(|value| value.into_string()),
-                        observed: error
+                        expected: details
+                            .expected_fingerprint
+                            .map(|value| value.into_string()),
+                        observed: details
                             .observed_fingerprint
                             .map(|value| value.into_string())
                             .unwrap_or_default(),
+                        expected_algorithm: details
+                            .expected_algorithm
+                            .map(|value| value.into_string()),
+                        observed_algorithm: details
+                            .observed_algorithm
+                            .map(|value| value.into_string()),
                         retry_test: true,
                         close_after_choice: false,
                     });
@@ -555,14 +643,23 @@ impl HostsApp {
             .find(|host| host.id == prompt.host_id)
         {
             host.host_fingerprint = Some(prompt.observed.clone());
+            host.host_key_algorithm = prompt.observed_algorithm.clone();
+            host.host_key_first_seen_unix = None;
+            host.host_key_last_verified_unix = None;
             host.verified = false;
         }
         if let Some(editor) = &mut self.editor
             && editor.profile.id == prompt.host_id
         {
             editor.profile.host_fingerprint = Some(prompt.observed.clone());
+            editor.profile.host_key_algorithm = prompt.observed_algorithm.clone();
+            editor.profile.host_key_first_seen_unix = None;
+            editor.profile.host_key_last_verified_unix = None;
             editor.profile.verified = false;
             editor.original.host_fingerprint = Some(prompt.observed.clone());
+            editor.original.host_key_algorithm = prompt.observed_algorithm.clone();
+            editor.original.host_key_first_seen_unix = None;
+            editor.original.host_key_last_verified_unix = None;
             editor.original.verified = false;
         }
         let _ = self.store.save();
@@ -600,6 +697,7 @@ impl HostsApp {
         self.pending_tests.retain(|pending| *pending != id);
         self.test_states.remove(&id);
         self.store.hosts.retain(|host| host.id != id);
+        crate::ssh::invalidate_profile(id);
         let _ = self.store.save();
         self.selected = self.store.hosts.first().map(|host| host.id);
         self.editor = self
@@ -691,6 +789,7 @@ impl HostsApp {
             return;
         }
         for id in &ids {
+            crate::ssh::invalidate_profile(*id);
             self.test_operations.remove(id);
             self.pending_tests.retain(|pending| pending != id);
             self.test_states.remove(id);
@@ -996,6 +1095,7 @@ impl HostsApp {
                                     .clicked()
                                 {
                                     self.catalog = Catalog::for_locale(Some(language.locale));
+                                    configure_fonts(context, language.locale);
                                     self.store.preferred_locale = Some(language.locale.to_owned());
                                     let _ = self.store.save();
                                     self.status = self.catalog.text("status_ready").to_owned();
@@ -1062,42 +1162,36 @@ impl HostsApp {
         ui.separator();
         ui.add_space(8.0);
 
-        let entries = self
-            .store
-            .hosts
-            .iter()
-            .map(|host| {
-                (
-                    host.id,
-                    host.alias.clone(),
-                    host.address.clone(),
-                    host.port,
-                    host.protocol,
-                    host.verified,
-                    self.test_states.get(&host.id).copied(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let hosts = &self.store.hosts;
+        let selected_id = self.selected;
+        let batch_mode = self.batch_mode;
+        let batch_selected = &self.batch_selected;
+        let test_states = &self.test_states;
+        let delete_label = self.catalog.text("delete").to_owned();
         let mut selection_request = None;
         let mut deletion_request = None;
         let mut batch_toggle_request = None;
+        ui.spacing_mut().item_spacing.y = 4.0;
         egui::ScrollArea::vertical()
             .id_salt("host_list_scroll")
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_rows(ui, 62.0, hosts.len(), |ui, row_range| {
                 ui.set_width(ui.available_width());
-                for (id, alias, address, port, protocol, verified, test_state) in entries {
-                    let selected = self.selected == Some(id);
+                for row in row_range {
+                    let host = &hosts[row];
+                    let id = host.id;
+                    let test_state = test_states.get(&id).copied();
+                    let selected = selected_id == Some(id);
                     let response = ui
                         .horizontal(|ui| {
-                            if self.batch_mode {
-                                let mut checked = self.batch_selected.contains(&id);
+                            if batch_mode {
+                                let mut checked = batch_selected.contains(&id);
                                 if ui.checkbox(&mut checked, "").changed() {
                                     batch_toggle_request = Some((id, checked));
                                 }
                             }
                             let verified_marker = if test_state == Some(HostTestState::Succeeded)
-                                || (test_state.is_none() && verified)
+                                || (test_state.is_none() && host.verified)
                             {
                                 "  ✓"
                             } else if test_state == Some(HostTestState::Testing) {
@@ -1107,10 +1201,10 @@ impl HostsApp {
                             };
                             let text = RichText::new(format!(
                                 "{}\n{} · {}:{}{}",
-                                alias,
-                                protocol.stable_name().to_ascii_uppercase(),
-                                address,
-                                port,
+                                host.alias,
+                                host.protocol.stable_name().to_ascii_uppercase(),
+                                host.address,
+                                host.port,
                                 verified_marker
                             ))
                             .line_height(Some(20.0));
@@ -1130,21 +1224,20 @@ impl HostsApp {
                         })
                         .inner;
                     if response.clicked() || response.secondary_clicked() {
-                        if self.batch_mode {
-                            batch_toggle_request = Some((id, !self.batch_selected.contains(&id)));
+                        if batch_mode {
+                            batch_toggle_request = Some((id, !batch_selected.contains(&id)));
                         } else {
                             selection_request = Some(id);
                         }
                     }
-                    if !self.batch_mode {
+                    if !batch_mode {
                         response.context_menu(|ui| {
-                            if ui.button(self.catalog.text("delete")).clicked() {
+                            if ui.button(&delete_label).clicked() {
                                 deletion_request = Some(id);
                                 ui.close();
                             }
                         });
                     }
-                    ui.add_space(4.0);
                 }
             });
 
@@ -1260,6 +1353,7 @@ impl HostsApp {
                                     .selected_text(match editor.profile.ssh_auth {
                                         SshAuth::Password => catalog.text("password_auth"),
                                         SshAuth::PrivateKey => catalog.text("private_key_auth"),
+                                        SshAuth::SshAgent => catalog.text("ssh_agent_auth"),
                                     })
                                     .show_ui(ui, |ui| {
                                         ui.selectable_value(
@@ -1271,6 +1365,11 @@ impl HostsApp {
                                             &mut editor.profile.ssh_auth,
                                             SshAuth::PrivateKey,
                                             catalog.text("private_key_auth"),
+                                        );
+                                        ui.selectable_value(
+                                            &mut editor.profile.ssh_auth,
+                                            SshAuth::SshAgent,
+                                            catalog.text("ssh_agent_auth"),
                                         );
                                     });
                                 ui.end_row();
@@ -1293,7 +1392,7 @@ impl HostsApp {
                                     });
                                 });
                                 ui.end_row();
-                            } else {
+                            } else if editor.profile.ssh_auth == SshAuth::PrivateKey {
                                 form_label_with_hint(ui, catalog.text("private_key"));
                                 ui.vertical(|ui| {
                                     ui.add(
@@ -1303,6 +1402,18 @@ impl HostsApp {
                                         .desired_width(420.0),
                                     );
                                     ui.small(catalog.text("private_key_hint"));
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button(catalog.text("browse_private_key")).clicked() {
+                                            action = Some(EditorAction::BrowsePrivateKey);
+                                        }
+                                        if ui.button(catalog.text("find_fido_key")).clicked() {
+                                            action = Some(EditorAction::DiscoverFido);
+                                        }
+                                        if ui.button(catalog.text("setup_fido_key")).clicked() {
+                                            action = Some(EditorAction::OpenFidoSetup);
+                                        }
+                                    });
+                                    ui.small(catalog.text("fido_direct_hint"));
                                 });
                                 ui.end_row();
 
@@ -1318,6 +1429,18 @@ impl HostsApp {
                                     } else {
                                         catalog.text("passphrase_optional")
                                     });
+                                });
+                                ui.end_row();
+                            } else {
+                                form_label_with_hint(ui, catalog.text("agent_key_fingerprint"));
+                                ui.vertical(|ui| {
+                                    ui.add(
+                                        egui::TextEdit::singleline(
+                                            &mut editor.profile.agent_key_fingerprint,
+                                        )
+                                        .desired_width(420.0),
+                                    );
+                                    ui.small(catalog.text("agent_key_hint"));
                                 });
                                 ui.end_row();
                             }
@@ -1369,13 +1492,21 @@ impl HostsApp {
                                 ui.end_row();
 
                                 form_label(ui, catalog.text("host_key"));
-                                ui.label(
-                                    editor
-                                        .profile
-                                        .host_fingerprint
-                                        .as_deref()
-                                        .unwrap_or(catalog.text("host_key_unverified")),
-                                );
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        editor
+                                            .profile
+                                            .host_fingerprint
+                                            .as_deref()
+                                            .unwrap_or(catalog.text("host_key_unverified")),
+                                    );
+                                    if let Some(algorithm) = &editor.profile.host_key_algorithm {
+                                        ui.small(format!(
+                                            "{}: {algorithm}",
+                                            catalog.text("host_key_algorithm")
+                                        ));
+                                    }
+                                });
                                 ui.end_row();
                             }
                         });
@@ -1449,7 +1580,243 @@ impl HostsApp {
                 self.write_callback("cancelled", alias.as_deref());
                 context.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            Some(EditorAction::BrowsePrivateKey) => {
+                if let Some(path) = rfd::FileDialog::new().pick_file()
+                    && let Some(editor) = &mut self.editor
+                {
+                    editor.profile.private_key_path = path.display().to_string();
+                }
+            }
+            Some(EditorAction::DiscoverFido) => {
+                if let Some(identity) = fido::discover_handles().into_iter().next() {
+                    if let Some(editor) = &mut self.editor {
+                        editor.profile.private_key_path = identity.path.display().to_string();
+                    }
+                    self.status = self.catalog.format(
+                        "fido_found",
+                        &[("fingerprint", identity.fingerprint.as_str())],
+                    );
+                } else {
+                    self.status = self.catalog.text("fido_not_found").to_owned();
+                }
+            }
+            Some(EditorAction::OpenFidoSetup) => {
+                self.fido_setup_prompt = Some(FidoSetupPrompt {
+                    pin: Zeroizing::new(String::new()),
+                    operation: None,
+                    status: None,
+                    identity: None,
+                });
+            }
             None => {}
+        }
+    }
+
+    fn start_fido_setup_operation(&mut self, action: FidoSetupAction) {
+        let Some(prompt) = self.fido_setup_prompt.as_mut() else {
+            return;
+        };
+        if prompt.operation.is_some() {
+            return;
+        }
+        let pin = std::mem::take(&mut prompt.pin);
+        let recover_existing_message = self.catalog.text("fido_recover_existing").to_owned();
+        let recovery_cancelled_message = self.catalog.text("fido_recovery_cancelled").to_owned();
+        let enrollment_cancelled_message =
+            self.catalog.text("fido_enrollment_cancelled").to_owned();
+        let (sender, receiver) = mpsc::channel();
+        let repaint_context = self.repaint_context.clone();
+        prompt.identity = None;
+        prompt.status = Some(self.catalog.text("fido_wait_touch").to_owned());
+        prompt.operation = Some(receiver);
+        thread::spawn(move || {
+            let result = (|| -> Result<Vec<FidoKeyInfo>, String> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                let keys = match action {
+                    FidoSetupAction::CreateRecommended => {
+                        let enrollment = fido::recoverable_enrollment();
+                        vec![
+                            runtime
+                                .block_on(fido::enroll(
+                                    enrollment.algorithm,
+                                    enrollment.application,
+                                    enrollment.user_id,
+                                    enrollment.flags,
+                                    pin,
+                                ))
+                                .map_err(|error| {
+                                    if matches!(
+                                        &error,
+                                        fido::FidoError::RecoverableCredentialExists
+                                    ) {
+                                        recover_existing_message.clone()
+                                    } else if matches!(
+                                        &error,
+                                        fido::FidoError::WindowsEnrollmentCancelled
+                                    ) {
+                                        enrollment_cancelled_message.clone()
+                                    } else {
+                                        error.to_string()
+                                    }
+                                })?,
+                        ]
+                    }
+                    FidoSetupAction::CreateCompatible => {
+                        let enrollment = fido::compatible_enrollment();
+                        vec![
+                            runtime
+                                .block_on(fido::enroll(
+                                    enrollment.algorithm,
+                                    enrollment.application,
+                                    enrollment.user_id,
+                                    enrollment.flags,
+                                    pin,
+                                ))
+                                .map_err(|error| error.to_string())?,
+                        ]
+                    }
+                    FidoSetupAction::RecoverResident => runtime
+                        .block_on(fido::load_resident(pin))
+                        .map_err(|error| match error {
+                            fido::FidoError::WindowsRecoveryCancelled { prompt } => {
+                                recovery_cancelled_message.replace("{step}", &prompt.to_string())
+                            }
+                            _ => error.to_string(),
+                        })?,
+                };
+                if keys.is_empty() {
+                    return Err(
+                        "No resident SSH credentials were found on the security key.".to_owned(),
+                    );
+                }
+                keys.iter()
+                    .map(fido::save_handle)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| error.to_string())
+            })();
+            if sender.send(result).is_ok() {
+                repaint_context.request_repaint();
+            }
+        });
+    }
+
+    fn fido_setup_modal(&mut self, context: &egui::Context) {
+        let Some(mut prompt) = self.fido_setup_prompt.take() else {
+            return;
+        };
+        if let Some(operation) = &prompt.operation {
+            match operation.try_recv() {
+                Ok(Ok(identities)) => {
+                    if let Some(identity) = identities.into_iter().next() {
+                        if let Some(editor) = &mut self.editor {
+                            editor.profile.private_key_path = identity.path.display().to_string();
+                        }
+                        prompt.status = Some(self.catalog.format(
+                            "fido_setup_succeeded",
+                            &[("fingerprint", identity.fingerprint.as_str())],
+                        ));
+                        prompt.identity = Some(identity);
+                    }
+                    prompt.operation = None;
+                }
+                Ok(Err(error)) => {
+                    prompt.status = Some(
+                        self.catalog
+                            .format("fido_setup_failed", &[("error", error.as_str())]),
+                    );
+                    prompt.operation = None;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    prompt.status = Some(self.catalog.text("fido_setup_disconnected").to_owned());
+                    prompt.operation = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        let busy = prompt.operation.is_some();
+        let choice = egui::Modal::new(egui::Id::new("fido_setup"))
+            .show(context, |ui| {
+                ui.set_max_width(620.0);
+                ui.heading(self.catalog.text("fido_setup_title"));
+                ui.add_space(8.0);
+                ui.label(self.catalog.text("fido_setup_hint"));
+                ui.add_space(12.0);
+                ui.label(RichText::new(self.catalog.text("fido_pin")).strong());
+                ui.add(
+                    egui::TextEdit::singleline(&mut *prompt.pin)
+                        .password(true)
+                        .desired_width(320.0),
+                );
+                ui.small(self.catalog.text("fido_pin_hint"));
+                ui.add_space(14.0);
+                let mut action = None;
+                ui.add_enabled_ui(!busy, |ui| {
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new(self.catalog.text("fido_create_recommended")),
+                        )
+                        .clicked()
+                    {
+                        action = Some(FidoSetupAction::CreateRecommended);
+                    }
+                    ui.small(self.catalog.text("fido_create_recommended_hint"));
+                    ui.add_space(8.0);
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new(self.catalog.text("fido_recover")),
+                        )
+                        .clicked()
+                    {
+                        action = Some(FidoSetupAction::RecoverResident);
+                    }
+                    ui.small(self.catalog.text("fido_recover_hint"));
+                    ui.add_space(8.0);
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new(self.catalog.text("fido_create_compatible")),
+                        )
+                        .clicked()
+                    {
+                        action = Some(FidoSetupAction::CreateCompatible);
+                    }
+                    ui.small(self.catalog.text("fido_create_compatible_hint"));
+                });
+                if busy {
+                    ui.add_space(12.0);
+                    ui.spinner();
+                }
+                if let Some(status) = &prompt.status {
+                    ui.add_space(12.0);
+                    ui.label(status);
+                }
+                if let Some(identity) = &prompt.identity {
+                    ui.add_space(10.0);
+                    ui.monospace(&identity.public_key);
+                    if ui.button(self.catalog.text("copy_public_key")).clicked() {
+                        ui.ctx().copy_text(identity.public_key.clone());
+                    }
+                }
+                ui.add_space(16.0);
+                if ui
+                    .add_enabled(!busy, egui::Button::new(self.catalog.text("close")))
+                    .clicked()
+                {
+                    return (None, true);
+                }
+                (action, false)
+            })
+            .inner;
+        self.fido_setup_prompt = Some(prompt);
+        if choice.1 {
+            self.fido_setup_prompt = None;
+        } else if let Some(action) = choice.0 {
+            self.start_fido_setup_operation(action);
         }
     }
 
@@ -1479,10 +1846,22 @@ impl HostsApp {
                 if let Some(expected) = &prompt.expected {
                     ui.label(RichText::new(self.catalog.text("fingerprint_previous")).strong());
                     ui.monospace(expected);
+                    if let Some(algorithm) = &prompt.expected_algorithm {
+                        ui.small(format!(
+                            "{}: {algorithm}",
+                            self.catalog.text("host_key_algorithm")
+                        ));
+                    }
                     ui.add_space(10.0);
                 }
                 ui.label(RichText::new(self.catalog.text("fingerprint_detected")).strong());
                 ui.monospace(&prompt.observed);
+                if let Some(algorithm) = &prompt.observed_algorithm {
+                    ui.small(format!(
+                        "{}: {algorithm}",
+                        self.catalog.text("host_key_algorithm")
+                    ));
+                }
                 ui.add_space(18.0);
                 let mut result = None;
                 ui.horizontal(|ui| {
@@ -1771,14 +2150,12 @@ impl eframe::App for HostsApp {
         );
         ui.allocate_rect(body, egui::Sense::hover());
         self.fingerprint_modal(&context);
+        self.fido_setup_modal(&context);
         self.import_window(&context);
         self.import_cleanup_modal(&context);
         self.batch_export_window(&context);
         self.delete_modal(&context);
         self.batch_delete_modal(&context);
-        if !self.tests_idle() {
-            context.request_repaint_after(std::time::Duration::from_millis(100));
-        }
     }
 }
 
@@ -1794,15 +2171,27 @@ impl Drop for HostsApp {
     }
 }
 
-fn test_timed_out(elapsed: Duration) -> bool {
-    elapsed >= GUI_TEST_TIMEOUT
+fn test_timed_out(elapsed: Duration, timeout: Duration) -> bool {
+    elapsed >= timeout
 }
 
-fn gui_test_limits() -> OperationLimits {
+fn gui_test_timeout(profile: &HostProfile, hosts: &[HostProfile]) -> Duration {
+    if profile.protocol == Protocol::Ssh
+        && crate::ssh::profile_may_require_interaction(profile, hosts)
+    {
+        GUI_INTERACTIVE_TEST_TIMEOUT
+    } else {
+        GUI_TEST_TIMEOUT
+    }
+}
+
+fn gui_test_limits(timeout: Duration) -> OperationLimits {
     OperationLimits {
-        total_timeout: Some(GUI_TEST_TIMEOUT),
-        connect_timeout: Some(GUI_TEST_TIMEOUT),
-        command_timeout: Some(GUI_TEST_TIMEOUT),
+        total_timeout: Some(timeout),
+        connect_timeout: Some(timeout),
+        command_timeout: Some(timeout),
+        output_bytes: None,
+        batch_scope: None,
     }
 }
 
@@ -1844,12 +2233,40 @@ fn with_rollback_error(primary: String, rollback: Option<String>) -> String {
 }
 
 fn imported_credential(item: &import::ImportedHost) -> Option<(CredentialKind, &str)> {
-    if item.profile.protocol == Protocol::Telnet || item.profile.ssh_auth == SshAuth::Password {
-        (!item.password.is_empty()).then_some((CredentialKind::Password, item.password.as_str()))
-    } else {
-        (!item.key_passphrase.is_empty())
-            .then_some((CredentialKind::KeyPassphrase, item.key_passphrase.as_str()))
+    match (item.profile.protocol, item.profile.ssh_auth) {
+        (Protocol::Telnet, _) | (Protocol::Ssh, SshAuth::Password) => (!item.password.is_empty())
+            .then_some((CredentialKind::Password, item.password.as_str())),
+        (Protocol::Ssh, SshAuth::PrivateKey) => (!item.key_passphrase.is_empty())
+            .then_some((CredentialKind::KeyPassphrase, item.key_passphrase.as_str())),
+        (Protocol::Ssh, SshAuth::SshAgent) => None,
     }
+}
+
+fn apply_verified_host_key(host: &mut HostProfile, verified: &VerifiedHostKey) -> bool {
+    if host.id != verified.host_id
+        || host.host_fingerprint.as_deref() != Some(verified.fingerprint.as_str())
+    {
+        return false;
+    }
+
+    let first_seen = host
+        .host_key_first_seen_unix
+        .or(Some(verified.verified_at_unix));
+    let last_verified = Some(
+        host.host_key_last_verified_unix
+            .unwrap_or_default()
+            .max(verified.verified_at_unix),
+    );
+    let changed = !host.verified
+        || host.host_key_algorithm.as_deref() != Some(verified.algorithm.as_str())
+        || host.host_key_first_seen_unix != first_seen
+        || host.host_key_last_verified_unix != last_verified;
+
+    host.verified = true;
+    host.host_key_algorithm = Some(verified.algorithm.clone());
+    host.host_key_first_seen_unix = first_seen;
+    host.host_key_last_verified_unix = last_verified;
+    changed
 }
 
 fn export_file_name(index: u32) -> String {
@@ -1915,16 +2332,24 @@ fn form_label_with_hint(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-fn configure_fonts(context: &egui::Context) {
-    let candidates = [
-        ("segoe", r"C:\Windows\Fonts\segoeui.ttf"),
-        ("yahei", r"C:\Windows\Fonts\msyh.ttc"),
-        ("meiryo", r"C:\Windows\Fonts\meiryo.ttc"),
-        ("yugothic", r"C:\Windows\Fonts\YuGothM.ttc"),
-    ];
+fn font_candidates(locale: &str) -> Vec<(&'static str, &'static str)> {
+    const SEGOE: (&str, &str) = ("segoe", r"C:\Windows\Fonts\segoeui.ttf");
+    const YAHEI: (&str, &str) = ("yahei", r"C:\Windows\Fonts\msyh.ttc");
+    const JHENGHEI: (&str, &str) = ("jhenghei", r"C:\Windows\Fonts\msjh.ttc");
+    const MEIRYO: (&str, &str) = ("meiryo", r"C:\Windows\Fonts\meiryo.ttc");
+    let regional = match locale {
+        "zh-CN" => [YAHEI, JHENGHEI, MEIRYO],
+        "zh-TW" => [JHENGHEI, YAHEI, MEIRYO],
+        "ja" => [MEIRYO, YAHEI, JHENGHEI],
+        _ => [YAHEI, JHENGHEI, MEIRYO],
+    };
+    std::iter::once(SEGOE).chain(regional).collect()
+}
+
+fn configure_fonts(context: &egui::Context, locale: &str) {
     let mut fonts = FontDefinitions::default();
     let mut installed = Vec::new();
-    for (name, path) in candidates {
+    for (name, path) in font_candidates(locale) {
         if let Ok(bytes) = fs::read(Path::new(path)) {
             fonts
                 .font_data
@@ -1947,6 +2372,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn font_loading_prioritizes_the_active_language_and_keeps_cjk_fallbacks() {
+        assert_eq!(font_candidates("en").len(), 4);
+        assert_eq!(font_candidates("zh-CN").len(), 4);
+        assert_eq!(font_candidates("zh-CN")[1].0, "yahei");
+        assert_eq!(font_candidates("zh-TW")[1].0, "jhenghei");
+        assert_eq!(font_candidates("ja")[1].0, "meiryo");
+        assert_eq!(font_candidates("unknown"), font_candidates("en"));
+    }
+
+    #[test]
     fn test_rows_use_requested_result_colors() {
         assert_eq!(
             host_row_fill(Some(HostTestState::Succeeded)),
@@ -1960,10 +2395,29 @@ mod tests {
     }
 
     #[test]
-    fn connection_test_timeout_is_capped_at_ten_seconds() {
-        assert!(!test_timed_out(Duration::from_millis(9_999)));
-        assert!(test_timed_out(Duration::from_secs(10)));
-        assert_eq!(gui_test_limits().total_timeout, Some(GUI_TEST_TIMEOUT));
+    fn connection_test_timeout_allows_windows_hardware_prompts() {
+        assert!(!test_timed_out(
+            Duration::from_millis(9_999),
+            GUI_TEST_TIMEOUT
+        ));
+        assert!(test_timed_out(Duration::from_secs(10), GUI_TEST_TIMEOUT));
+        assert_eq!(
+            gui_test_limits(GUI_INTERACTIVE_TEST_TIMEOUT).total_timeout,
+            Some(GUI_INTERACTIVE_TEST_TIMEOUT)
+        );
+
+        let mut host = HostProfile {
+            protocol: Protocol::Ssh,
+            ssh_auth: SshAuth::PrivateKey,
+            private_key_path: "id_ecdsa_sk".to_owned(),
+            ..HostProfile::default()
+        };
+        assert_eq!(
+            gui_test_timeout(&host, &[host.clone()]),
+            GUI_INTERACTIVE_TEST_TIMEOUT
+        );
+        host.private_key_path = "id_ed25519".to_owned();
+        assert_eq!(gui_test_timeout(&host, &[host.clone()]), GUI_TEST_TIMEOUT);
     }
 
     #[test]
@@ -1986,6 +2440,48 @@ mod tests {
         editor.password.clear();
         editor.profile.address = "127.0.0.2".to_owned();
         assert!(editor.test_result_is_stale());
+    }
+
+    #[test]
+    fn repeated_host_verification_updates_last_verified_and_requires_save() {
+        let id = Uuid::new_v4();
+        let mut host = HostProfile {
+            id,
+            host_fingerprint: Some("SHA256:example".to_owned()),
+            host_key_algorithm: Some("ssh-ed25519".to_owned()),
+            host_key_first_seen_unix: Some(10),
+            host_key_last_verified_unix: Some(20),
+            verified: true,
+            ..HostProfile::default()
+        };
+        let verified = VerifiedHostKey {
+            host_id: id,
+            alias: "example".to_owned(),
+            fingerprint: "SHA256:example".to_owned(),
+            algorithm: "ssh-ed25519".to_owned(),
+            verified_at_unix: 30,
+        };
+
+        assert!(apply_verified_host_key(&mut host, &verified));
+        assert_eq!(host.host_key_first_seen_unix, Some(10));
+        assert_eq!(host.host_key_last_verified_unix, Some(30));
+        assert!(!apply_verified_host_key(&mut host, &verified));
+
+        let stale = VerifiedHostKey {
+            verified_at_unix: 25,
+            ..verified.clone()
+        };
+        assert!(!apply_verified_host_key(&mut host, &stale));
+        assert_eq!(host.host_key_last_verified_unix, Some(30));
+
+        let unchanged = host.clone();
+        let mismatched = VerifiedHostKey {
+            fingerprint: "SHA256:different".to_owned(),
+            verified_at_unix: 40,
+            ..verified
+        };
+        assert!(!apply_verified_host_key(&mut host, &mismatched));
+        assert_eq!(host, unchanged);
     }
 
     #[test]
@@ -2075,5 +2571,15 @@ mod tests {
             imported_credential(&key_host),
             Some((CredentialKind::KeyPassphrase, "example-passphrase"))
         );
+
+        let agent_host = import::ImportedHost {
+            profile: HostProfile {
+                ssh_auth: SshAuth::SshAgent,
+                ..HostProfile::default()
+            },
+            password: Zeroizing::new("ignored-password".to_owned()),
+            key_passphrase: Zeroizing::new("ignored-passphrase".to_owned()),
+        };
+        assert_eq!(imported_credential(&agent_host), None);
     }
 }

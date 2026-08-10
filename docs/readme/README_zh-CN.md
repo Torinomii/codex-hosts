@@ -16,55 +16,53 @@
 
 ## 主要功能
 
-- 保存别名、地址、端口、用户名、协议、身份验证方式、可选私钥路径、已信任的 SSH 主机密钥和可选跳板主机。
-- 下载 CSV 模板并批量导入主机，可将密码和私钥口令转存到 Windows 凭据管理器；导入后可立即删除含敏感信息的源文件，电子表格添加的额外列会被忽略。
-- 一键测试全部已保存主机，每台最多等待 10 秒，并用颜色清楚区分成功与失败。
-- 勾选多台主机进行批量删除或无凭据 CSV 导出；导出到目录时自动使用新的顺序文件名，不覆盖已有文件。
-- 支持 SSH 密码与键盘交互验证，以及带可选口令的 OpenSSH 私钥。
-- 密码和私钥口令仅存入 Windows 凭据管理器。
-- 使用已保存且验证通过的 SSH 主机构建多层跳板链。
-- Codex 可以预先创建指定别名的草稿并等待保存、信任或取消，无需在对话中询问凭据。
+- 保存服务器信息提供给codex连接。
+- 支持密码、普通 OpenSSH 密钥或 FIDO/YubiKey 等硬件密钥登录。
+- 支持 Windows OpenSSH Agent 或 Pageant 中加载的身份。
 
 ## 安装
 
-### 下载 Release
+### 直接下载
 
-预编译包支持 64 位 Windows 10 或更高版本，可从 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下载。
+预编译版本支持 64 位 Windows 10 或更高版本，可从 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下载。
 
-### 安装
+如果你手动安装：
 
-将 ` bin\codex-hosts.exe` 复制到 `skill\codex-hosts\bin\codex-hosts.exe`，然后把 `skill\codex-hosts` 目录复制到 `%USERPROFILE%\.codex\skills\codex-hosts`。
+1. 将 `bin\codex-hosts.exe` 放到 `skill\codex-hosts\bin\codex-hosts.exe`。
+2. 将完整的 `skill\codex-hosts` 文件夹复制到 `%USERPROFILE%\.codex\skills\codex-hosts`。
 
-### 使用 Codex 提示词安装
+也可以直接让 Codex 安装：
 
 ```text
-从 https://github.com/Torinomii/codex-hosts/releases/latest 下载最新版本安装 codex-hosts：自动识别当前环境的 Skill 安装目录，并将完整的 codex-hosts Skill 和执行文件安装到正确位置，确认Skill以及可执行文件及必要配置文件存在。
+从 https://github.com/Torinomii/codex-hosts/releases/latest 下载并安装最新版 codex-hosts。请自动找到当前环境的 Skill 安装目录，安装完整的 Skill 和可执行文件，并确认所需文件都已就位。
 ```
 
-### 从源代码安装
+### 从源代码构建
 
-源代码构建需要 Rust 1.92 或更高版本以及 MSVC 工具链：
+需要 Rust 1.92 或更高版本以及 MSVC 工具链：
 
-```
+```powershell
 git clone https://github.com/Torinomii/codex-hosts.git
 cd codex-hosts
 cargo build --locked --release
 ```
 
-将 `target\release\codex-hosts.exe` 复制到 `skill\codex-hosts\bin\codex-hosts.exe`，然后把完整的 `skill\codex-hosts` 目录安装为 `%USERPROFILE%\.codex\skills\codex-hosts`。
+构建完成后，将 `target\release\codex-hosts.exe` 复制到 `skill\codex-hosts\bin\codex-hosts.exe`，再安装完整的 Skill 文件夹。
 
-### 如何使用
+## 快速上手
 
-1.正确安装skill和执行文件后，codex遇到新的远程连接需求会拉起codex-hosts要求输入密码。
-2.也可以提前在codex-hosts中输入连接信息，然后让codex识别信息进行调用连接。
+1. 打开 `codex-hosts.exe`，新建一个主机。
+2. 填写别名、地址、端口和用户名，再选择登录方式，保存。
 
-## Codex 集成
 
-仓库在 `skill\codex-hosts` 中提供了可移植的 Codex skill。安装后，`SKILL.md` 会相对于已安装的 skill 目录定位 `bin\codex-hosts.exe`，无需修改仓库相关的绝对路径。
+<details>
+<summary>接口</summary>
 
-GUI 编辑模式允许传入非敏感预填信息：
+### Codex 或脚本调用
 
-```
+GUI 编辑模式可以预填不敏感的连接信息：
+
+```powershell
 .\bin\codex-hosts.exe --codex-edit `
   --alias example `
   --host server.example.com `
@@ -75,22 +73,35 @@ GUI 编辑模式允许传入非敏感预填信息：
   --result-file result.json
 ```
 
-切勿通过对话、命令行参数、JSON、脚本或日志传递密码或私钥口令。唯一的文件例外是用户明确选择导入的 CSV；程序会将其视为敏感文件，并在凭据转存到 Windows 凭据管理器后立即询问是否删除。
+认证参数使用稳定名称：
 
-工具模式通过同一个可执行文件读取不含凭据的请求文件并写入结果文件：
+- `password`：密码登录。
+- `private-key` / `private_key`：密钥文件或 FIDO 句柄，也接受 `fido-handle`。
+- `ssh-agent` / `ssh_agent`：正在运行的 SSH Agent 或 Pageant。
+
+工具模式通过请求文件和结果文件工作，文件中不能包含凭据：
 
 ```json
+{"action":"capabilities"}
 {"action":"list_hosts"}
+{"action":"agent_identities"}
+{"action":"fido_identities"}
 {"action":"probe","alias":"example"}
 {"action":"exec","alias":"example","command":"hostname"}
+{"action":"exec_many","alias":"example","commands":["hostname","uptime"],"max_concurrency":8}
+{"action":"batch_probe","aliases":["web-1","web-2"],"max_concurrency":8,"batch_timeout_ms":30000}
+{"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
 ```
 
-`probe` 和 `exec` 可以按单次操作设置 `connect_timeout_ms` 与 `command_timeout_ms`；无需应用层超时时应省略。已保存主机不包含固定超时，远程命令会原样发送，不会猜测远端操作系统。
+`exec_many` 会先登录一次，再通过同一条 SSH 连接同时运行多条短命令；使用硬件密钥时，这通常可以把一组命令合并为一次认证。`agent_identities` 和 `fido_identities` 只返回公开的身份信息与公钥。执行远程命令时，请检查结果中的 `output_truncated`，确认输出是否因为长度限制被截断。
+
+</details>
 
 ## 安全边界
 
-- 密码和私钥口令只保存在 Windows 凭据管理器中，绝不会返回给 Codex。
-- SSH 指纹必须明确固定，应用不会自动替换。
-- 只有已验证的 SSH 配置才能作为跳板；跳板链会检查循环并限制为最多八台主机。
-- Telnet 为明文协议，只应在明确接受该风险的可信网络中使用。
-- 每个输出流最多捕获一 MiB 命令输出。
+- 密码和密钥文件口令只保存在 Windows 凭据管理器中；FIDO PIN 只用于当前操作，不会保存。
+- SSH 主机指纹必须由用户明确确认，程序不会自动替换已经保存的指纹。
+- FIDO 直连不会启动或启用 Agent 服务；Agent 转发也始终关闭。
+- 只有已经验证的 SSH 主机才能作为跳板，跳板链最多包含八台主机，并会检查循环。
+- Telnet 会明文传输账号和数据，只应在你明确接受风险的可信网络中使用。
+- 单条命令最多接收 1 MiB 输出；`exec_many` 或一组批量结果写成完整 JSON 后最多为 8 MiB。程序会在接收输出时直接执行预算，不会先在内存中保存多份大结果。

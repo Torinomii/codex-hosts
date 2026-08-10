@@ -10,61 +10,58 @@
 
 [English](../../README.md) | [简体中文](README_zh-CN.md) | [繁體中文](README_zh-TW.md) | [日本語](README_ja.md)
 
-`codex-hosts` 是供 Codex 使用的 Windows SSH / Telnet 主機管理工具，讓 Codex 不必接觸密碼或金鑰即可安全地發起連線。
+`codex-hosts` 是供 Codex 使用的 Windows SSH / Telnet 主機管理工具，讓 Codex 不必接觸密碼或金鑰也能安全地發起連線。
 
 ![Codex Hosts 主視窗](../../Main.png)
 
 ## 主要功能
 
-- 儲存別名、位址、連接埠、使用者名稱、通訊協定、驗證方式、選填私密金鑰路徑、已信任的 SSH 主機金鑰和選填跳板主機。
-- 下載 CSV 範本並批次匯入主機，可將密碼與私密金鑰密碼片語轉存至 Windows 認證管理員；匯入後可立即刪除含敏感資訊的來源檔案，試算表加入的額外欄位會被忽略。
-- 一次測試全部已儲存主機，每台最多等候 10 秒，並以顏色清楚區分成功與失敗。
-- 勾選多台主機進行批次刪除或不含認證的 CSV 匯出；匯出至目錄時會自動使用新的流水號檔名，不覆寫現有檔案。
-- 支援 SSH 密碼與鍵盤互動驗證，以及含選填密碼片語的 OpenSSH 私密金鑰。
-- 密碼與私密金鑰密碼片語僅儲存在 Windows 認證管理員中。
-- 使用已儲存且驗證成功的 SSH 主機建立多層跳板鏈。
-- Codex 可以預先建立指定別名的草稿並等候儲存、信任或取消，不必在對話中詢問認證。
+- 儲存伺服器資訊，供 Codex 連線時使用。
+- 支援密碼、一般 OpenSSH 金鑰，以及 FIDO/YubiKey 等硬體金鑰登入。
+- 支援已載入 Windows OpenSSH Agent 或 Pageant 的身分。
 
 ## 安裝
 
-### 下載 Release
+### 直接下載
 
-預先建置的套件支援 64 位元 Windows 10 或更新版本，可從 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下載。
+預先建置的版本支援 64 位元 Windows 10 或更新版本，可從 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下載。
 
-### 安裝
+如果要手動安裝：
 
-將 `bin\codex-hosts.exe` 複製到 `skill\codex-hosts\bin\codex-hosts.exe`，然後把 `skill\codex-hosts` 目錄複製到 `%USERPROFILE%\.codex\skills\codex-hosts`。
+1. 將 `bin\codex-hosts.exe` 放到 `skill\codex-hosts\bin\codex-hosts.exe`。
+2. 將完整的 `skill\codex-hosts` 資料夾複製到 `%USERPROFILE%\.codex\skills\codex-hosts`。
 
-### 使用 Codex 提示詞安裝
+也可以直接請 Codex 安裝：
 
 ```text
-從 https://github.com/Torinomii/codex-hosts/releases/latest 下載最新版本並安裝 codex-hosts：自動識別目前環境的 Skill 安裝目錄，將完整的 codex-hosts Skill 和執行檔安裝到正確位置，並確認 Skill、執行檔及必要的設定檔存在。
+從 https://github.com/Torinomii/codex-hosts/releases/latest 下載並安裝最新版 codex-hosts。請自動找到目前環境的 Skill 安裝目錄，安裝完整的 Skill 和執行檔，並確認所有必要檔案都已就位。
 ```
 
-### 從原始碼安裝
+### 從原始碼建置
 
-原始碼建置需要 Rust 1.92 或更新版本以及 MSVC 工具鏈：
+需要 Rust 1.92 或更新版本以及 MSVC 工具鏈：
 
-```
+```powershell
 git clone https://github.com/Torinomii/codex-hosts.git
 cd codex-hosts
 cargo build --locked --release
 ```
 
-將 `target\release\codex-hosts.exe` 複製到 `skill\codex-hosts\bin\codex-hosts.exe`，然後把完整的 `skill\codex-hosts` 目錄安裝為 `%USERPROFILE%\.codex\skills\codex-hosts`。
+建置完成後，將 `target\release\codex-hosts.exe` 複製到 `skill\codex-hosts\bin\codex-hosts.exe`，再安裝完整的 Skill 資料夾。
 
-### 如何使用
+## 快速上手
 
-1. 正確安裝 skill 和執行檔後，Codex 遇到新的遠端連線需求時會開啟 codex-hosts，要求輸入密碼。
-2. 也可以事先在 codex-hosts 中輸入連線資訊，再讓 Codex 識別並使用已儲存的資訊進行連線。
+1. 開啟 `codex-hosts.exe`，新增一台主機。
+2. 填寫別名、位址、連接埠和使用者名稱，再選擇登入方式並儲存。
 
-## Codex 整合
+<details>
+<summary>介面</summary>
 
-存放庫在 `skill\codex-hosts` 中提供可攜式 Codex skill。安裝後，`SKILL.md` 會相對於已安裝的 skill 目錄尋找 `bin\codex-hosts.exe`，不需要修改與存放庫位置相關的絕對路徑。
+### 從 Codex 或指令碼呼叫
 
-GUI 編輯模式允許傳入非機密的預填資訊：
+GUI 編輯模式可以預填不敏感的連線資訊：
 
-```
+```powershell
 .\bin\codex-hosts.exe --codex-edit `
   --alias example `
   --host server.example.com `
@@ -75,22 +72,35 @@ GUI 編輯模式允許傳入非機密的預填資訊：
   --result-file result.json
 ```
 
-切勿透過對話、命令列引數、JSON、指令碼或日誌傳遞密碼或私密金鑰密碼片語。唯一的檔案例外是使用者明確選擇匯入的 CSV；程式會將其視為敏感檔案，並在認證轉存至 Windows 認證管理員後立即詢問是否刪除。
+驗證參數使用固定名稱：
 
-工具模式透過同一個執行檔讀取不含認證的要求檔案並寫入結果檔案：
+- `password`：密碼登入。
+- `private-key` / `private_key`：金鑰檔案或 FIDO 控制代碼，也接受 `fido-handle`。
+- `ssh-agent` / `ssh_agent`：正在執行的 SSH Agent 或 Pageant。
+
+工具模式透過要求檔案和結果檔案運作，兩者都不能包含認證資訊：
 
 ```json
+{"action":"capabilities"}
 {"action":"list_hosts"}
+{"action":"agent_identities"}
+{"action":"fido_identities"}
 {"action":"probe","alias":"example"}
 {"action":"exec","alias":"example","command":"hostname"}
+{"action":"exec_many","alias":"example","commands":["hostname","uptime"],"max_concurrency":8}
+{"action":"batch_probe","aliases":["web-1","web-2"],"max_concurrency":8,"batch_timeout_ms":30000}
+{"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
 ```
 
-`probe` 和 `exec` 可以針對單次作業設定 `connect_timeout_ms` 與 `command_timeout_ms`；不需要應用程式層級逾時時應省略。已儲存的主機不包含固定逾時值，遠端命令會原樣傳送，不會猜測遠端作業系統。
+`exec_many` 只登入一次，再透過同一條 SSH 連線同時執行多條短命令；使用硬體金鑰時，一組命令通常只需要驗證一次。`agent_identities` 和 `fido_identities` 只會傳回公開的身分資訊與公開金鑰。執行遠端命令時，請檢查結果中的 `output_truncated`，確認輸出是否因長度限制而被截斷。
+
+</details>
 
 ## 安全界線
 
-- 密碼與私密金鑰密碼片語只會儲存在 Windows 認證管理員中，絕不會傳回 Codex。
-- SSH 指紋必須明確固定，應用程式不會自動取代。
-- 只有已驗證的 SSH 設定檔才能作為跳板；跳板鏈會檢查循環並限制為最多八台主機。
-- Telnet 是明文通訊協定，只應在明確接受該風險的受信任網路中使用。
-- 每個輸出資料流最多擷取一 MiB 的命令輸出。
+- 密碼和金鑰檔案密碼片語只會儲存在 Windows 認證管理員中；FIDO PIN 只用於目前操作，不會儲存。
+- SSH 主機指紋必須由使用者明確確認，程式不會自動取代已儲存的指紋。
+- FIDO 直接簽署不會啟動或啟用 Agent 服務；Agent 轉送也一律關閉。
+- 只有已驗證的 SSH 主機才能作為跳板，跳板鏈最多包含八台主機，並會檢查循環。
+- Telnet 會以明文傳輸帳號和資料，只應在明確接受風險的可信網路中使用。
+- 單條命令最多接收 1 MiB 輸出；`exec_many` 或完整批次結果寫成 JSON 後最多為 8 MiB。程式會在接收輸出時直接套用預算，不會先在記憶體中保存多份大型結果。
