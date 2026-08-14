@@ -119,3 +119,22 @@ pub enum CredentialError {
     #[error("credential store operation failed: {0}")]
     Keyring(#[from] KeyringError),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_password_round_trips_as_a_saved_credential() {
+        let id = Uuid::new_v4();
+        let result = store(id, CredentialKind::Password, "")
+            .and_then(|()| load(id, CredentialKind::Password));
+        let cleanup = delete(id, CredentialKind::Password);
+
+        cleanup.expect("temporary empty-password credential should be removed");
+        let password = result
+            .expect("empty password should be stored")
+            .expect("empty password should remain a present credential");
+        assert!(password.is_empty());
+    }
+}

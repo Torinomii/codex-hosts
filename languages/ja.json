@@ -28,7 +28,7 @@
     "ssh_agent_auth": "SSH Agent / Pageant",
     "password": "パスワード",
     "password_saved": "保存済みです。空欄のままにすると現在のパスワードを保持します。",
-    "password_required": "保存する前にパスワードを入力してください。",
+    "password_required": "パスワードは未保存です。空欄のまま保存すると、空のパスワードを使用します。",
     "private_key": "SSH 鍵ファイル",
     "private_key_hint": "通常の OpenSSH 秘密鍵ファイル、またはハードウェアキー用に作成された *_sk ファイルを選択してください。",
     "browse_private_key": "参照…",
