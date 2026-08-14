@@ -28,7 +28,7 @@
     "ssh_agent_auth": "SSH Agent / Pageant",
     "password": "Password",
     "password_saved": "Saved. Leave blank to keep the existing password.",
-    "password_required": "Enter a password before saving this host.",
+    "password_required": "No password is saved. Leave this blank to save and use an empty password.",
     "private_key": "SSH key file",
     "private_key_hint": "Select a regular OpenSSH private-key file or a *_sk file created for a hardware key.",
     "browse_private_key": "Browse…",

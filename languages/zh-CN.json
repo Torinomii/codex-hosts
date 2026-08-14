@@ -28,7 +28,7 @@
     "ssh_agent_auth": "SSH Agent / Pageant",
     "password": "密码",
     "password_saved": "已保存；留空将保留现有密码。",
-    "password_required": "保存此主机前请输入密码。",
+    "password_required": "尚未保存密码；留空即可保存并使用空密码。",
     "private_key": "SSH 密钥文件",
     "private_key_hint": "请选择普通 OpenSSH 私钥文件，或使用硬件密钥时生成的 *_sk 文件。",
     "browse_private_key": "浏览…",

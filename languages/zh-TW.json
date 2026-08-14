@@ -28,7 +28,7 @@
     "ssh_agent_auth": "SSH Agent / Pageant",
     "password": "密碼",
     "password_saved": "已儲存；留空將保留現有密碼。",
-    "password_required": "儲存此主機前請輸入密碼。",
+    "password_required": "尚未儲存密碼；留空即可儲存並使用空密碼。",
     "private_key": "SSH 金鑰檔案",
     "private_key_hint": "請選擇一般 OpenSSH 私密金鑰檔案，或使用硬體金鑰時產生的 *_sk 檔案。",
     "browse_private_key": "瀏覽…",

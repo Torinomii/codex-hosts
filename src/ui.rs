@@ -62,8 +62,16 @@ impl HostEditor {
         !self.profile.connection_details_equal(&self.original)
     }
 
+    fn needs_password(&self) -> bool {
+        self.profile.protocol == Protocol::Telnet || self.profile.ssh_auth == SshAuth::Password
+    }
+
+    fn should_store_password(&self) -> bool {
+        !self.password.is_empty() || (self.needs_password() && !self.has_password)
+    }
+
     fn test_result_is_stale(&self) -> bool {
-        self.connection_changed() || !self.password.is_empty() || !self.key_passphrase.is_empty()
+        self.connection_changed() || self.should_store_password() || !self.key_passphrase.is_empty()
     }
 }
 
@@ -277,13 +285,8 @@ impl HostsApp {
             return Err(self.catalog.text("validation_alias").to_owned());
         }
 
-        let needs_password = editor.profile.protocol == Protocol::Telnet
-            || editor.profile.ssh_auth == SshAuth::Password;
-        if needs_password && editor.password.is_empty() && !editor.has_password {
-            return Err(self.catalog.text("password_required").to_owned());
-        }
         let invalidate_test_state = editor.test_result_is_stale();
-        if !editor.password.is_empty() {
+        if editor.should_store_password() {
             credentials::store(
                 editor.profile.id,
                 CredentialKind::Password,
@@ -2438,6 +2441,10 @@ mod tests {
         editor.password.push_str("replacement");
         assert!(editor.test_result_is_stale());
         editor.password.clear();
+        editor.has_password = false;
+        assert!(editor.should_store_password());
+        assert!(editor.test_result_is_stale());
+        editor.has_password = true;
         editor.profile.address = "127.0.0.2".to_owned();
         assert!(editor.test_result_is_stale());
     }
