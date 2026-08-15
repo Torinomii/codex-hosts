@@ -34,27 +34,60 @@ pub struct LaunchOptions {
     pub observed_algorithm: Option<String>,
 }
 
+#[derive(Clone)]
+struct PendingCallback {
+    status: &'static str,
+    alias: Option<String>,
+}
+
 struct HostEditor {
     profile: HostProfile,
     original: HostProfile,
     password: Zeroizing<String>,
     key_passphrase: Zeroizing<String>,
-    has_password: bool,
+    password_mode: PasswordMode,
+    saved_password_mode: Option<PasswordMode>,
+    password_read_error: Option<String>,
     has_key_passphrase: bool,
+    key_passphrase_read_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PasswordMode {
+    Password,
+    NoPassword,
 }
 
 impl HostEditor {
     fn load(profile: HostProfile) -> Self {
-        let has_password = credentials::has(profile.id, CredentialKind::Password).unwrap_or(false);
-        let has_key_passphrase =
-            credentials::has(profile.id, CredentialKind::KeyPassphrase).unwrap_or(false);
+        let (saved_password_mode, password_read_error) =
+            match credentials::load(profile.id, CredentialKind::Password) {
+                Ok(Some(password)) => (
+                    Some(if password.is_empty() {
+                        PasswordMode::NoPassword
+                    } else {
+                        PasswordMode::Password
+                    }),
+                    None,
+                ),
+                Ok(None) => (None, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+        let (has_key_passphrase, key_passphrase_read_error) =
+            match credentials::has(profile.id, CredentialKind::KeyPassphrase) {
+                Ok(has_key_passphrase) => (has_key_passphrase, None),
+                Err(error) => (false, Some(error.to_string())),
+            };
         Self {
             original: profile.clone(),
             profile,
             password: Zeroizing::new(String::new()),
             key_passphrase: Zeroizing::new(String::new()),
-            has_password,
+            password_mode: saved_password_mode.unwrap_or(PasswordMode::Password),
+            saved_password_mode,
+            password_read_error,
             has_key_passphrase,
+            key_passphrase_read_error,
         }
     }
 
@@ -67,11 +100,32 @@ impl HostEditor {
     }
 
     fn should_store_password(&self) -> bool {
-        !self.password.is_empty() || (self.needs_password() && !self.has_password)
+        if !self.needs_password() {
+            return false;
+        }
+        match self.password_mode {
+            PasswordMode::Password => !self.password.is_empty(),
+            PasswordMode::NoPassword => self.saved_password_mode != Some(PasswordMode::NoPassword),
+        }
+    }
+
+    fn should_store_key_passphrase(&self) -> bool {
+        self.profile.protocol == Protocol::Ssh
+            && self.profile.ssh_auth == SshAuth::PrivateKey
+            && !self.key_passphrase.is_empty()
+    }
+
+    fn password_value_missing(&self) -> bool {
+        self.needs_password()
+            && self.password_mode == PasswordMode::Password
+            && self.password.is_empty()
+            && self.saved_password_mode != Some(PasswordMode::Password)
     }
 
     fn test_result_is_stale(&self) -> bool {
-        self.connection_changed() || self.should_store_password() || !self.key_passphrase.is_empty()
+        self.connection_changed()
+            || self.should_store_password()
+            || self.should_store_key_passphrase()
     }
 }
 
@@ -159,18 +213,25 @@ pub struct HostsApp {
     batch_export_window_open: bool,
     launch: LaunchOptions,
     callback_written: bool,
+    pending_callback: Option<PendingCallback>,
 }
 
 impl HostsApp {
     pub fn new(context: &eframe::CreationContext<'_>, launch: LaunchOptions) -> Self {
         context.egui_ctx.set_zoom_factor(1.06);
 
-        let mut store = HostStore::load().unwrap_or_default();
+        let (mut store, mut startup_error) = match HostStore::load_recovering() {
+            Ok(store) => (store, None),
+            Err(error) => {
+                let error = error.to_string();
+                (HostStore::blocked(error.clone()), Some(error))
+            }
+        };
         let catalog = Catalog::for_locale(store.preferred_locale.as_deref());
         configure_fonts(&context.egui_ctx, catalog.locale());
         let mut selected = store.hosts.first().map(|host| host.id);
 
-        if launch.codex_edit {
+        if launch.codex_edit && startup_error.is_none() {
             let alias = launch
                 .prefill
                 .alias
@@ -179,15 +240,25 @@ impl HostsApp {
                 .unwrap_or_else(|| store.next_neutral_alias());
             if let Some(existing) = store.find_alias(&alias) {
                 selected = Some(existing.id);
+            } else if launch.observed_fingerprint.is_some() {
+                selected = None;
+                startup_error = Some(format!("HOST_NOT_FOUND: {alias}"));
             } else {
                 let mut draft = HostProfile::new(alias);
                 draft.apply_prefill(&launch.prefill);
                 if let Some(jump_alias) = launch.prefill.jump_alias.as_deref() {
                     draft.jump_host = store.find_alias(jump_alias).map(|host| host.id);
                 }
-                selected = Some(draft.id);
+                let id = draft.id;
                 store.hosts.push(draft);
-                let _ = store.save();
+                match store.save() {
+                    Ok(()) => selected = Some(id),
+                    Err(error) => {
+                        store.hosts.retain(|host| host.id != id);
+                        selected = None;
+                        startup_error = Some(error.to_string());
+                    }
+                }
             }
         }
 
@@ -196,6 +267,7 @@ impl HostsApp {
             .cloned()
             .map(HostEditor::load);
         if launch.codex_edit
+            && launch.observed_fingerprint.is_none()
             && let Some(editor) = &mut editor
         {
             editor.profile.apply_prefill(&launch.prefill);
@@ -216,7 +288,9 @@ impl HostsApp {
                 close_after_choice: true,
             })
         });
-        let status = if launch.codex_edit {
+        let status = if let Some(error) = startup_error {
+            catalog.format("storage_error", &[("error", &error)])
+        } else if launch.codex_edit {
             catalog.text("draft_waiting").to_owned()
         } else {
             catalog.text("status_ready").to_owned()
@@ -245,6 +319,7 @@ impl HostsApp {
             batch_export_window_open: false,
             launch,
             callback_written: false,
+            pending_callback: None,
         }
     }
 
@@ -265,16 +340,18 @@ impl HostsApp {
         let id = profile.id;
         self.store.hosts.push(profile.clone());
         if let Err(error) = self.store.save() {
+            self.store.hosts.retain(|host| host.id != id);
             self.status = self
                 .catalog
                 .format("storage_error", &[("error", &error.to_string())]);
+            return;
         }
         self.selected = Some(id);
         self.editor = Some(HostEditor::load(profile));
     }
 
     fn persist_editor(&mut self) -> Result<(), String> {
-        let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
+        let editor = self.editor.as_ref().ok_or_else(|| "NO_EDITOR".to_owned())?;
         if let Some(issue) = editor.profile.validation_issue() {
             return Err(self.catalog.text(issue.translation_key()).to_owned());
         }
@@ -285,65 +362,116 @@ impl HostsApp {
             return Err(self.catalog.text("validation_alias").to_owned());
         }
 
+        if editor.password_value_missing() {
+            if let Some(error) = editor.password_read_error.as_deref() {
+                return Err(self.catalog.format("credential_error", &[("error", error)]));
+            }
+            return Err(self.catalog.text("password_required").to_owned());
+        }
+
         let invalidate_test_state = editor.test_result_is_stale();
-        if editor.should_store_password() {
-            credentials::store(
-                editor.profile.id,
+        let store_password = editor.should_store_password();
+        let store_key_passphrase = editor.should_store_key_passphrase();
+        let credential_update = if store_password {
+            Some((
                 CredentialKind::Password,
-                editor.password.as_str(),
-            )
-            .map_err(|error| {
-                self.catalog
-                    .format("credential_error", &[("error", &error.to_string())])
-            })?;
-            editor.has_password = true;
-            editor.password.clear();
-        }
-        if !editor.key_passphrase.is_empty() {
-            credentials::store(
-                editor.profile.id,
-                CredentialKind::KeyPassphrase,
-                editor.key_passphrase.as_str(),
-            )
-            .map_err(|error| {
-                self.catalog
-                    .format("credential_error", &[("error", &error.to_string())])
-            })?;
-            editor.has_key_passphrase = true;
-            editor.key_passphrase.clear();
-        }
+                match editor.password_mode {
+                    PasswordMode::Password => editor.password.clone(),
+                    PasswordMode::NoPassword => Zeroizing::new(String::new()),
+                },
+            ))
+        } else if store_key_passphrase {
+            Some((CredentialKind::KeyPassphrase, editor.key_passphrase.clone()))
+        } else {
+            None
+        };
+        let id = editor.profile.id;
+        let mut profile = editor.profile.clone();
+        profile.alias = profile.alias.trim().to_owned();
+        profile.address = profile.address.trim().to_owned();
+        profile.username = profile.username.trim().to_owned();
+        profile.private_key_path = profile.private_key_path.trim().to_owned();
+        profile.agent_key_fingerprint = profile.agent_key_fingerprint.trim().to_owned();
         if invalidate_test_state {
-            editor.profile.verified = false;
-            self.test_states.remove(&editor.profile.id);
+            profile.verified = false;
         }
-        editor.profile.alias = editor.profile.alias.trim().to_owned();
-        editor.profile.address = editor.profile.address.trim().to_owned();
-        editor.profile.username = editor.profile.username.trim().to_owned();
-        editor.profile.private_key_path = editor.profile.private_key_path.trim().to_owned();
-        editor.profile.agent_key_fingerprint =
-            editor.profile.agent_key_fingerprint.trim().to_owned();
-        if editor.profile.protocol == Protocol::Telnet {
-            editor.profile.jump_host = None;
-            editor.profile.host_fingerprint = None;
-            editor.profile.host_key_algorithm = None;
-            editor.profile.host_key_first_seen_unix = None;
-            editor.profile.host_key_last_verified_unix = None;
+        if profile.protocol == Protocol::Telnet {
+            profile.jump_host = None;
+            profile.host_fingerprint = None;
+            profile.host_key_algorithm = None;
+            profile.host_key_first_seen_unix = None;
+            profile.host_key_last_verified_unix = None;
         }
-        let stored = self
-            .store
+
+        let mut updated_store = self.store.clone();
+        let stored = updated_store
             .hosts
             .iter_mut()
-            .find(|host| host.id == editor.profile.id)
+            .find(|host| host.id == id)
             .ok_or_else(|| "HOST_NOT_FOUND".to_owned())?;
-        stored.clone_from(&editor.profile);
-        self.store.save().map_err(|error| {
-            self.catalog
-                .format("storage_error", &[("error", &error.to_string())])
-        })?;
-        if invalidate_test_state {
-            crate::ssh::invalidate_profile(editor.profile.id);
+        stored.clone_from(&profile);
+
+        if let Some((kind, secret)) = credential_update.as_ref() {
+            match credentials::snapshot_kind(id, *kind) {
+                Ok(snapshot) => {
+                    if let Err(error) = credentials::store(id, *kind, secret.as_str()) {
+                        return Err(self
+                            .catalog
+                            .format("credential_error", &[("error", &error.to_string())]));
+                    }
+                    if let Err(error) = updated_store.save() {
+                        let rollback = credentials::restore_kind(id, *kind, snapshot.as_ref())
+                            .err()
+                            .map(|error| error.to_string());
+                        let primary = self
+                            .catalog
+                            .format("storage_error", &[("error", &error.to_string())]);
+                        return Err(with_rollback_error(primary, rollback));
+                    }
+                }
+                Err(_) => {
+                    if let Err(error) = updated_store.save() {
+                        return Err(self
+                            .catalog
+                            .format("storage_error", &[("error", &error.to_string())]));
+                    }
+                    if let Err(error) = credentials::store(id, *kind, secret.as_str()) {
+                        let rollback = self
+                            .store
+                            .save_recovery_baseline()
+                            .err()
+                            .map(|error| format!("host metadata: {error}"));
+                        let primary = self
+                            .catalog
+                            .format("credential_error", &[("error", &error.to_string())]);
+                        return Err(with_rollback_error(primary, rollback));
+                    }
+                }
+            }
+        } else if let Err(error) = updated_store.save() {
+            return Err(self
+                .catalog
+                .format("storage_error", &[("error", &error.to_string())]));
         }
-        editor.original.clone_from(&editor.profile);
+
+        self.store = updated_store;
+        if invalidate_test_state {
+            self.test_states.remove(&id);
+            crate::ssh::invalidate_profile(id);
+        }
+        let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
+        editor.profile = profile.clone();
+        editor.original = profile;
+        if store_password {
+            editor.saved_password_mode = Some(editor.password_mode);
+            editor.password_read_error = None;
+            editor.password.clear();
+        }
+        if store_key_passphrase {
+            editor.has_key_passphrase = true;
+            editor.key_passphrase_read_error = None;
+            editor.key_passphrase.clear();
+        }
         Ok(())
     }
 
@@ -357,8 +485,13 @@ impl HostsApp {
                         .as_ref()
                         .map(|editor| editor.profile.alias.clone())
                         .unwrap_or_default();
-                    self.write_callback("saved", Some(&alias));
-                    context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    match self.write_callback("saved", Some(&alias)) {
+                        Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(error) => {
+                            self.status =
+                                self.catalog.format("callback_error", &[("error", &error)])
+                        }
+                    }
                 }
             }
             Err(error) => self.status = error,
@@ -435,8 +568,9 @@ impl HostsApp {
         }
         if self.editor.as_ref().is_some_and(|editor| {
             editor.profile != editor.original
-                || !editor.password.is_empty()
-                || !editor.key_passphrase.is_empty()
+                || editor.should_store_password()
+                || editor.should_store_key_passphrase()
+                || editor.password_value_missing()
         }) && let Err(error) = self.persist_editor()
         {
             self.status = error;
@@ -512,11 +646,23 @@ impl HostsApp {
         }
         if self.testing_all && self.tests_idle() {
             self.testing_all = false;
-            self.test_hosts_snapshot = None;
             if self.test_store_dirty {
-                let _ = self.store.save();
+                if let Err(error) = self.store.save() {
+                    if let Some(snapshot) = self.test_hosts_snapshot.take() {
+                        self.store.hosts = snapshot.as_ref().clone();
+                    }
+                    self.test_store_dirty = false;
+                    self.status = self
+                        .catalog
+                        .format("storage_error", &[("error", &error.to_string())]);
+                    return;
+                }
                 self.test_store_dirty = false;
+                if let Some(id) = self.editor.as_ref().map(|editor| editor.profile.id) {
+                    self.sync_editor_verification_from_store(id);
+                }
             }
+            self.test_hosts_snapshot = None;
             let succeeded = self
                 .test_states
                 .values()
@@ -541,37 +687,29 @@ impl HostsApp {
             Ok(result) => {
                 self.test_states.insert(id, HostTestState::Succeeded);
                 let identity = result.stdout.trim().to_owned();
+                let mut updated_store = self.store.clone();
+                let mut metadata_changed = false;
                 for verified in &result.verified_host_keys {
-                    if let Some(stored) = self
-                        .store
+                    if let Some(stored) = updated_store
                         .hosts
                         .iter_mut()
                         .find(|host| host.id == verified.host_id)
                     {
-                        self.test_store_dirty |= apply_verified_host_key(stored, verified);
-                    }
-                    if let Some(editor) = &mut self.editor
-                        && editor.profile.id == verified.host_id
-                    {
-                        editor.profile.verified = true;
-                        editor.profile.host_key_algorithm = Some(verified.algorithm.clone());
-                        editor.profile.host_key_first_seen_unix = editor
-                            .profile
-                            .host_key_first_seen_unix
-                            .or(Some(verified.verified_at_unix));
-                        editor.profile.host_key_last_verified_unix = Some(
-                            editor
-                                .profile
-                                .host_key_last_verified_unix
-                                .unwrap_or_default()
-                                .max(verified.verified_at_unix),
-                        );
-                        editor.original.clone_from(&editor.profile);
+                        metadata_changed |= apply_verified_host_key(stored, verified);
                     }
                 }
-                if !self.testing_all && self.test_store_dirty {
-                    let _ = self.store.save();
-                    self.test_store_dirty = false;
+                if self.testing_all {
+                    self.store = updated_store;
+                    self.test_store_dirty |= metadata_changed;
+                } else if metadata_changed {
+                    if let Err(error) = updated_store.save() {
+                        self.status = self
+                            .catalog
+                            .format("storage_error", &[("error", &error.to_string())]);
+                        return;
+                    }
+                    self.store = updated_store;
+                    self.sync_editor_verification_from_store(id);
                 }
                 if !self.testing_all && self.selected == Some(id) {
                     self.status = self
@@ -627,6 +765,30 @@ impl HostsApp {
         }
     }
 
+    fn sync_editor_verification_from_store(&mut self, id: Uuid) {
+        let Some(stored) = self.store.hosts.iter().find(|host| host.id == id) else {
+            return;
+        };
+        let Some(editor) = self
+            .editor
+            .as_mut()
+            .filter(|editor| editor.profile.id == id)
+        else {
+            return;
+        };
+        for profile in [&mut editor.profile, &mut editor.original] {
+            profile.verified = stored.verified;
+            profile
+                .host_fingerprint
+                .clone_from(&stored.host_fingerprint);
+            profile
+                .host_key_algorithm
+                .clone_from(&stored.host_key_algorithm);
+            profile.host_key_first_seen_unix = stored.host_key_first_seen_unix;
+            profile.host_key_last_verified_unix = stored.host_key_last_verified_unix;
+        }
+    }
+
     fn apply_fingerprint_choice(&mut self, trust: bool, context: &egui::Context) {
         let Some(prompt) = self.fingerprint_prompt.take() else {
             return;
@@ -634,23 +796,42 @@ impl HostsApp {
         if !trust {
             self.status = self.catalog.text("status_cancelled").to_owned();
             if prompt.close_after_choice {
-                self.write_callback("cancelled", Some(&prompt.alias));
-                context.send_viewport_cmd(egui::ViewportCommand::Close);
+                match self.write_callback("cancelled", Some(&prompt.alias)) {
+                    Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(error) => {
+                        self.status = self.catalog.format("callback_error", &[("error", &error)]);
+                        self.fingerprint_prompt = Some(prompt);
+                    }
+                }
             }
             return;
         }
-        if let Some(host) = self
-            .store
+
+        let mut updated_store = self.store.clone();
+        let Some(host) = updated_store
             .hosts
             .iter_mut()
             .find(|host| host.id == prompt.host_id)
-        {
-            host.host_fingerprint = Some(prompt.observed.clone());
-            host.host_key_algorithm = prompt.observed_algorithm.clone();
-            host.host_key_first_seen_unix = None;
-            host.host_key_last_verified_unix = None;
-            host.verified = false;
+        else {
+            self.status = self
+                .catalog
+                .format("storage_error", &[("error", "HOST_NOT_FOUND")]);
+            return;
+        };
+        host.host_fingerprint = Some(prompt.observed.clone());
+        host.host_key_algorithm = prompt.observed_algorithm.clone();
+        host.host_key_first_seen_unix = None;
+        host.host_key_last_verified_unix = None;
+        host.verified = false;
+        if let Err(error) = updated_store.save() {
+            self.status = self
+                .catalog
+                .format("storage_error", &[("error", &error.to_string())]);
+            self.fingerprint_prompt = Some(prompt);
+            return;
         }
+        self.store = updated_store;
+
         if let Some(editor) = &mut self.editor
             && editor.profile.id == prompt.host_id
         {
@@ -665,10 +846,13 @@ impl HostsApp {
             editor.original.host_key_last_verified_unix = None;
             editor.original.verified = false;
         }
-        let _ = self.store.save();
         if prompt.close_after_choice {
-            self.write_callback("trusted", Some(&prompt.alias));
-            context.send_viewport_cmd(egui::ViewportCommand::Close);
+            match self.write_callback("trusted", Some(&prompt.alias)) {
+                Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
+                Err(error) => {
+                    self.status = self.catalog.format("callback_error", &[("error", &error)]);
+                }
+            }
         } else if prompt.retry_test {
             self.start_test_host(prompt.host_id);
             if self.selected == Some(prompt.host_id) {
@@ -690,18 +874,48 @@ impl HostsApp {
             self.status = self.catalog.text("chain_in_use").to_owned();
             return;
         }
+        let credential_snapshot = match credentials::snapshot(id) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.status = self
+                    .catalog
+                    .format("credential_error", &[("error", &error.to_string())]);
+                return;
+            }
+        };
+        let credential_snapshots = vec![(id, credential_snapshot)];
         if let Err(error) = credentials::delete_all(id) {
+            let error = with_rollback_error(
+                error.to_string(),
+                restore_credential_snapshots(&credential_snapshots).err(),
+            );
             self.status = self
                 .catalog
-                .format("credential_error", &[("error", &error.to_string())]);
+                .format("credential_error", &[("error", &error)]);
             return;
         }
+        let original_hosts = self.store.hosts.clone();
+        self.store.hosts.retain(|host| host.id != id);
+        if let Err(error) = self.store.save() {
+            self.store.hosts = original_hosts;
+            let mut rollback_errors = Vec::new();
+            if let Err(rollback_error) = restore_credential_snapshots(&credential_snapshots) {
+                rollback_errors.push(rollback_error);
+            }
+            if let Err(rollback_error) = self.store.save() {
+                rollback_errors.push(format!("host metadata: {rollback_error}"));
+            }
+            let error = with_rollback_error(
+                error.to_string(),
+                (!rollback_errors.is_empty()).then(|| rollback_errors.join("; ")),
+            );
+            self.status = self.catalog.format("storage_error", &[("error", &error)]);
+            return;
+        }
+        crate::ssh::invalidate_profile(id);
         self.test_operations.remove(&id);
         self.pending_tests.retain(|pending| *pending != id);
         self.test_states.remove(&id);
-        self.store.hosts.retain(|host| host.id != id);
-        crate::ssh::invalidate_profile(id);
-        let _ = self.store.save();
         self.selected = self.store.hosts.first().map(|host| host.id);
         self.editor = self
             .selected
@@ -971,13 +1185,34 @@ impl HostsApp {
         }
     }
 
-    fn write_callback(&mut self, status: &'static str, alias: Option<&str>) {
+    fn write_callback(&mut self, status: &'static str, alias: Option<&str>) -> Result<(), String> {
         if self.callback_written {
-            return;
+            return Ok(());
         }
+        let should_replace = match self.pending_callback.as_ref() {
+            None => true,
+            Some(pending) => should_replace_callback(pending.status, status),
+        };
+        if should_replace {
+            self.pending_callback = Some(PendingCallback {
+                status,
+                alias: alias.map(str::to_owned),
+            });
+        }
+        self.flush_callback()
+    }
+
+    fn flush_callback(&mut self) -> Result<(), String> {
+        if self.callback_written {
+            return Ok(());
+        }
+        let Some(callback) = self.pending_callback.clone() else {
+            return Ok(());
+        };
         let Some(path) = self.launch.result_path.as_deref() else {
             self.callback_written = true;
-            return;
+            self.pending_callback = None;
+            return Ok(());
         };
         #[derive(Serialize)]
         struct Callback<'a> {
@@ -985,10 +1220,15 @@ impl HostsApp {
             #[serde(skip_serializing_if = "Option::is_none")]
             alias: Option<&'a str>,
         }
-        if let Ok(bytes) = serde_json::to_vec_pretty(&Callback { status, alias }) {
-            let _ = fs::write(path, bytes);
-        }
+        let bytes = serde_json::to_vec_pretty(&Callback {
+            status: callback.status,
+            alias: callback.alias.as_deref(),
+        })
+        .map_err(|error| error.to_string())?;
+        fs::write(path, bytes).map_err(|error| error.to_string())?;
         self.callback_written = true;
+        self.pending_callback = None;
+        Ok(())
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
@@ -1100,11 +1340,16 @@ impl HostsApp {
                                     self.catalog = Catalog::for_locale(Some(language.locale));
                                     configure_fonts(context, language.locale);
                                     self.store.preferred_locale = Some(language.locale.to_owned());
-                                    let _ = self.store.save();
-                                    self.status = self.catalog.text("status_ready").to_owned();
                                     context.send_viewport_cmd(egui::ViewportCommand::Title(
                                         self.catalog.text("app_title").to_owned(),
                                     ));
+                                    self.status = match self.store.save() {
+                                        Ok(()) => self.catalog.text("status_ready").to_owned(),
+                                        Err(error) => self.catalog.format(
+                                            "storage_error",
+                                            &[("error", &error.to_string())],
+                                        ),
+                                    };
                                 }
                             }
                         });
@@ -1381,18 +1626,44 @@ impl HostsApp {
                             if editor.profile.protocol == Protocol::Telnet
                                 || editor.profile.ssh_auth == SshAuth::Password
                             {
+                                form_label_with_hint(ui, catalog.text("password_mode"));
+                                ui.horizontal(|ui| {
+                                    ui.radio_value(
+                                        &mut editor.password_mode,
+                                        PasswordMode::Password,
+                                        catalog.text("password"),
+                                    );
+                                    ui.radio_value(
+                                        &mut editor.password_mode,
+                                        PasswordMode::NoPassword,
+                                        catalog.text("no_password"),
+                                    );
+                                });
+                                ui.end_row();
+
                                 form_label_with_hint(ui, catalog.text("password"));
                                 ui.vertical(|ui| {
-                                    ui.add(
+                                    ui.add_enabled(
+                                        editor.password_mode == PasswordMode::Password,
                                         egui::TextEdit::singleline(&mut *editor.password)
                                             .password(true)
                                             .desired_width(420.0),
                                     );
-                                    ui.small(if editor.has_password {
-                                        catalog.text("password_saved")
-                                    } else {
-                                        catalog.text("password_required")
-                                    });
+                                    let password_hint =
+                                        if editor.password_mode == PasswordMode::NoPassword {
+                                            catalog.text("no_password_hint").to_owned()
+                                        } else if let Some(error) =
+                                            editor.password_read_error.as_deref()
+                                        {
+                                            catalog.format("credential_error", &[("error", error)])
+                                        } else if editor.saved_password_mode
+                                            == Some(PasswordMode::Password)
+                                        {
+                                            catalog.text("password_saved").to_owned()
+                                        } else {
+                                            catalog.text("password_required").to_owned()
+                                        };
+                                    ui.small(password_hint);
                                 });
                                 ui.end_row();
                             } else if editor.profile.ssh_auth == SshAuth::PrivateKey {
@@ -1427,11 +1698,16 @@ impl HostsApp {
                                             .password(true)
                                             .desired_width(420.0),
                                     );
-                                    ui.small(if editor.has_key_passphrase {
-                                        catalog.text("passphrase_saved")
+                                    let passphrase_hint = if let Some(error) =
+                                        editor.key_passphrase_read_error.as_deref()
+                                    {
+                                        catalog.format("credential_error", &[("error", error)])
+                                    } else if editor.has_key_passphrase {
+                                        catalog.text("passphrase_saved").to_owned()
                                     } else {
-                                        catalog.text("passphrase_optional")
-                                    });
+                                        catalog.text("passphrase_optional").to_owned()
+                                    };
+                                    ui.small(passphrase_hint);
                                 });
                                 ui.end_row();
                             } else {
@@ -1580,8 +1856,12 @@ impl HostsApp {
                     .editor
                     .as_ref()
                     .map(|editor| editor.profile.alias.clone());
-                self.write_callback("cancelled", alias.as_deref());
-                context.send_viewport_cmd(egui::ViewportCommand::Close);
+                match self.write_callback("cancelled", alias.as_deref()) {
+                    Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(error) => {
+                        self.status = self.catalog.format("callback_error", &[("error", &error)])
+                    }
+                }
             }
             Some(EditorAction::BrowsePrivateKey) => {
                 if let Some(path) = rfd::FileDialog::new().pick_file()
@@ -2169,13 +2449,25 @@ impl Drop for HostsApp {
                 .editor
                 .as_ref()
                 .map(|editor| editor.profile.alias.clone());
-            self.write_callback("cancelled", alias.as_deref());
+            let _ = self.write_callback("cancelled", alias.as_deref());
         }
     }
 }
 
 fn test_timed_out(elapsed: Duration, timeout: Duration) -> bool {
     elapsed >= timeout
+}
+
+fn should_replace_callback(existing: &str, new: &str) -> bool {
+    fn priority(status: &str) -> u8 {
+        match status {
+            "trusted" => 2,
+            "saved" => 1,
+            _ => 0,
+        }
+    }
+
+    priority(new) > priority(existing) || new == existing
 }
 
 fn gui_test_timeout(profile: &HostProfile, hosts: &[HostProfile]) -> Duration {
@@ -2434,19 +2726,43 @@ mod tests {
             original: profile,
             password: Zeroizing::new(String::new()),
             key_passphrase: Zeroizing::new(String::new()),
-            has_password: true,
+            password_mode: PasswordMode::Password,
+            saved_password_mode: Some(PasswordMode::Password),
+            password_read_error: None,
             has_key_passphrase: false,
+            key_passphrase_read_error: None,
         };
         assert!(!editor.test_result_is_stale());
         editor.password.push_str("replacement");
         assert!(editor.test_result_is_stale());
         editor.password.clear();
-        editor.has_password = false;
+        editor.saved_password_mode = None;
+        assert!(editor.password_value_missing());
+        assert!(!editor.should_store_password());
+        editor.password_mode = PasswordMode::NoPassword;
         assert!(editor.should_store_password());
         assert!(editor.test_result_is_stale());
-        editor.has_password = true;
+        editor.saved_password_mode = Some(PasswordMode::NoPassword);
+        assert!(!editor.should_store_password());
+        editor.password_mode = PasswordMode::Password;
+        assert!(editor.password_value_missing());
+        editor.password_read_error = Some("credential lookup failed".to_owned());
+        assert!(!editor.should_store_password());
+        editor.password.push_str("explicit replacement");
+        assert!(editor.should_store_password());
+        editor.password.clear();
         editor.profile.address = "127.0.0.2".to_owned();
         assert!(editor.test_result_is_stale());
+    }
+
+    #[test]
+    fn committed_callback_outcomes_cannot_be_downgraded() {
+        assert!(should_replace_callback("cancelled", "saved"));
+        assert!(should_replace_callback("saved", "saved"));
+        assert!(should_replace_callback("saved", "trusted"));
+        assert!(!should_replace_callback("saved", "cancelled"));
+        assert!(!should_replace_callback("trusted", "saved"));
+        assert!(!should_replace_callback("trusted", "cancelled"));
     }
 
     #[test]
