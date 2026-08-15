@@ -29,7 +29,7 @@ fn main() {
 }
 
 fn launch_gui(options: ui::LaunchOptions) {
-    let preferred_locale = storage::HostStore::load()
+    let preferred_locale = storage::HostStore::load_recovering()
         .ok()
         .and_then(|store| store.preferred_locale);
     let title = i18n::Catalog::for_locale(preferred_locale.as_deref())

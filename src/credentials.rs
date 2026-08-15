@@ -53,6 +53,24 @@ pub fn snapshot(id: Uuid) -> Result<CredentialSnapshot, CredentialError> {
     })
 }
 
+pub fn snapshot_kind(
+    id: Uuid,
+    kind: CredentialKind,
+) -> Result<Option<Zeroizing<String>>, CredentialError> {
+    load(id, kind)
+}
+
+pub fn restore_kind(
+    id: Uuid,
+    kind: CredentialKind,
+    secret: Option<&Zeroizing<String>>,
+) -> Result<(), CredentialError> {
+    match secret {
+        Some(secret) => store(id, kind, secret.as_str()),
+        None => delete(id, kind),
+    }
+}
+
 pub fn restore(id: Uuid, snapshot: &CredentialSnapshot) -> Result<(), CredentialError> {
     let mut first_error = None;
     for (kind, secret) in [
