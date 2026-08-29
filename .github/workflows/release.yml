@@ -124,13 +124,6 @@ jobs:
           Write-Output "Executable SHA-256: $((Get-FileHash -Algorithm SHA256 -LiteralPath '.\target\release\codex-hosts.exe').Hash)"
           Remove-Item -LiteralPath $stagingRoot -Recurse -Force
 
-      - name: Upload workflow artifact
-        uses: actions/upload-artifact@v7
-        with:
-          path: dist/codex-hosts-windows-x86_64.zip
-          archive: false
-          if-no-files-found: error
-
       - name: Publish GitHub Release
         shell: pwsh
         env:
