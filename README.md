@@ -16,7 +16,7 @@
 
 ## What it does
 
-- Saves server details for Codex to use when connecting.
+- Saves server connection details and makes temporary passwords, API keys, and other sensitive values available for Codex to use.
 - Supports passwords, ordinary OpenSSH keys, and hardware-backed keys such as FIDO/YubiKey.
 - Supports identities already loaded in Windows OpenSSH Agent or Pageant.
 

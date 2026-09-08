@@ -81,18 +81,22 @@ jobs:
           $binDirectory = Join-Path $stagingRoot "bin"
           $skillDirectory = Join-Path $stagingRoot "skill\codex-hosts"
           $agentDirectory = Join-Path $skillDirectory "agents"
+          $referenceDirectory = Join-Path $skillDirectory "references"
           New-Item -ItemType Directory -Path $binDirectory -Force | Out-Null
           New-Item -ItemType Directory -Path $agentDirectory -Force | Out-Null
+          New-Item -ItemType Directory -Path $referenceDirectory -Force | Out-Null
           New-Item -ItemType Directory -Path (Split-Path -Parent $archivePath) -Force | Out-Null
 
           Copy-Item -LiteralPath ".\target\release\codex-hosts.exe" -Destination $binDirectory
           Copy-Item -LiteralPath ".\skill\codex-hosts\SKILL.md" -Destination $skillDirectory
           Copy-Item -LiteralPath ".\skill\codex-hosts\agents\openai.yaml" -Destination $agentDirectory
+          Copy-Item -LiteralPath ".\skill\codex-hosts\references\temporary-secrets.md" -Destination $referenceDirectory
 
           $expectedFiles = @(
             "bin/codex-hosts.exe",
             "skill/codex-hosts/SKILL.md",
-            "skill/codex-hosts/agents/openai.yaml"
+            "skill/codex-hosts/agents/openai.yaml",
+            "skill/codex-hosts/references/temporary-secrets.md"
           ) | Sort-Object
           $actualFiles = @(
             Get-ChildItem -LiteralPath $stagingRoot -Recurse -File | ForEach-Object {

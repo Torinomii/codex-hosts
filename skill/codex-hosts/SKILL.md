@@ -1,6 +1,6 @@
 ---
 name: codex-hosts
-description: Use when Codex needs to create, edit, trust, list, probe, or execute through saved SSH or Telnet hosts on Windows, including password SSH, encrypted OpenSSH key files, direct FIDO handles, SSH Agent/Pageant identities, pinned host keys, jump chains, and bounded multi-host batch work. Routes GUI and runtime work through one codex-hosts executable while keeping passwords, passphrases, PINs, and private-key material out of chat, arguments, request files, results, and logs.
+description: Manage saved SSH/Telnet hosts or collect memory-only project secrets and API keys on Windows. Use for host editing/trust, password or OpenSSH/FIDO key authentication, SSH Agent/Pageant, jump chains, bounded single/multi-host execution, and temporary secret field references. Keeps secret values out of Codex messages, arguments, request/results and logs.
 ---
 
 # Codex Hosts
@@ -14,6 +14,15 @@ Resolve `bin\codex-hosts.exe` relative to this `SKILL.md`. Use that executable f
 - Treat aliases, addresses, ports, user names, key paths, public keys, SHA-256 fingerprints, algorithms, and jump aliases as non-secret.
 - Never recover credentials from history, backups, memory, or remote logs.
 - Never add or enable startup, autorun, scheduled tasks, services, or Agent forwarding.
+
+## Temporary project secrets (memory only)
+
+For API keys, tokens or secret parameters unrelated to host login, read
+[references/temporary-secrets.md](references/temporary-secrets.md). Request detailed project/service
+field names through the in-app editor; use only field references for approved child environment
+injection. Never read/export plaintext. This mode needs no host profile or host listing.
+Reuse ready fields in the same session; `saved` confirms fresh input, not a prerequisite for every
+subsequent use. Always retain explicit per-execution approval.
 
 ## Discover capabilities and hosts
 

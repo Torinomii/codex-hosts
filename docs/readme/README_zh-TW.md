@@ -16,7 +16,7 @@
 
 ## 主要功能
 
-- 儲存伺服器資訊，供 Codex 連線時使用。
+- 儲存伺服器連線資訊，並提供臨時密碼、API Key 等敏感內容供 Codex 呼叫。
 - 支援密碼、一般 OpenSSH 金鑰，以及 FIDO/YubiKey 等硬體金鑰登入。
 - 支援已載入 Windows OpenSSH Agent 或 Pageant 的身分。
 

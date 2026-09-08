@@ -28,6 +28,7 @@ use crate::storage::HostStore;
 #[derive(Debug, Clone, Default)]
 pub struct LaunchOptions {
     pub codex_edit: bool,
+    pub show_temporary: bool,
     pub prefill: Prefill,
     pub result_path: Option<PathBuf>,
     pub observed_fingerprint: Option<String>,
@@ -93,6 +94,17 @@ impl HostEditor {
 
     fn connection_changed(&self) -> bool {
         !self.profile.connection_details_equal(&self.original)
+    }
+
+    fn has_unsaved_changes(&self) -> bool {
+        self.profile != self.original
+            || !self.password.is_empty()
+            || !self.key_passphrase.is_empty()
+            || self.password_mode != self.saved_password_mode.unwrap_or(PasswordMode::Password)
+    }
+
+    fn matches_stored_original(&self, store: &HostStore) -> bool {
+        store.hosts.iter().any(|host| host == &self.original)
     }
 
     fn needs_password(&self) -> bool {
@@ -190,6 +202,12 @@ enum FidoSetupAction {
 }
 
 pub struct HostsApp {
+    temporary: Option<crate::temporary_secrets::SecretsApp>,
+    tray: Option<crate::tray::Tray>,
+    exiting: bool,
+    hidden: bool,
+    tray_available: bool,
+    host_refresh_pending: bool,
     store: HostStore,
     catalog: Catalog,
     selected: Option<Uuid>,
@@ -217,7 +235,10 @@ pub struct HostsApp {
 }
 
 impl HostsApp {
-    pub fn new(context: &eframe::CreationContext<'_>, launch: LaunchOptions) -> Self {
+    pub fn new(
+        context: &eframe::CreationContext<'_>,
+        launch: LaunchOptions,
+    ) -> std::io::Result<Self> {
         context.egui_ctx.set_zoom_factor(1.06);
 
         let (mut store, mut startup_error) = match HostStore::load_recovering() {
@@ -295,7 +316,29 @@ impl HostsApp {
         } else {
             catalog.text("status_ready").to_owned()
         };
-        Self {
+        let mut temporary = if launch.codex_edit {
+            None
+        } else {
+            Some(crate::temporary_secrets::SecretsApp::new(
+                context.egui_ctx.clone(),
+            )?)
+        };
+        if let Some(temporary) = &mut temporary {
+            temporary.visible = launch.show_temporary;
+        }
+        let tray = if launch.codex_edit {
+            None
+        } else {
+            crate::tray::Tray::new(context.egui_ctx.clone(), catalog.clone()).ok()
+        };
+        let tray_available = tray.is_some();
+        Ok(Self {
+            temporary,
+            tray,
+            exiting: false,
+            hidden: false,
+            tray_available,
+            host_refresh_pending: false,
             store,
             catalog,
             selected,
@@ -320,7 +363,7 @@ impl HostsApp {
             launch,
             callback_written: false,
             pending_callback: None,
-        }
+        })
     }
 
     fn select(&mut self, id: Uuid) {
@@ -333,6 +376,23 @@ impl HostsApp {
             .cloned()
             .map(HostEditor::load);
         self.status = self.catalog.text("status_ready").to_owned();
+    }
+
+    fn refresh_hosts(&mut self) -> Result<(), String> {
+        let fresh = HostStore::load().map_err(|error| error.to_string())?;
+        if self.store.same_revision(&fresh) {
+            return Ok(());
+        }
+        reconcile_host_editor(&mut self.editor, &mut self.selected, &fresh);
+        self.store = fresh;
+        self.batch_selected
+            .retain(|id| self.store.hosts.iter().any(|host| host.id == *id));
+        self.test_states.clear();
+        self.fingerprint_prompt = None;
+        self.delete_prompt = false;
+        self.batch_delete_prompt = false;
+        self.status = self.catalog.text("hosts_refreshed").to_owned();
+        Ok(())
     }
 
     fn new_host(&mut self) {
@@ -351,6 +411,14 @@ impl HostsApp {
     }
 
     fn persist_editor(&mut self) -> Result<(), String> {
+        self.refresh_hosts()?;
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|editor| !editor.matches_stored_original(&self.store))
+        {
+            return Err(self.catalog.text("host_changed").to_owned());
+        }
         let editor = self.editor.as_ref().ok_or_else(|| "NO_EDITOR".to_owned())?;
         if let Some(issue) = editor.profile.validation_issue() {
             return Err(self.catalog.text(issue.translation_key()).to_owned());
@@ -438,7 +506,7 @@ impl HostsApp {
                     if let Err(error) = credentials::store(id, *kind, secret.as_str()) {
                         let rollback = self
                             .store
-                            .save_recovery_baseline()
+                            .save_recovery_baseline_after(&updated_store)
                             .err()
                             .map(|error| format!("host metadata: {error}"));
                         let primary = self
@@ -1354,6 +1422,24 @@ impl HostsApp {
                             }
                         });
                     ui.label(self.catalog.text("language"));
+                    if !self.launch.codex_edit
+                        && !self.tray_available
+                        && ui.button(self.catalog.text("tray_exit")).clicked()
+                    {
+                        self.exiting = true;
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if self.temporary.is_some()
+                        && ui
+                            .add(
+                                egui::Button::new(self.catalog.text("temp_title"))
+                                    .min_size([112.0, 34.0].into()),
+                            )
+                            .clicked()
+                        && let Some(temporary) = &mut self.temporary
+                    {
+                        temporary.visible = true;
+                    }
                 });
             },
         );
@@ -2405,9 +2491,68 @@ impl HostsApp {
 }
 
 impl eframe::App for HostsApp {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_tests();
+        let mut restore = false;
+        let mut open_secrets = false;
+        if let Some(tray) = &self.tray {
+            tray.set_catalog(&self.catalog);
+            while let Some(event) = tray.poll() {
+                match event {
+                    crate::tray::Event::Open => restore = true,
+                    crate::tray::Event::Secrets => {
+                        restore = true;
+                        open_secrets = true;
+                    }
+                    crate::tray::Event::Exit => {
+                        self.exiting = true;
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    crate::tray::Event::Unavailable => {
+                        self.tray_available = false;
+                        restore = true;
+                    }
+                }
+            }
+        }
+        if let Some(temporary) = &mut self.temporary {
+            if open_secrets {
+                temporary.visible = true;
+            }
+            restore |= temporary.logic(context);
+        }
+        if restore && !self.exiting {
+            self.host_refresh_pending = true;
+            self.hidden = false;
+            context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            context.send_viewport_cmd(egui::ViewportCommand::Focus);
+        }
+        if self.host_refresh_pending && self.tests_idle() && !self.testing_all {
+            self.host_refresh_pending = false;
+            if let Err(error) = self.refresh_hosts() {
+                self.status = self.catalog.format("storage_error", &[("error", &error)]);
+            }
+        }
+        if should_hide_to_tray(
+            context.input(|i| i.viewport().close_requested()),
+            self.launch.codex_edit,
+            self.exiting,
+            self.hidden,
+            restore,
+        ) {
+            context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if self.tray_available {
+                self.hidden = true;
+                context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else {
+                self.status = self.catalog.text("tray_unavailable").to_owned();
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
-        self.poll_tests();
         self.top_bar(ui, &context);
         ui.separator();
         let body = ui.available_rect_before_wrap();
@@ -2439,6 +2584,9 @@ impl eframe::App for HostsApp {
         self.batch_export_window(&context);
         self.delete_modal(&context);
         self.batch_delete_modal(&context);
+        if let Some(temporary) = &mut self.temporary {
+            temporary.show(&context, &self.catalog);
+        }
     }
 }
 
@@ -2452,6 +2600,31 @@ impl Drop for HostsApp {
             let _ = self.write_callback("cancelled", alias.as_deref());
         }
     }
+}
+
+fn reconcile_host_editor(
+    editor: &mut Option<HostEditor>,
+    selected: &mut Option<Uuid>,
+    store: &HostStore,
+) {
+    if editor.as_ref().is_some_and(HostEditor::has_unsaved_changes) {
+        return; // Preserve drafts, but persist_editor must reject an externally changed original.
+    }
+    let host = selected
+        .and_then(|id| store.hosts.iter().find(|host| host.id == id))
+        .or_else(|| store.hosts.first());
+    *selected = host.map(|host| host.id);
+    *editor = host.cloned().map(HostEditor::load);
+}
+
+fn should_hide_to_tray(
+    close_requested: bool,
+    codex_edit: bool,
+    exiting: bool,
+    hidden: bool,
+    restoring: bool,
+) -> bool {
+    close_requested && !codex_edit && !exiting && !hidden && !restoring
 }
 
 fn test_timed_out(elapsed: Duration, timeout: Duration) -> bool {
@@ -2641,7 +2814,7 @@ fn font_candidates(locale: &str) -> Vec<(&'static str, &'static str)> {
     std::iter::once(SEGOE).chain(regional).collect()
 }
 
-fn configure_fonts(context: &egui::Context, locale: &str) {
+pub(crate) fn configure_fonts(context: &egui::Context, locale: &str) {
     let mut fonts = FontDefinitions::default();
     let mut installed = Vec::new();
     for (name, path) in font_candidates(locale) {
@@ -2665,6 +2838,44 @@ fn configure_fonts(context: &egui::Context, locale: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refresh_preserves_dirty_drafts_and_reloads_clean_or_deleted_hosts() {
+        let original = HostProfile::new("original".into());
+        let mut store = HostStore::default();
+        store.hosts.push(original.clone());
+        let mut selected = Some(original.id);
+        let mut editor = Some(HostEditor::load(original.clone()));
+        store.hosts[0].address = "external.example".into();
+        reconcile_host_editor(&mut editor, &mut selected, &store);
+        assert_eq!(editor.as_ref().unwrap().profile.address, "external.example");
+        editor.as_mut().unwrap().profile.alias = "unrelated-local-draft".into();
+        store
+            .hosts
+            .push(HostProfile::new("another-window-host".into()));
+        reconcile_host_editor(&mut editor, &mut selected, &store);
+        assert!(editor.as_ref().unwrap().matches_stored_original(&store));
+        editor.as_mut().unwrap().profile.alias = "unsaved-draft".into();
+        editor
+            .as_mut()
+            .unwrap()
+            .password
+            .push_str("synthetic-draft");
+        store.hosts[0].address = "newer.example".into();
+        reconcile_host_editor(&mut editor, &mut selected, &store);
+        let draft = editor.as_ref().unwrap();
+        assert_eq!(draft.profile.alias, "unsaved-draft");
+        assert_eq!(draft.password.as_str(), "synthetic-draft");
+        assert!(!draft.matches_stored_original(&store));
+        // Explicitly discarding the draft allows the current stored profile to be loaded.
+        editor = None;
+        reconcile_host_editor(&mut editor, &mut selected, &store);
+        assert!(editor.as_ref().unwrap().matches_stored_original(&store));
+        store.hosts.clear();
+        reconcile_host_editor(&mut editor, &mut selected, &store);
+        assert!(editor.is_none());
+        assert!(selected.is_none());
+    }
 
     #[test]
     fn font_loading_prioritizes_the_active_language_and_keeps_cjk_fallbacks() {
@@ -2904,5 +3115,14 @@ mod tests {
             key_passphrase: Zeroizing::new("ignored-passphrase".to_owned()),
         };
         assert_eq!(imported_credential(&agent_host), None);
+    }
+
+    #[test]
+    fn stale_close_cannot_override_restore_or_explicit_exit() {
+        assert!(should_hide_to_tray(true, false, false, false, false));
+        assert!(!should_hide_to_tray(true, false, false, true, false));
+        assert!(!should_hide_to_tray(true, false, false, false, true));
+        assert!(!should_hide_to_tray(true, false, true, false, false));
+        assert!(!should_hide_to_tray(true, true, false, false, false));
     }
 }

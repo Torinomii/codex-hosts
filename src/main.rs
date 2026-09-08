@@ -9,7 +9,9 @@ mod model;
 mod ssh;
 mod storage;
 mod telnet;
+mod temporary_secrets;
 mod tool;
+mod tray;
 mod ui;
 
 use std::path::PathBuf;
@@ -20,6 +22,15 @@ use model::{Prefill, Protocol, SshAuth};
 fn main() {
     match parse_args(std::env::args().skip(1).collect()) {
         Ok(LaunchMode::Gui(options)) => launch_gui(options),
+        Ok(LaunchMode::TemporarySecrets(session)) => {
+            let _ = session;
+            if !temporary_secrets::restore_existing(true) {
+                launch_gui(ui::LaunchOptions {
+                    show_temporary: true,
+                    ..Default::default()
+                });
+            }
+        }
         Ok(LaunchMode::Tool {
             request_path,
             result_path,
@@ -29,6 +40,9 @@ fn main() {
 }
 
 fn launch_gui(options: ui::LaunchOptions) {
+    if !options.codex_edit && temporary_secrets::restore_existing(options.show_temporary) {
+        return;
+    }
     let preferred_locale = storage::HostStore::load_recovering()
         .ok()
         .and_then(|store| store.preferred_locale);
@@ -46,12 +60,13 @@ fn launch_gui(options: ui::LaunchOptions) {
         "Codex Hosts",
         native_options,
         Box::new(move |creation_context| {
-            Ok(Box::new(ui::HostsApp::new(creation_context, options)))
+            Ok(Box::new(ui::HostsApp::new(creation_context, options)?))
         }),
     );
 }
 
 enum LaunchMode {
+    TemporarySecrets(uuid::Uuid),
     Gui(ui::LaunchOptions),
     Tool {
         request_path: PathBuf,
@@ -60,6 +75,14 @@ enum LaunchMode {
 }
 
 fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
+    if args.first().is_some_and(|arg| arg == "--temporary-secrets") {
+        if args.len() != 2 {
+            return Err("temporary secrets requires only a session UUID".into());
+        }
+        return uuid::Uuid::parse_str(&args[1])
+            .map(LaunchMode::TemporarySecrets)
+            .map_err(|_| "invalid session UUID".into());
+    }
     let mut options = ui::LaunchOptions::default();
     let mut request_path = None;
     let mut result_path = None;
@@ -173,5 +196,22 @@ mod tests {
             .expect("invalid authentication must fail");
         assert!(error.contains("fido-handle"));
         assert!(error.contains("SSH Agent/Pageant"));
+    }
+    #[test]
+    fn temporary_mode_accepts_only_an_opaque_uuid() {
+        let id = uuid::Uuid::new_v4();
+        assert!(
+            matches!(parse_args(vec!["--temporary-secrets".into(), id.to_string()]).unwrap(), LaunchMode::TemporarySecrets(value) if value == id)
+        );
+        assert!(parse_args(vec!["--temporary-secrets".into(), "not-a-session".into()]).is_err());
+        assert!(
+            parse_args(vec![
+                "--temporary-secrets".into(),
+                id.to_string(),
+                "--secret".into(),
+                "not-accepted".into()
+            ])
+            .is_err()
+        );
     }
 }

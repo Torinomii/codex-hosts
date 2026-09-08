@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Hosts"
-  short_description: "Use saved SSH and Telnet hosts safely"
-  default_prompt: "Use $codex-hosts to run bounded single-host, multi-command, or multi-host work without exposing credentials, and reuse authenticated SSH sessions when possible."
+  short_description: "Manage hosts and memory-only secret references"
+  default_prompt: "Use $codex-hosts for bounded SSH/Telnet work or memory-only project secrets: collect missing values in the in-app editor, reuse ready field references, and request explicit approval for each secret-consuming execution without reading plaintext."
