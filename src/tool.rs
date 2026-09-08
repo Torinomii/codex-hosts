@@ -32,6 +32,13 @@ const MAX_TOOL_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 #[serde(tag = "action", rename_all = "snake_case")]
 enum ToolRequest {
     Capabilities,
+    TemporarySecretsOpen {
+        fields: Vec<String>,
+    },
+    TemporarySecrets {
+        session: uuid::Uuid,
+        request: crate::temporary_secrets::Request,
+    },
     AgentIdentities,
     FidoIdentities,
     ListHosts,
@@ -140,7 +147,7 @@ struct CapabilitiesResult {
     schema_version: u32,
     status: &'static str,
     app_version: &'static str,
-    actions: [&'static str; 8],
+    actions: [&'static str; 10],
     ssh_auth: [&'static str; 3],
     max_batch_concurrency: usize,
     max_batch_hosts: usize,
@@ -204,6 +211,7 @@ struct BatchWorkResult {
 #[derive(Serialize)]
 #[serde(untagged)]
 enum ToolResponse {
+    TemporarySecrets(crate::temporary_secrets::Response),
     Capabilities(CapabilitiesResult),
     AgentIdentities(AgentIdentitiesResult),
     FidoIdentities(FidoIdentitiesResult),
@@ -217,6 +225,7 @@ enum ToolResponse {
 impl ToolResponse {
     fn is_failure(&self) -> bool {
         matches!(self, Self::Failure(_))
+            || matches!(self, Self::TemporarySecrets(response) if response.status == "error")
     }
 }
 
@@ -258,6 +267,8 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             status: "ok",
             app_version: env!("CARGO_PKG_VERSION"),
             actions: [
+                "temporary_secrets_open",
+                "temporary_secrets",
                 "agent_identities",
                 "fido_identities",
                 "list_hosts",
@@ -297,11 +308,36 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         }));
     }
 
+    match &request {
+        ToolRequest::TemporarySecretsOpen { fields } => {
+            return crate::temporary_secrets::open(fields.clone())
+                .map(ToolResponse::TemporarySecrets)
+                .map_err(|code| {
+                    RemoteFailure::new(
+                        code,
+                        "Temporary secret window unavailable or invalid field names.",
+                    )
+                });
+        }
+        ToolRequest::TemporarySecrets { session, request } => {
+            return crate::temporary_secrets::call(*session, request.clone())
+                .map(ToolResponse::TemporarySecrets)
+                .map_err(|code| {
+                    RemoteFailure::new(
+                        code,
+                        "Temporary session unavailable; open a new window if it was closed.",
+                    )
+                });
+        }
+        _ => {}
+    }
     let store = HostStore::load()
         .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
 
     match request {
-        ToolRequest::Capabilities => unreachable!(),
+        ToolRequest::Capabilities
+        | ToolRequest::TemporarySecretsOpen { .. }
+        | ToolRequest::TemporarySecrets { .. } => unreachable!(),
         ToolRequest::AgentIdentities => unreachable!(),
         ToolRequest::FidoIdentities => unreachable!(),
         ToolRequest::ListHosts => list_hosts(&store),

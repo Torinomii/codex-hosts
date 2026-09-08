@@ -16,9 +16,10 @@
 
 ## 主要功能
 
-- 保存服务器信息提供给codex连接。
+- 保存服务器连接信息，临时密码、apikey等敏感内容提供给codex调用。
 - 支持密码、普通 OpenSSH 密钥或 FIDO/YubiKey 等硬件密钥登录。
 - 支持 Windows OpenSSH Agent 或 Pageant 中加载的身份。
+
 
 ## 安装
 

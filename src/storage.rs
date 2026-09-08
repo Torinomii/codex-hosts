@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -19,6 +20,9 @@ pub struct HostStore {
     pub hosts: Vec<HostProfile>,
     #[serde(skip)]
     write_blocked: Option<String>,
+    // Exact loaded bytes (None means no primary). Never written into hosts.json.
+    #[serde(skip)]
+    revision: RefCell<Option<Vec<u8>>>,
 }
 
 fn load_primary_strict(path: &Path) -> Result<Option<HostStore>, StorageError> {
@@ -39,6 +43,7 @@ impl Default for HostStore {
             preferred_locale: None,
             hosts: Vec::new(),
             write_blocked: None,
+            revision: RefCell::new(None),
         }
     }
 }
@@ -73,12 +78,20 @@ impl HostStore {
             return Err(StorageError::WriteBlocked(reason.clone()));
         }
         let path = hosts_path()?;
-        save_store_to_path(self, &path)
+        self.save_to_path(&path)
     }
 
-    pub fn save_recovery_baseline(&self) -> Result<(), StorageError> {
+    fn save_to_path(&self, path: &Path) -> Result<(), StorageError> {
+        save_checked_store_to_path(self, path, self, false)
+    }
+
+    pub fn save_recovery_baseline_after(&self, committed: &Self) -> Result<(), StorageError> {
         let path = hosts_path()?;
-        save_recovery_baseline_to_path(self, &path)
+        save_checked_store_to_path(self, &path, committed, true)
+    }
+
+    pub fn same_revision(&self, other: &Self) -> bool {
+        *self.revision.borrow() == *other.revision.borrow()
     }
 
     pub fn find_alias(&self, alias: &str) -> Option<&HostProfile> {
@@ -106,10 +119,51 @@ fn load_legacy_or_default() -> Result<HostStore, StorageError> {
     {
         let mut migrated = read_store(&legacy)?;
         migrated.version = STORE_VERSION;
+        *migrated.revision.get_mut() = None; // Migration creates a new primary, not the legacy file.
         migrated.save()?;
         return Ok(migrated);
     }
     Ok(HostStore::default())
+}
+
+fn disk_revision(path: &Path) -> Result<Option<Vec<u8>>, StorageError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_checked_store_to_path(
+    store: &HostStore,
+    path: &Path,
+    expected: &HostStore,
+    recovery: bool,
+) -> Result<(), StorageError> {
+    if let Some(reason) = &store.write_blocked {
+        return Err(StorageError::WriteBlocked(reason.clone()));
+    }
+    fs::create_dir_all(path.parent().ok_or(StorageError::NoDataDirectory)?)?;
+    // A stable sidecar, not the replaceable primary, serializes cooperating writers. Closing the
+    // handle releases the lock even after a crash; never unlink it while another process can open it.
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    lock.try_lock()
+        .map_err(|error| StorageError::WriteBlocked(format!("host storage is busy: {error}")))?;
+    if disk_revision(path)? != *expected.revision.borrow() {
+        return Err(StorageError::Changed);
+    }
+    if recovery {
+        save_recovery_baseline_to_path(store, path)?;
+    } else {
+        save_store_to_path(store, path)?;
+    }
+    *store.revision.borrow_mut() = disk_revision(path)?;
+    Ok(())
 }
 
 fn save_store_to_path(store: &HostStore, path: &Path) -> Result<(), StorageError> {
@@ -251,6 +305,7 @@ fn read_store(path: &Path) -> Result<HostStore, StorageError> {
     let bytes = fs::read(path)?;
     let mut store: HostStore = serde_json::from_slice(&bytes)?;
     store.version = STORE_VERSION;
+    *store.revision.get_mut() = Some(bytes);
     Ok(store)
 }
 
@@ -276,6 +331,10 @@ fn legacy_hosts_path() -> Option<PathBuf> {
 
 #[derive(Debug, Error)]
 pub enum StorageError {
+    #[error(
+        "host data changed in another window; reopen the main window and review the latest hosts before saving"
+    )]
+    Changed,
     #[error("no application data directory is available")]
     NoDataDirectory,
     #[error("file operation failed: {0}")]
@@ -293,6 +352,84 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_window_cannot_overwrite_callback_edits_or_locale() {
+        let directory = std::env::temp_dir().join(format!("codex-hosts-review-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("hosts.json");
+        let mut original = HostStore::default();
+        original.hosts.push(HostProfile::new("original".into()));
+        original.save_to_path(&path).unwrap();
+        let mut hidden = read_store(&path).unwrap();
+        let mut callback = read_store(&path).unwrap();
+        callback.hosts[0].address = "changed.example".into();
+        callback.hosts.push(HostProfile::new("added".into()));
+        callback.save_to_path(&path).unwrap();
+        hidden.preferred_locale = Some("ja".into());
+        assert!(matches!(
+            hidden.save_to_path(&path),
+            Err(StorageError::Changed)
+        ));
+        let mut restored = read_store(&path).unwrap();
+        assert_eq!(restored.hosts.len(), 2);
+        assert_eq!(restored.hosts[0].address, "changed.example");
+        restored.preferred_locale = Some("ja".into());
+        restored.save_to_path(&path).unwrap();
+        restored.preferred_locale = Some("en".into());
+        restored.save_to_path(&path).unwrap();
+        assert_eq!(read_store(&path).unwrap().hosts.len(), 2);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn guarded_rollback_never_overwrites_a_later_writer() {
+        let directory = std::env::temp_dir().join(format!("codex-hosts-review-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("hosts.json");
+        let original = HostStore::default();
+        original.save_to_path(&path).unwrap();
+        let mut candidate = original.clone();
+        candidate.hosts.push(HostProfile::new("candidate".into()));
+        candidate.save_to_path(&path).unwrap();
+        save_checked_store_to_path(&original, &path, &candidate, true).unwrap();
+        assert!(read_store(&path).unwrap().hosts.is_empty());
+        assert!(
+            read_store(&path.with_extension("json.bak"))
+                .unwrap()
+                .hosts
+                .is_empty()
+        );
+        let mut later = read_store(&path).unwrap();
+        later.hosts.push(HostProfile::new("later".into()));
+        later.save_to_path(&path).unwrap();
+        assert!(matches!(
+            save_checked_store_to_path(&original, &path, &candidate, true),
+            Err(StorageError::Changed)
+        ));
+        assert_eq!(read_store(&path).unwrap().hosts[0].alias, "later");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn checked_save_fails_promptly_while_another_writer_holds_the_lock() {
+        let directory = std::env::temp_dir().join(format!("codex-hosts-review-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("hosts.json");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        assert!(HostStore::default().save_to_path(&path).is_err());
+        assert!(!path.exists());
+        drop(lock);
+        HostStore::default().save_to_path(&path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn neutral_alias_does_not_mix_interface_languages() {
