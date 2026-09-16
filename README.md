@@ -10,15 +10,23 @@
 
 [English](README.md) | [简体中文](docs/readme/README_zh-CN.md) | [繁體中文](docs/readme/README_zh-TW.md) | [日本語](docs/readme/README_ja.md)
 
-`codex-hosts` is a Windows SSH / Telnet host manager for Codex. It lets Codex connect safely without handling your passwords or keys.
+`codex-hosts` is a Windows SSH / Telnet host manager for Codex. It lets Codex connect to and operate remote hosts without directly handling sensitive credentials such as passwords, private-key passphrases, or FIDO PINs in chat, command arguments, or request files.
 
 ![Codex Hosts main window](Main.png)
 
-## What it does
+## Features
 
-- Saves server connection details and makes temporary passwords, API keys, and other sensitive values available for Codex to use.
-- Supports passwords, ordinary OpenSSH keys, and hardware-backed keys such as FIDO/YubiKey.
-- Supports identities already loaded in Windows OpenSSH Agent or Pageant.
+- Manage reusable SSH / Telnet host profiles.
+- Password and ordinary OpenSSH private-key authentication.
+- FIDO / YubiKey hardware-backed SSH keys.
+- Identities already loaded in Windows OpenSSH Agent or Pageant.
+- SSH host-key pinning with explicit user confirmation.
+- Verified SSH jump-host chains.
+- Single-host command execution.
+- Concurrent commands over one SSH connection.
+- Multi-host SSH / Telnet probing and execution.
+- Memory-only temporary secrets for API keys, tokens, and other values that should not be exposed to Codex.
+- A complete Codex Skill for host lookup, connection, authentication, and command execution.
 
 ## Installation
 
@@ -26,15 +34,40 @@
 
 The prebuilt version supports 64-bit Windows 10 or newer. Download it from [Releases](https://github.com/Torinomii/codex-hosts/releases/latest).
 
-To install it manually:
+### Install the Codex Skill
 
-1. Put `bin\codex-hosts.exe` at `skill\codex-hosts\bin\codex-hosts.exe`.
-2. Copy the complete `skill\codex-hosts` folder to `%USERPROFILE%\.codex\skills\codex-hosts`.
+The installed Skill should look like this:
+
+```text
+%USERPROFILE%\.codex\skills\codex-hosts\
+├── SKILL.md
+├── bin\
+│   └── codex-hosts.exe
+├── agents\
+└── references\
+```
+
+For a manual installation:
+
+1. Place the release executable at:
+
+```text
+%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe
+```
+
+2. Copy the complete contents of `skill\codex-hosts` from the release into:
+
+```text
+%USERPROFILE%\.codex\skills\codex-hosts
+```
+
+Do not install only `SKILL.md` or the executable; keep the complete Skill directory.
 
 You can also ask Codex to install it:
 
 ```text
-Download and install the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest. Automatically find the Skill installation directory for the current environment, install the complete Skill and executable, and confirm that all required files are in place.
+Download and install the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest.
+Automatically find the Skill installation directory for the current environment, install the complete Skill and executable, and confirm that all required files are in place.
 ```
 
 ### Build from source
@@ -47,19 +80,263 @@ cd codex-hosts
 cargo build --locked --release
 ```
 
-When the build finishes, copy `target\release\codex-hosts.exe` to `skill\codex-hosts\bin\codex-hosts.exe`, then install the complete Skill folder.
+The executable is created at:
+
+```text
+target\release\codex-hosts.exe
+```
+
+Place it in the Skill's `bin` directory after the build completes.
 
 ## Quick start
 
-1. Open `codex-hosts.exe` and create a host.
-2. Enter an alias, address, port, and user name, then choose how to sign in and save.
+### 1. Add a host
+
+Open `codex-hosts.exe` and create a host.
+
+Enter:
+
+- Alias
+- Address or IP
+- Port
+- User name
+- Protocol
+- Authentication method
+
+Then save the profile.
+
+### 2. Choose an authentication method
+
+| Method | Description |
+| --- | --- |
+| Password | Password authentication, stored in Windows Credential Manager |
+| OpenSSH Key | Ordinary OpenSSH private-key file |
+| FIDO / Security Key | OpenSSH FIDO handle backed by a hardware device |
+| SSH Agent | Identity already loaded in Windows OpenSSH Agent or Pageant |
+
+Sensitive authentication values are not passed through the Codex conversation.
+
+### 3. Use the host from Codex
+
+After saving a host, tell Codex the host alias and the task to perform.
+
+For example:
+
+```text
+Connect to example and run hostname.
+```
+
+Or:
+
+```text
+Check disk usage on web-1 and web-2.
+```
+
+You can also request several operations at once:
+
+```text
+Connect to server1 and check hostname, uptime, and disk space.
+```
+
+The Codex Skill handles:
+
+- Host lookup
+- Connection setup
+- SSH host-key verification
+- Authentication
+- Command execution
+- Structured results
+
+Normal use does not require writing Tool JSON manually.
+
+## Security boundaries
+
+### Login credentials
+
+Passwords and private-key passphrases are persistently stored in Windows Credential Manager.
+
+These sensitive values are not:
+
+- Written into host profiles
+- Placed in Tool JSON
+- Passed as command-line arguments
+- Returned to Codex
+
+A FIDO PIN is used only for the current operation and is not saved.
+
+### SSH host keys
+
+SSH host fingerprints require explicit user confirmation.
+
+On a first connection to an unknown host, `codex-hosts` displays the detected host fingerprint. It is saved only after the user confirms it.
+
+If the server host key later changes, the saved fingerprint is not replaced automatically and must be confirmed again.
+
+### Temporary secrets
+
+`codex-hosts` can also hold temporary API keys, tokens, and other sensitive values unrelated to host login.
+
+These values live only in the current `codex-hosts` process memory. They are not stored in Windows Credential Manager and are not returned to Codex.
+
+After user approval, they can be injected directly into the environment of a selected program.
+
+They expire when `codex-hosts` exits, the user signs out, or the system restarts.
+
+See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md) for the complete behavior.
+
+## FIDO / security keys
+
+`codex-hosts` can use existing OpenSSH ECDSA-SK and Ed25519-SK FIDO handles.
+
+For example:
+
+```text
+id_ecdsa_sk
+id_ed25519_sk
+```
+
+New or recovered FIDO SSH credentials created through the application use ECDSA-SK.
+
+In FIDO mode:
+
+- Hardware private keys stay on the security device.
+- The FIDO PIN is used only for the current operation and is not saved.
+- SSH Agent is not required.
+- Agent forwarding is always disabled.
+- Authentication may require a PIN or touch, depending on the device configuration.
+
+FIDO handles and SSH Agent are separate authentication paths.
+
+FIDO handle:
+
+```text
+codex-hosts
+    │
+    ▼
+OpenSSH FIDO Handle
+    │
+    ▼
+Security key
+```
+
+`codex-hosts` performs hardware signing directly through system components.
+
+SSH Agent:
+
+```text
+codex-hosts
+    │
+    ▼
+OpenSSH Agent / Pageant
+    │
+    ▼
+Loaded identity
+```
+
+Authentication is delegated to an already running Agent.
+
+`codex-hosts` does not start, enable, or persist an Agent service automatically.
+
+## Jump hosts
+
+An SSH host can use another saved and verified SSH host as a jump host.
+
+For example:
+
+```text
+Codex
+  │
+  ▼
+jump-1
+  │
+  ▼
+jump-2
+  │
+  ▼
+target
+```
+
+Rules:
+
+- A jump host must be a verified SSH host.
+- Every hop verifies its host key.
+- Jump-host loops are rejected.
+- An SSH chain can contain at most 8 hosts.
+- Agent forwarding is always disabled.
+
+## Telnet
+
+`codex-hosts` also supports Telnet.
+
+Telnet does not provide encryption, so user names, passwords, commands, and returned data may travel across the network in plaintext.
+
+Use Telnet only on trusted networks where you explicitly accept that risk. SSH is recommended for Internet-facing connections.
+
+## Batch execution
+
+### Multiple commands on one SSH host
+
+`exec_many` reuses one SSH connection to run several independent short commands concurrently:
+
+```json
+{
+  "action": "exec_many",
+  "alias": "example",
+  "commands": [
+    "hostname",
+    "uptime",
+    "df -h"
+  ],
+  "max_concurrency": 8
+}
+```
+
+It authenticates once and then opens multiple channels over the same SSH connection.
+
+This is especially useful with FIDO / security keys because a group of commands can normally share one authentication.
+
+`exec_many` is available only for SSH hosts.
+
+### Multiple hosts
+
+Specify the hosts explicitly:
+
+```json
+{
+  "action": "batch_exec",
+  "aliases": [
+    "web-1",
+    "web-2",
+    "web-3"
+  ],
+  "command": "uptime",
+  "max_concurrency": 8,
+  "batch_timeout_ms": 30000
+}
+```
+
+Hosts can also be probed in a batch:
+
+```json
+{
+  "action": "batch_probe",
+  "aliases": [
+    "web-1",
+    "web-2"
+  ],
+  "max_concurrency": 8,
+  "batch_timeout_ms": 30000
+}
+```
+
+Batch mode requires an explicit host list. An empty list is never interpreted as all hosts.
 
 <details>
-<summary>Interface</summary>
+<summary>Codex / Tool interface</summary>
 
-### Calling from Codex or a script
+### GUI edit mode
 
-GUI edit mode can be prefilled with non-secret connection details:
+Codex or a script can open the host editor with non-secret connection details prefilled:
 
 ```powershell
 .\bin\codex-hosts.exe --codex-edit `
@@ -72,13 +349,23 @@ GUI edit mode can be prefilled with non-secret connection details:
   --result-file result.json
 ```
 
+Do not pass passwords, private-key passphrases, or FIDO PINs as arguments.
+
 Authentication arguments use stable names:
 
 - `password`: password authentication.
-- `private-key` / `private_key`: a key file or FIDO handle; `fido-handle` is also accepted.
-- `ssh-agent` / `ssh_agent`: a running SSH Agent or Pageant.
+- `private-key` / `private_key`: ordinary private-key file or FIDO handle; `fido-handle` is also accepted.
+- `ssh-agent` / `ssh_agent`: Windows OpenSSH Agent or Pageant.
 
-Tool mode reads a request file and writes a result file. Neither file may contain credentials:
+`private-key` covers both ordinary OpenSSH private keys and FIDO handles.
+
+`ssh-agent` refers specifically to Agent / Pageant mode and not to every hardware-key authentication path.
+
+### Tool mode
+
+Tool mode uses UTF-8 JSON request and result files. Neither file may contain credentials.
+
+Common requests:
 
 ```json
 {"action":"capabilities"}
@@ -92,15 +379,58 @@ Tool mode reads a request file and writes a result file. Neither file may contai
 {"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
 ```
 
-`exec_many` authenticates once, then runs several short commands through concurrent channels on the same SSH connection. With a hardware key, this normally reduces a group of commands to one authentication. `agent_identities` and `fido_identities` return only public identity details and public keys. When running remote commands, check `output_truncated` in the result to see whether any output was shortened by the size limit.
+`agent_identities` and `fido_identities` return only public identity details and public keys.
+
+When running remote commands, check `output_truncated` to see whether output was shortened by the size limit.
+
+See [`SKILL.md`](skill/codex-hosts/SKILL.md) for the full Codex behavior, workflow, and safety rules.
 
 </details>
 
-## Security boundaries
+## Execution limits
 
-- Passwords and key-file passphrases are stored only in Windows Credential Manager. A FIDO PIN is used only for the current operation and is never saved.
-- SSH host fingerprints must be explicitly confirmed by the user. The app never replaces a saved fingerprint automatically.
-- Direct FIDO signing never starts or enables an Agent service, and Agent forwarding is always disabled.
-- Only verified SSH hosts can be used as jump hosts. A chain can contain at most eight hosts and is checked for loops.
-- Telnet sends accounts and data in plaintext. Use it only on a trusted network where you explicitly accept that risk.
-- A single command can capture at most 1 MiB of output. A complete `exec_many` or batch JSON result is limited to 8 MiB. The budget is applied while output is received, and the result is written directly instead of building several large JSON copies in memory.
+Command execution is deliberately bounded to prevent excessive output or memory use.
+
+- A single command can capture at most **1 MiB** of output.
+- A complete `exec_many` or batch JSON result is limited to **8 MiB**.
+- `exec_many` and batch operations use bounded concurrency.
+- Check `output_truncated` when output may have been shortened.
+- Remote commands are not automatically retried after network failures.
+
+Automatic retries are avoided because remote commands may not be idempotent, for example:
+
+```text
+reboot
+rm
+systemctl restart
+database writes
+deployment operations
+```
+
+A network failure does not mean that running the same command again is safe.
+
+## Project structure
+
+```text
+codex-hosts
+├── src\
+├── skill\
+│   └── codex-hosts\
+│       ├── SKILL.md
+│       ├── agents\
+│       └── references\
+├── languages\
+├── docs\
+│   └── readme\
+│       ├── README_zh-CN.md
+│       ├── README_zh-TW.md
+│       └── README_ja.md
+├── Cargo.toml
+├── Cargo.lock
+├── Main.png
+└── README.md
+```
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
