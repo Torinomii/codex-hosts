@@ -10,31 +10,64 @@
 
 [English](../../README.md) | [简体中文](README_zh-CN.md) | [繁體中文](README_zh-TW.md) | [日本語](README_ja.md)
 
-`codex-hosts` 是供 Codex 使用的 Windows SSH / Telnet 主機管理工具，讓 Codex 不必接觸密碼或金鑰也能安全地發起連線。
+`codex-hosts` 是供 Codex 使用的 Windows SSH / Telnet 主機管理工具，讓 Codex 可以連線並操作遠端主機，而不必在對話、命令參數或要求檔案中直接處理密碼、私鑰密碼片語和 FIDO PIN 等敏感憑據。
 
 ![Codex Hosts 主視窗](../../Main.png)
 
 ## 主要功能
 
-- 儲存伺服器連線資訊，並提供臨時密碼、API Key 等敏感內容供 Codex 呼叫。
-- 支援密碼、一般 OpenSSH 金鑰，以及 FIDO/YubiKey 等硬體金鑰登入。
+- 管理可重複使用的 SSH / Telnet 主機設定。
+- 支援密碼與一般 OpenSSH 私鑰驗證。
+- 支援 FIDO / YubiKey 等硬體安全金鑰。
 - 支援已載入 Windows OpenSSH Agent 或 Pageant 的身分。
+- SSH 主機指紋固定與使用者確認。
+- 支援已驗證的 SSH Jump Host / 跳板鏈。
+- 支援單一主機命令執行。
+- 支援在同一條 SSH 連線上並行執行多條命令。
+- 支援 SSH / Telnet 多主機批次探測與執行。
+- 支援僅存在於記憶體中的臨時秘密，可用於 API Key、Token 等不適合直接交給 Codex 的敏感參數。
+- 提供完整 Codex Skill，可由 Codex 自動完成主機查找、連線、驗證與命令執行。
 
 ## 安裝
 
 ### 直接下載
 
-預先建置的版本支援 64 位元 Windows 10 或更新版本，可從 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下載。
+預先建置版本支援 64 位元 Windows 10 或更新版本，可從 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下載。
 
-如果要手動安裝：
+### 安裝 Codex Skill
 
-1. 將 `bin\codex-hosts.exe` 放到 `skill\codex-hosts\bin\codex-hosts.exe`。
-2. 將完整的 `skill\codex-hosts` 資料夾複製到 `%USERPROFILE%\.codex\skills\codex-hosts`。
+完整 Skill 的安裝結構：
+
+```text
+%USERPROFILE%\.codex\skills\codex-hosts\
+├── SKILL.md
+├── bin\
+│   └── codex-hosts.exe
+├── agents\
+└── references\
+```
+
+手動安裝：
+
+1. 將 Release 中的 `codex-hosts.exe` 放到：
+
+```text
+%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe
+```
+
+2. 將 Release 中完整的 `skill\codex-hosts` 內容複製到：
+
+```text
+%USERPROFILE%\.codex\skills\codex-hosts
+```
+
+不要只複製 `SKILL.md` 或執行檔，應保留完整的 Skill 目錄。
 
 也可以直接請 Codex 安裝：
 
 ```text
-從 https://github.com/Torinomii/codex-hosts/releases/latest 下載並安裝最新版 codex-hosts。請自動找到目前環境的 Skill 安裝目錄，安裝完整的 Skill 和執行檔，並確認所有必要檔案都已就位。
+從 https://github.com/Torinomii/codex-hosts/releases/latest 下載並安裝最新版 codex-hosts。
+請自動找到目前環境的 Skill 安裝目錄，安裝完整的 Skill 與執行檔，並確認所有必要檔案都已就位。
 ```
 
 ### 從原始碼建置
@@ -47,19 +80,269 @@ cd codex-hosts
 cargo build --locked --release
 ```
 
-建置完成後，將 `target\release\codex-hosts.exe` 複製到 `skill\codex-hosts\bin\codex-hosts.exe`，再安裝完整的 Skill 資料夾。
+生成的執行檔位於：
+
+```text
+target\release\codex-hosts.exe
+```
+
+建置完成後，將它放入 Skill 的 `bin` 目錄即可。
 
 ## 快速上手
 
-1. 開啟 `codex-hosts.exe`，新增一台主機。
-2. 填寫別名、位址、連接埠和使用者名稱，再選擇登入方式並儲存。
+### 1. 新增主機
+
+開啟 `codex-hosts.exe`，新增一台主機。
+
+填寫：
+
+- 別名
+- 位址或 IP
+- 連接埠
+- 使用者名稱
+- 協定
+- 驗證方式
+
+然後儲存。
+
+### 2. 選擇驗證方式
+
+| 驗證方式 | 說明 |
+| --- | --- |
+| Password | 使用密碼登入，密碼儲存在 Windows 認證管理員中 |
+| OpenSSH Key | 使用一般 OpenSSH 私鑰檔案 |
+| FIDO / 安全金鑰 | 使用 OpenSSH FIDO Handle，由硬體裝置完成簽署 |
+| SSH Agent | 使用已載入 Windows OpenSSH Agent 或 Pageant 的身分 |
+
+這些驗證方式中的敏感值不會透過 Codex 對話傳遞。
+
+### 3. 讓 Codex 使用主機
+
+儲存主機後，只需要告訴 Codex 主機別名和要執行的工作。
+
+例如：
+
+```text
+連線到 example，執行 hostname。
+```
+
+或者：
+
+```text
+檢查 web-1 和 web-2 的磁碟使用情況。
+```
+
+也可以一次要求執行多個操作：
+
+```text
+連線到 server1，檢查 hostname、uptime 和磁碟空間。
+```
+
+Codex Skill 會負責：
+
+- 查找主機設定
+- 建立連線
+- 驗證 SSH Host Key
+- 完成身分驗證
+- 執行命令
+- 傳回結構化結果
+
+一般使用時不需要手動撰寫 Tool JSON。
+
+## 安全界線
+
+### 登入憑據
+
+密碼與私鑰檔案密碼片語會持久儲存在 Windows 認證管理員中。
+
+這些敏感值不會：
+
+- 寫入主機設定
+- 放入 Tool JSON
+- 作為命令列參數傳遞
+- 傳回給 Codex
+
+FIDO PIN 只用於目前操作，不會儲存。
+
+### SSH Host Key
+
+SSH 主機指紋必須由使用者明確確認。
+
+首次連線到未知主機時，`codex-hosts` 會顯示實際偵測到的主機指紋。
+
+只有使用者確認後才會儲存。
+
+如果伺服器 Host Key 之後發生變更，程式不會自動取代已儲存的指紋，必須再次由使用者明確確認。
+
+### 臨時秘密
+
+`codex-hosts` 也可以暫時保存 API Key、Token 等與主機登入無關的敏感參數。
+
+這些值只保存在目前 `codex-hosts` 處理程序的記憶體中，不會儲存到 Windows 認證管理員，也不會傳回給 Codex。
+
+使用時可以在使用者核准後直接注入指定程式的環境變數。
+
+退出 `codex-hosts`、登出或重新啟動系統後，這些臨時值會失效。
+
+完整說明請見 [`temporary-secrets.md`](../../skill/codex-hosts/references/temporary-secrets.md)。
+
+## FIDO / 安全金鑰
+
+`codex-hosts` 可以使用現有的 OpenSSH ECDSA-SK 與 Ed25519-SK FIDO Handle。
+
+例如：
+
+```text
+id_ecdsa_sk
+id_ed25519_sk
+```
+
+透過應用程式建立或恢復新的 FIDO SSH 憑據時，會使用 ECDSA-SK。
+
+FIDO 模式下：
+
+- 硬體私鑰不會離開安全裝置。
+- FIDO PIN 只用於目前操作，不會儲存。
+- 不需要啟用 SSH Agent。
+- Agent Forwarding 一律停用。
+- 依照安全金鑰設定，驗證過程可能需要 PIN 或 Touch。
+
+FIDO Handle 與 SSH Agent 是兩種不同的驗證方式。
+
+FIDO Handle：
+
+```text
+codex-hosts
+    │
+    ▼
+OpenSSH FIDO Handle
+    │
+    ▼
+安全金鑰
+```
+
+由 `codex-hosts` 直接透過系統元件完成硬體簽署。
+
+SSH Agent：
+
+```text
+codex-hosts
+    │
+    ▼
+OpenSSH Agent / Pageant
+    │
+    ▼
+已載入的身分
+```
+
+驗證工作交給已經執行中的 Agent。
+
+`codex-hosts` 不會為了使用 Agent 模式而自動啟動、啟用或持久化 Agent 服務。
+
+## Jump Host
+
+SSH 主機可以使用其他已儲存並驗證的 SSH 主機作為 Jump Host。
+
+例如：
+
+```text
+Codex
+  │
+  ▼
+jump-1
+  │
+  ▼
+jump-2
+  │
+  ▼
+target
+```
+
+安全規則：
+
+- Jump Host 必須是已驗證的 SSH 主機。
+- 每個 Hop 都需要驗證 Host Key。
+- 不允許 Jump Host 鏈循環。
+- 一條 SSH 鏈最多包含 8 台主機。
+- Agent Forwarding 一律停用。
+
+## Telnet
+
+`codex-hosts` 同樣支援 Telnet。
+
+但 Telnet 本身沒有加密，使用者名稱、密碼、命令和傳回資料都可能以明文形式在網路中傳輸。
+
+因此只應在你明確接受該風險的可信網路中使用 Telnet。
+
+面向網際網路的連線建議使用 SSH。
+
+## 批次執行
+
+### SSH 單主機多命令
+
+`exec_many` 可以重複使用同一條 SSH 連線，同時執行多條獨立短命令：
+
+```json
+{
+  "action": "exec_many",
+  "alias": "example",
+  "commands": [
+    "hostname",
+    "uptime",
+    "df -h"
+  ],
+  "max_concurrency": 8
+}
+```
+
+它只進行一次 SSH 驗證，然後透過同一條連線建立多個 Channel。
+
+對 FIDO / 安全金鑰特別有用，因為一組命令通常可以共用一次身分驗證。
+
+`exec_many` 僅適用於 SSH 主機。
+
+### 多主機批次執行
+
+可以明確指定多台主機：
+
+```json
+{
+  "action": "batch_exec",
+  "aliases": [
+    "web-1",
+    "web-2",
+    "web-3"
+  ],
+  "command": "uptime",
+  "max_concurrency": 8,
+  "batch_timeout_ms": 30000
+}
+```
+
+也可以批次測試連線：
+
+```json
+{
+  "action": "batch_probe",
+  "aliases": [
+    "web-1",
+    "web-2"
+  ],
+  "max_concurrency": 8,
+  "batch_timeout_ms": 30000
+}
+```
+
+批次模式要求明確指定主機清單。
+
+空清單不會被解讀成「全部主機」。
 
 <details>
-<summary>介面</summary>
+<summary>Codex / Tool 介面</summary>
 
-### 從 Codex 或指令碼呼叫
+### GUI 編輯模式
 
-GUI 編輯模式可以預填不敏感的連線資訊：
+可以從 Codex 或指令碼開啟主機編輯器，並預先填入非敏感連線資訊：
 
 ```powershell
 .\bin\codex-hosts.exe --codex-edit `
@@ -72,13 +355,23 @@ GUI 編輯模式可以預填不敏感的連線資訊：
   --result-file result.json
 ```
 
+不要將密碼、私鑰密碼片語或 FIDO PIN 作為參數傳遞。
+
 驗證參數使用固定名稱：
 
-- `password`：密碼登入。
-- `private-key` / `private_key`：金鑰檔案或 FIDO 控制代碼，也接受 `fido-handle`。
-- `ssh-agent` / `ssh_agent`：正在執行的 SSH Agent 或 Pageant。
+- `password`：密碼驗證。
+- `private-key` / `private_key`：一般私鑰檔案或 FIDO Handle，也接受 `fido-handle`。
+- `ssh-agent` / `ssh_agent`：Windows OpenSSH Agent 或 Pageant。
 
-工具模式透過要求檔案和結果檔案運作，兩者都不能包含認證資訊：
+`private-key` 同時用於一般 OpenSSH 私鑰與 FIDO Handle。
+
+`ssh-agent` 只表示 Agent / Pageant 模式，不代表所有硬體金鑰驗證方式。
+
+### Tool 模式
+
+Tool 模式透過 UTF-8 JSON 要求檔案與結果檔案通訊，兩者都不得包含憑據。
+
+常見要求：
 
 ```json
 {"action":"capabilities"}
@@ -92,15 +385,58 @@ GUI 編輯模式可以預填不敏感的連線資訊：
 {"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
 ```
 
-`exec_many` 只登入一次，再透過同一條 SSH 連線同時執行多條短命令；使用硬體金鑰時，一組命令通常只需要驗證一次。`agent_identities` 和 `fido_identities` 只會傳回公開的身分資訊與公開金鑰。執行遠端命令時，請檢查結果中的 `output_truncated`，確認輸出是否因長度限制而被截斷。
+`agent_identities` 和 `fido_identities` 只會傳回公開的身分資訊與公開金鑰。
+
+執行遠端命令時，請檢查結果中的 `output_truncated`，確認輸出是否因長度限制而被截斷。
+
+完整的 Codex 行為、呼叫流程與安全規則請見 [`SKILL.md`](../../skill/codex-hosts/SKILL.md)。
 
 </details>
 
-## 安全界線
+## 執行限制
 
-- 密碼和金鑰檔案密碼片語只會儲存在 Windows 認證管理員中；FIDO PIN 只用於目前操作，不會儲存。
-- SSH 主機指紋必須由使用者明確確認，程式不會自動取代已儲存的指紋。
-- FIDO 直接簽署不會啟動或啟用 Agent 服務；Agent 轉送也一律關閉。
-- 只有已驗證的 SSH 主機才能作為跳板，跳板鏈最多包含八台主機，並會檢查循環。
-- Telnet 會以明文傳輸帳號和資料，只應在明確接受風險的可信網路中使用。
-- 單條命令最多接收 1 MiB 輸出；`exec_many` 或完整批次結果寫成 JSON 後最多為 8 MiB。程式會在接收輸出時直接套用預算，不會先在記憶體中保存多份大型結果。
+為了避免異常命令產生無限輸出或占用過多記憶體，命令執行有明確限制。
+
+- 單條命令最多擷取 **1 MiB** 輸出。
+- 完整 `exec_many` 或批次 JSON 結果最大為 **8 MiB**。
+- `exec_many` 與批次工作使用受限並行。
+- 輸出被截斷時，可透過 `output_truncated` 判斷。
+- 遠端命令不會因網路錯誤而自動重新執行。
+
+不自動重試是因為遠端命令可能不是冪等操作，例如：
+
+```text
+reboot
+rm
+systemctl restart
+資料庫寫入
+部署操作
+```
+
+網路錯誤並不代表再次執行相同命令一定安全。
+
+## 專案結構
+
+```text
+codex-hosts
+├── src\
+├── skill\
+│   └── codex-hosts\
+│       ├── SKILL.md
+│       ├── agents\
+│       └── references\
+├── languages\
+├── docs\
+│   └── readme\
+│       ├── README_zh-CN.md
+│       ├── README_zh-TW.md
+│       └── README_ja.md
+├── Cargo.toml
+├── Cargo.lock
+├── Main.png
+└── README.md
+```
+
+## License
+
+本專案使用 [Apache License 2.0](../../LICENSE)。
