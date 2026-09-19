@@ -9,19 +9,29 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, RichText};
+use eframe::egui;
 use serde::Serialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
+
+mod dialogs;
+mod host_form;
+mod host_list;
+mod status;
+mod theme;
+mod toolbar;
+
+pub(crate) use theme::configure_fonts;
+
+use status::{StatusKind, StatusMessage};
+use theme::apply_style;
 
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
 use crate::i18n::Catalog;
 use crate::import;
-use crate::model::{
-    HostFilter, HostProfile, Prefill, Protocol, SshAuth, can_use_as_jump, normalize_tags,
-};
+use crate::model::{HostFilter, HostProfile, Prefill, Protocol, SshAuth, normalize_tags};
 use crate::ssh::{
     OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE, VerifiedHostKey,
 };
@@ -149,9 +159,6 @@ impl HostEditor {
 const GUI_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const GUI_INTERACTIVE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_TESTS: usize = 8;
-const TEST_SUCCESS_FILL: Color32 = Color32::from_rgb(36, 105, 67);
-const TEST_FAILURE_FILL: Color32 = Color32::from_rgb(132, 48, 53);
-const SELECTED_ROW_STROKE: Color32 = Color32::from_rgb(230, 230, 230);
 
 struct TestOperation {
     receiver: Receiver<(Instant, Result<RemoteResult, RemoteFailure>)>,
@@ -217,7 +224,7 @@ pub struct HostsApp {
     catalog: Catalog,
     selected: Option<Uuid>,
     editor: Option<HostEditor>,
-    status: String,
+    status: StatusMessage,
     test_operations: HashMap<Uuid, TestOperation>,
     pending_tests: VecDeque<Uuid>,
     test_hosts_snapshot: Option<Arc<Vec<HostProfile>>>,
@@ -235,6 +242,9 @@ pub struct HostsApp {
     host_filter: HostFilter,
     batch_delete_prompt: bool,
     batch_export_window_open: bool,
+    sidebar_width: Option<f32>,
+    /// Scroll the host list so the selected row is visible on the next frame.
+    scroll_to_selected: bool,
     launch: LaunchOptions,
     callback_written: bool,
     pending_callback: Option<PendingCallback>,
@@ -246,6 +256,7 @@ impl HostsApp {
         launch: LaunchOptions,
     ) -> std::io::Result<Self> {
         context.egui_ctx.set_zoom_factor(1.06);
+        apply_style(&context.egui_ctx);
 
         let (mut store, mut startup_error) = match HostStore::load_recovering() {
             Ok(store) => (store, None),
@@ -316,11 +327,14 @@ impl HostsApp {
             })
         });
         let status = if let Some(error) = startup_error {
-            catalog.format("storage_error", &[("error", &error)])
+            StatusMessage::new(
+                StatusKind::Error,
+                catalog.format("storage_error", &[("error", &error)]),
+            )
         } else if launch.codex_edit {
-            catalog.text("draft_waiting").to_owned()
+            StatusMessage::info(catalog.text("draft_waiting"))
         } else {
-            catalog.text("status_ready").to_owned()
+            StatusMessage::info(catalog.text("status_ready"))
         };
         let mut temporary = if launch.codex_edit {
             None
@@ -367,6 +381,8 @@ impl HostsApp {
             host_filter: HostFilter::default(),
             batch_delete_prompt: false,
             batch_export_window_open: false,
+            sidebar_width: None,
+            scroll_to_selected: true,
             launch,
             callback_written: false,
             pending_callback: None,
@@ -382,7 +398,7 @@ impl HostsApp {
             .find(|host| host.id == id)
             .cloned()
             .map(HostEditor::load);
-        self.status = self.catalog.text("status_ready").to_owned();
+        self.set_status_key("status_ready");
     }
 
     fn refresh_hosts(&mut self) -> Result<(), String> {
@@ -398,7 +414,7 @@ impl HostsApp {
         self.fingerprint_prompt = None;
         self.delete_prompt = false;
         self.batch_delete_prompt = false;
-        self.status = self.catalog.text("hosts_refreshed").to_owned();
+        self.set_status_key("hosts_refreshed");
         Ok(())
     }
 
@@ -408,13 +424,12 @@ impl HostsApp {
         self.store.hosts.push(profile.clone());
         if let Err(error) = self.store.save() {
             self.store.hosts.retain(|host| host.id != id);
-            self.status = self
-                .catalog
-                .format("storage_error", &[("error", &error.to_string())]);
+            self.set_status_format("storage_error", &[("error", &error.to_string())]);
             return;
         }
         self.selected = Some(id);
         self.editor = Some(HostEditor::load(profile));
+        self.scroll_to_selected = true;
     }
 
     fn persist_editor(&mut self) -> Result<(), String> {
@@ -560,7 +575,7 @@ impl HostsApp {
     fn save(&mut self, context: &egui::Context) {
         match self.persist_editor() {
             Ok(()) => {
-                self.status = self.catalog.text("status_saved").to_owned();
+                self.set_status_key("status_saved");
                 if self.launch.codex_edit {
                     let alias = self
                         .editor
@@ -570,26 +585,25 @@ impl HostsApp {
                     match self.write_callback("saved", Some(&alias)) {
                         Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
                         Err(error) => {
-                            self.status =
-                                self.catalog.format("callback_error", &[("error", &error)])
+                            self.set_status_format("callback_error", &[("error", &error)])
                         }
                     }
                 }
             }
-            Err(error) => self.status = error,
+            Err(error) => self.set_status(StatusKind::Error, error),
         }
     }
 
     fn start_test(&mut self) {
         if let Err(error) = self.persist_editor() {
-            self.status = error;
+            self.set_status(StatusKind::Error, error);
             return;
         }
         let Some(id) = self.editor.as_ref().map(|editor| editor.profile.id) else {
             return;
         };
         self.start_test_host(id);
-        self.status = self.catalog.text("testing").to_owned();
+        self.set_status_key("testing");
     }
 
     fn start_test_host(&mut self, id: Uuid) {
@@ -655,7 +669,7 @@ impl HostsApp {
                 || editor.password_value_missing()
         }) && let Err(error) = self.persist_editor()
         {
-            self.status = error;
+            self.set_status(StatusKind::Error, error);
             return;
         }
         let ids = self
@@ -665,7 +679,7 @@ impl HostsApp {
             .map(|host| host.id)
             .collect::<Vec<_>>();
         if ids.is_empty() {
-            self.status = self.catalog.text("test_all_empty").to_owned();
+            self.set_status_key("test_all_empty");
             return;
         }
         self.test_states.clear();
@@ -675,7 +689,7 @@ impl HostsApp {
         self.test_hosts_snapshot = Some(Arc::new(self.store.hosts.clone()));
         self.testing_all = true;
         self.start_pending_tests();
-        self.status = self.catalog.text("testing_all").to_owned();
+        self.set_status_key("testing_all");
     }
 
     fn poll_tests(&mut self) {
@@ -734,9 +748,7 @@ impl HostsApp {
                         self.store.hosts = snapshot.as_ref().clone();
                     }
                     self.test_store_dirty = false;
-                    self.status = self
-                        .catalog
-                        .format("storage_error", &[("error", &error.to_string())]);
+                    self.set_status_format("storage_error", &[("error", &error.to_string())]);
                     return;
                 }
                 self.test_store_dirty = false;
@@ -757,10 +769,16 @@ impl HostsApp {
                 .filter(|state| **state == HostTestState::Failed)
                 .count()
                 .to_string();
-            self.status = self.catalog.format(
+            let text = self.catalog.format(
                 "status_test_all_done",
                 &[("succeeded", &succeeded), ("failed", &failed)],
             );
+            let kind = if failed == "0" {
+                StatusKind::Success
+            } else {
+                StatusKind::Warning
+            };
+            self.set_status(kind, text);
         }
     }
 
@@ -785,18 +803,14 @@ impl HostsApp {
                     self.test_store_dirty |= metadata_changed;
                 } else if metadata_changed {
                     if let Err(error) = updated_store.save() {
-                        self.status = self
-                            .catalog
-                            .format("storage_error", &[("error", &error.to_string())]);
+                        self.set_status_format("storage_error", &[("error", &error.to_string())]);
                         return;
                     }
                     self.store = updated_store;
                     self.sync_editor_verification_from_store(id);
                 }
                 if !self.testing_all && self.selected == Some(id) {
-                    self.status = self
-                        .catalog
-                        .format("status_test_ok", &[("identity", identity.as_str())]);
+                    self.set_status_format("status_test_ok", &[("identity", identity.as_str())]);
                 }
             }
             Err(error)
@@ -836,12 +850,11 @@ impl HostsApp {
             Err(error) => {
                 self.test_states.insert(id, HostTestState::Failed);
                 if !self.testing_all && self.selected == Some(id) {
-                    self.status = if matches!(error.code, "TEST_TIMEOUT" | TOTAL_TIMEOUT_CODE) {
-                        self.catalog.text("status_test_timeout").to_owned()
+                    if matches!(error.code, "TEST_TIMEOUT" | TOTAL_TIMEOUT_CODE) {
+                        self.set_status_key("status_test_timeout");
                     } else {
-                        self.catalog
-                            .format("status_test_failed", &[("error", error.code)])
-                    };
+                        self.set_status_format("status_test_failed", &[("error", error.code)]);
+                    }
                 }
             }
         }
@@ -876,12 +889,12 @@ impl HostsApp {
             return;
         };
         if !trust {
-            self.status = self.catalog.text("status_cancelled").to_owned();
+            self.set_status_key("status_cancelled");
             if prompt.close_after_choice {
                 match self.write_callback("cancelled", Some(&prompt.alias)) {
                     Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
                     Err(error) => {
-                        self.status = self.catalog.format("callback_error", &[("error", &error)]);
+                        self.set_status_format("callback_error", &[("error", &error)]);
                         self.fingerprint_prompt = Some(prompt);
                     }
                 }
@@ -895,9 +908,7 @@ impl HostsApp {
             .iter_mut()
             .find(|host| host.id == prompt.host_id)
         else {
-            self.status = self
-                .catalog
-                .format("storage_error", &[("error", "HOST_NOT_FOUND")]);
+            self.set_status_format("storage_error", &[("error", "HOST_NOT_FOUND")]);
             return;
         };
         host.host_fingerprint = Some(prompt.observed.clone());
@@ -906,9 +917,7 @@ impl HostsApp {
         host.host_key_last_verified_unix = None;
         host.verified = false;
         if let Err(error) = updated_store.save() {
-            self.status = self
-                .catalog
-                .format("storage_error", &[("error", &error.to_string())]);
+            self.set_status_format("storage_error", &[("error", &error.to_string())]);
             self.fingerprint_prompt = Some(prompt);
             return;
         }
@@ -932,13 +941,13 @@ impl HostsApp {
             match self.write_callback("trusted", Some(&prompt.alias)) {
                 Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
                 Err(error) => {
-                    self.status = self.catalog.format("callback_error", &[("error", &error)]);
+                    self.set_status_format("callback_error", &[("error", &error)]);
                 }
             }
         } else if prompt.retry_test {
             self.start_test_host(prompt.host_id);
             if self.selected == Some(prompt.host_id) {
-                self.status = self.catalog.text("testing").to_owned();
+                self.set_status_key("testing");
             }
         }
     }
@@ -953,15 +962,13 @@ impl HostsApp {
             .iter()
             .any(|host| host.jump_host == Some(id))
         {
-            self.status = self.catalog.text("chain_in_use").to_owned();
+            self.set_status_key("chain_in_use");
             return;
         }
         let credential_snapshot = match credentials::snapshot(id) {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.status = self
-                    .catalog
-                    .format("credential_error", &[("error", &error.to_string())]);
+                self.set_status_format("credential_error", &[("error", &error.to_string())]);
                 return;
             }
         };
@@ -971,9 +978,7 @@ impl HostsApp {
                 error.to_string(),
                 restore_credential_snapshots(&credential_snapshots).err(),
             );
-            self.status = self
-                .catalog
-                .format("credential_error", &[("error", &error)]);
+            self.set_status_format("credential_error", &[("error", &error)]);
             return;
         }
         let original_hosts = self.store.hosts.clone();
@@ -991,7 +996,7 @@ impl HostsApp {
                 error.to_string(),
                 (!rollback_errors.is_empty()).then(|| rollback_errors.join("; ")),
             );
-            self.status = self.catalog.format("storage_error", &[("error", &error)]);
+            self.set_status_format("storage_error", &[("error", &error)]);
             return;
         }
         crate::ssh::invalidate_profile(id);
@@ -1009,7 +1014,7 @@ impl HostsApp {
     fn begin_batch_mode(&mut self) {
         self.batch_mode = true;
         self.batch_selected.clear();
-        self.status = self.catalog.text("batch_select_hint").to_owned();
+        self.set_status_key("batch_select_hint");
     }
 
     fn toggle_batch_selection(&mut self) {
@@ -1025,16 +1030,16 @@ impl HostsApp {
         self.batch_selected.clear();
         self.batch_delete_prompt = false;
         self.batch_export_window_open = false;
-        self.status = self.catalog.text("status_ready").to_owned();
+        self.set_status_key("status_ready");
     }
 
     fn request_batch_delete(&mut self) {
         if self.batch_selected.is_empty() {
-            self.status = self.catalog.text("batch_nothing_selected").to_owned();
+            self.set_status_key("batch_nothing_selected");
             return;
         }
         if batch_has_external_dependents(&self.store.hosts, &self.batch_selected) {
-            self.status = self.catalog.text("chain_in_use").to_owned();
+            self.set_status_key("chain_in_use");
             return;
         }
         self.batch_delete_prompt = true;
@@ -1049,9 +1054,7 @@ impl HostsApp {
         {
             Ok(snapshots) => snapshots,
             Err(error) => {
-                self.status = self
-                    .catalog
-                    .format("credential_error", &[("error", &error.to_string())]);
+                self.set_status_format("credential_error", &[("error", &error.to_string())]);
                 return;
             }
         };
@@ -1061,9 +1064,7 @@ impl HostsApp {
                     error.to_string(),
                     restore_credential_snapshots(&credential_snapshots).err(),
                 );
-                self.status = self
-                    .catalog
-                    .format("credential_error", &[("error", &error)]);
+                self.set_status_format("credential_error", &[("error", &error)]);
                 return;
             }
         }
@@ -1084,7 +1085,7 @@ impl HostsApp {
                 error.to_string(),
                 (!rollback_errors.is_empty()).then(|| rollback_errors.join("; ")),
             );
-            self.status = self.catalog.format("storage_error", &[("error", &error)]);
+            self.set_status_format("storage_error", &[("error", &error)]);
             return;
         }
         for id in &ids {
@@ -1105,7 +1106,7 @@ impl HostsApp {
             self.testing_all = false;
             self.test_hosts_snapshot = None;
         }
-        self.status = self.catalog.text("batch_deleted").to_owned();
+        self.set_status_key("batch_deleted");
     }
 
     fn download_import_template(&mut self) {
@@ -1119,14 +1120,10 @@ impl HostsApp {
         match fs::write(&path, import::template_bytes()) {
             Ok(()) => {
                 let path = path.display().to_string();
-                self.status = self
-                    .catalog
-                    .format("template_saved", &[("path", path.as_str())]);
+                self.set_status_format("template_saved", &[("path", path.as_str())]);
             }
             Err(error) => {
-                self.status = self
-                    .catalog
-                    .format("template_save_failed", &[("error", &error.to_string())]);
+                self.set_status_format("template_save_failed", &[("error", &error.to_string())]);
             }
         }
     }
@@ -1148,9 +1145,7 @@ impl HostsApp {
         let batch = match batch {
             Ok(batch) => batch,
             Err(error) => {
-                self.status = self
-                    .catalog
-                    .format("import_failed", &[("error", error.as_str())]);
+                self.set_status_format("import_failed", &[("error", error.as_str())]);
                 return;
             }
         };
@@ -1164,9 +1159,7 @@ impl HostsApp {
                 && let Err(error) = credentials::store(item.profile.id, kind, secret)
             {
                 rollback_import_credentials(&imported_ids);
-                self.status = self
-                    .catalog
-                    .format("credential_error", &[("error", &error.to_string())]);
+                self.set_status_format("credential_error", &[("error", &error.to_string())]);
                 return;
             }
         }
@@ -1179,17 +1172,16 @@ impl HostsApp {
         if let Err(error) = self.store.save() {
             self.store.hosts.truncate(self.store.hosts.len() - count);
             rollback_import_credentials(&imported_ids);
-            self.status = self
-                .catalog
-                .format("storage_error", &[("error", &error.to_string())]);
+            self.set_status_format("storage_error", &[("error", &error.to_string())]);
             return;
         }
         if let Some(id) = first_id {
             self.select(id);
+            self.scroll_to_selected = true;
         }
         self.import_window_open = false;
         if contains_sensitive_values {
-            self.status = self.catalog.format(
+            self.set_status_format(
                 "import_succeeded_with_credentials",
                 &[("count", &count.to_string())],
             );
@@ -1198,15 +1190,13 @@ impl HostsApp {
                 imported_count: count,
             });
         } else {
-            self.status = self
-                .catalog
-                .format("import_succeeded", &[("count", &count.to_string())]);
+            self.set_status_format("import_succeeded", &[("count", &count.to_string())]);
         }
     }
 
     fn request_batch_export(&mut self) {
         if self.batch_selected.is_empty() {
-            self.status = self.catalog.text("batch_nothing_selected").to_owned();
+            self.set_status_key("batch_nothing_selected");
             return;
         }
         self.batch_export_window_open = true;
@@ -1252,17 +1242,13 @@ impl HostsApp {
         match result {
             Ok(path) => {
                 let path = path.display().to_string();
-                self.status = self
-                    .catalog
-                    .format("batch_export_succeeded", &[("path", path.as_str())]);
+                self.set_status_format("batch_export_succeeded", &[("path", path.as_str())]);
                 self.batch_export_window_open = false;
                 self.batch_mode = false;
                 self.batch_selected.clear();
             }
             Err(error) => {
-                self.status = self
-                    .catalog
-                    .format("batch_export_failed", &[("error", error.as_str())]);
+                self.set_status_format("batch_export_failed", &[("error", error.as_str())]);
             }
         }
     }
@@ -1311,817 +1297,6 @@ impl HostsApp {
         self.callback_written = true;
         self.pending_callback = None;
         Ok(())
-    }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        retain_visible_selection(
-            &self.store.hosts,
-            &self.host_filter,
-            &mut self.batch_selected,
-        );
-        let mut open_import = false;
-        let mut test_all = false;
-        let mut begin_batch = false;
-        let mut toggle_batch_selection = false;
-        let mut delete_batch = false;
-        let mut export_batch = false;
-        let mut cancel_batch = false;
-        ui.allocate_ui_with_layout(
-            egui::vec2(ui.available_width(), 48.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.add_space(18.0);
-                if self.batch_mode {
-                    let visible = self
-                        .store
-                        .hosts
-                        .iter()
-                        .filter(|host| self.host_filter.matches(host))
-                        .collect::<Vec<_>>();
-                    let all_selected = !visible.is_empty()
-                        && visible
-                            .iter()
-                            .all(|host| self.batch_selected.contains(&host.id));
-                    if ui
-                        .add_enabled(
-                            !visible.is_empty(),
-                            egui::Button::new(self.catalog.text(if all_selected {
-                                "deselect_all"
-                            } else {
-                                "select_all"
-                            }))
-                            .min_size([92.0, 34.0].into()),
-                        )
-                        .clicked()
-                    {
-                        toggle_batch_selection = true;
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(self.catalog.text("delete"))
-                                .min_size([92.0, 34.0].into()),
-                        )
-                        .clicked()
-                    {
-                        delete_batch = true;
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(self.catalog.text("export"))
-                                .min_size([92.0, 34.0].into()),
-                        )
-                        .clicked()
-                    {
-                        export_batch = true;
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(self.catalog.text("cancel"))
-                                .min_size([92.0, 34.0].into()),
-                        )
-                        .clicked()
-                    {
-                        cancel_batch = true;
-                    }
-                } else if !self.launch.codex_edit {
-                    if ui
-                        .add(
-                            egui::Button::new(self.catalog.text("import_hosts"))
-                                .min_size([112.0, 34.0].into()),
-                        )
-                        .clicked()
-                    {
-                        open_import = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.tests_idle(),
-                            egui::Button::new(self.catalog.text("test_all"))
-                                .min_size([112.0, 34.0].into()),
-                        )
-                        .clicked()
-                    {
-                        test_all = true;
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(self.catalog.text("batch_manage"))
-                                .min_size([112.0, 34.0].into()),
-                        )
-                        .clicked()
-                    {
-                        begin_batch = true;
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(18.0);
-                    let current = self.catalog.locale().to_owned();
-                    let selected_name = Catalog::available()
-                        .iter()
-                        .find(|language| language.locale == current)
-                        .map(|language| language.display_name)
-                        .unwrap_or(current.as_str());
-                    egui::ComboBox::from_id_salt("language_selector")
-                        .selected_text(selected_name)
-                        .width(130.0)
-                        .show_ui(ui, |ui| {
-                            for language in Catalog::available() {
-                                if ui
-                                    .selectable_label(
-                                        language.locale == current,
-                                        language.display_name,
-                                    )
-                                    .clicked()
-                                {
-                                    self.catalog = Catalog::for_locale(Some(language.locale));
-                                    configure_fonts(context, language.locale);
-                                    self.store.preferred_locale = Some(language.locale.to_owned());
-                                    context.send_viewport_cmd(egui::ViewportCommand::Title(
-                                        self.catalog.text("app_title").to_owned(),
-                                    ));
-                                    self.status = match self.store.save() {
-                                        Ok(()) => self.catalog.text("status_ready").to_owned(),
-                                        Err(error) => self.catalog.format(
-                                            "storage_error",
-                                            &[("error", &error.to_string())],
-                                        ),
-                                    };
-                                }
-                            }
-                        });
-                    ui.label(self.catalog.text("language"));
-                    if !self.launch.codex_edit
-                        && !self.tray_available
-                        && ui.button(self.catalog.text("tray_exit")).clicked()
-                    {
-                        self.exiting = true;
-                        context.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    if self.temporary.is_some()
-                        && ui
-                            .add(
-                                egui::Button::new(self.catalog.text("temp_title"))
-                                    .min_size([112.0, 34.0].into()),
-                            )
-                            .clicked()
-                        && let Some(temporary) = &mut self.temporary
-                    {
-                        temporary.visible = true;
-                    }
-                });
-            },
-        );
-        if open_import {
-            self.import_window_open = true;
-        }
-        if test_all {
-            self.start_all_tests();
-        }
-        if begin_batch {
-            self.begin_batch_mode();
-        }
-        if toggle_batch_selection {
-            self.toggle_batch_selection();
-        }
-        if delete_batch {
-            self.request_batch_delete();
-        }
-        if export_batch {
-            self.request_batch_export();
-        }
-        if cancel_batch {
-            self.cancel_batch_mode();
-        }
-    }
-
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
-        let sidebar_width = ui.available_width();
-        ui.set_width(sidebar_width);
-        ui.add_space(20.0);
-        ui.horizontal(|ui| {
-            ui.add_space(16.0);
-            ui.vertical(|ui| {
-                ui.set_width((sidebar_width - 32.0).max(0.0));
-                ui.heading(self.catalog.text("nav_title"));
-                ui.add_space(4.0);
-                ui.label(
-                    RichText::new(self.catalog.text("nav_subtitle"))
-                        .color(ui.visuals().weak_text_color()),
-                );
-                ui.add_space(16.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 38.0],
-                        egui::Button::new(format!("＋ {}", self.catalog.text("new_host"))),
-                    )
-                    .clicked()
-                {
-                    self.new_host();
-                }
-            });
-        });
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        ui.add(
-            egui::TextEdit::singleline(&mut self.host_filter.search)
-                .hint_text(self.catalog.text("search_hosts"))
-                .desired_width(f32::INFINITY),
-        );
-        let mut available_tags = normalize_tags(
-            self.store
-                .hosts
-                .iter()
-                .flat_map(|host| host.tags.iter())
-                .chain(self.host_filter.tags.iter()),
-        );
-        available_tags.sort_by_key(|tag| tag.to_lowercase());
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("host_tag_filter")
-                .selected_text(format!(
-                    "{} ({})",
-                    self.catalog.text("filter_tags"),
-                    self.host_filter.tags.len()
-                ))
-                .show_ui(ui, |ui| {
-                    for tag in &available_tags {
-                        let mut checked = self
-                            .host_filter
-                            .tags
-                            .iter()
-                            .any(|selected| selected.to_lowercase() == tag.to_lowercase());
-                        if ui.checkbox(&mut checked, tag).changed() {
-                            if checked {
-                                self.host_filter.tags.push(tag.clone());
-                            } else {
-                                self.host_filter.tags.retain(|selected| {
-                                    selected.to_lowercase() != tag.to_lowercase()
-                                });
-                            }
-                        }
-                    }
-                });
-            if ui
-                .small_button(self.catalog.text("clear_filters"))
-                .clicked()
-            {
-                self.host_filter = HostFilter::default();
-            }
-        });
-        retain_visible_selection(
-            &self.store.hosts,
-            &self.host_filter,
-            &mut self.batch_selected,
-        );
-        ui.add_space(8.0);
-        let hosts = self
-            .store
-            .hosts
-            .iter()
-            .filter(|host| self.host_filter.matches(host))
-            .collect::<Vec<_>>();
-        if hosts.is_empty() {
-            ui.label(self.catalog.text("no_matching_hosts"));
-        }
-        let selected_id = self.selected;
-        let batch_mode = self.batch_mode;
-        let batch_selected = &self.batch_selected;
-        let test_states = &self.test_states;
-        let delete_label = self.catalog.text("delete").to_owned();
-        let mut selection_request = None;
-        let mut deletion_request = None;
-        let mut batch_toggle_request = None;
-        ui.spacing_mut().item_spacing.y = 4.0;
-        egui::ScrollArea::vertical()
-            .id_salt("host_list_scroll")
-            .auto_shrink([false, false])
-            .show_rows(ui, 82.0, hosts.len(), |ui, row_range| {
-                ui.set_width(ui.available_width());
-                for row in row_range {
-                    let host = &hosts[row];
-                    let id = host.id;
-                    let test_state = test_states.get(&id).copied();
-                    let selected = selected_id == Some(id);
-                    let response = ui
-                        .horizontal(|ui| {
-                            if batch_mode {
-                                let mut checked = batch_selected.contains(&id);
-                                if ui.checkbox(&mut checked, "").changed() {
-                                    batch_toggle_request = Some((id, checked));
-                                }
-                            }
-                            let verified_marker = if test_state == Some(HostTestState::Succeeded)
-                                || (test_state.is_none() && host.verified)
-                            {
-                                "  ✓"
-                            } else if test_state == Some(HostTestState::Testing) {
-                                "  …"
-                            } else {
-                                ""
-                            };
-                            let text = RichText::new(format!(
-                                "{}\n{} · {}:{}{}\n{}",
-                                host.alias,
-                                host.protocol.stable_name().to_ascii_uppercase(),
-                                host.address,
-                                host.port,
-                                verified_marker,
-                                host.tags.join(" · ")
-                            ))
-                            .line_height(Some(20.0));
-                            // Preserve the explicit alias/details/tags rows. Button::truncate()
-                            // limits the whole galley to one row in egui 0.35.
-                            let mut button = egui::Button::new(()).left_text(text);
-                            if let Some(fill) = host_row_fill(test_state) {
-                                button = button.fill(fill);
-                            }
-                            if selected {
-                                button = button.stroke(egui::Stroke::new(2.0, SELECTED_ROW_STROKE));
-                            }
-                            let size = [ui.available_width(), 82.0];
-                            ui.scope(|ui| {
-                                ui.spacing_mut().button_padding.x = 12.0;
-                                ui.add_sized(size, button)
-                            })
-                            .inner
-                        })
-                        .inner;
-                    let response = response.on_hover_text(format!(
-                        "{}\n{}",
-                        host.description,
-                        host.tags.join(", ")
-                    ));
-                    if response.clicked() || response.secondary_clicked() {
-                        if batch_mode {
-                            batch_toggle_request = Some((id, !batch_selected.contains(&id)));
-                        } else {
-                            selection_request = Some(id);
-                        }
-                    }
-                    if !batch_mode {
-                        response.context_menu(|ui| {
-                            if ui.button(&delete_label).clicked() {
-                                deletion_request = Some(id);
-                                ui.close();
-                            }
-                        });
-                    }
-                }
-            });
-
-        if let Some((id, checked)) = batch_toggle_request {
-            if checked {
-                self.batch_selected.insert(id);
-            } else {
-                self.batch_selected.remove(&id);
-            }
-        } else if let Some(id) = deletion_request {
-            self.select(id);
-            self.delete_prompt = true;
-        } else if let Some(id) = selection_request {
-            self.select(id);
-        }
-    }
-
-    fn editor_panel(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        let catalog = self.catalog.clone();
-        let hosts = self.store.hosts.clone();
-        let testing = self.testing_all
-            || self.selected.is_some_and(|id| {
-                self.test_operations.contains_key(&id) || self.pending_tests.contains(&id)
-            });
-        let codex_edit = self.launch.codex_edit;
-        let mut action = None;
-        let editor_scroll = egui::ScrollArea::vertical().id_salt("host_editor_scroll");
-        editor_scroll.show(ui, |ui| {
-            ui.set_max_width(760.0);
-            ui.add_space(24.0);
-            let Some(editor) = self.editor.as_mut() else {
-                ui.heading(catalog.text("editor_new_title"));
-                return;
-            };
-            ui.heading(if editor.original.alias.is_empty() {
-                catalog.text("editor_new_title")
-            } else {
-                catalog.text("editor_edit_title")
-            });
-            ui.add_space(4.0);
-            ui.label(
-                RichText::new(catalog.text("editor_subtitle"))
-                    .color(ui.visuals().weak_text_color()),
-            );
-            if codex_edit {
-                ui.add_space(12.0);
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(RichText::new(catalog.text("codex_draft")).strong());
-                    ui.label(catalog.text("secret_not_exported"));
-                });
-            }
-            ui.add_space(18.0);
-            egui::Frame::group(ui.style())
-                .inner_margin(egui::Margin::same(18))
-                .show(ui, |ui| {
-                    egui::Grid::new("host_form")
-                        .num_columns(2)
-                        .min_col_width(160.0)
-                        .spacing([24.0, 14.0])
-                        .show(ui, |ui| {
-                            form_label(ui, catalog.text("alias"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut editor.profile.alias)
-                                    .desired_width(420.0),
-                            );
-                            ui.end_row();
-
-                            form_label(ui, catalog.text("description"));
-                            ui.add(
-                                egui::TextEdit::multiline(&mut editor.profile.description)
-                                    .desired_width(420.0)
-                                    .desired_rows(3),
-                            );
-                            ui.end_row();
-
-                            form_label(ui, catalog.text("tags"));
-                            ui.vertical(|ui| {
-                                ui.set_max_width(420.0);
-                                let mut remove = None;
-                                ui.horizontal_wrapped(|ui| {
-                                    for (index, tag) in editor.profile.tags.iter().enumerate() {
-                                        if ui
-                                            .add(
-                                                egui::Button::new(format!("{tag} ×"))
-                                                    .small()
-                                                    .truncate(),
-                                            )
-                                            .clicked()
-                                        {
-                                            remove = Some(index);
-                                        }
-                                    }
-                                });
-                                if let Some(index) = remove {
-                                    editor.profile.tags.remove(index);
-                                }
-                                ui.horizontal(|ui| {
-                                    let input = ui.add(
-                                        egui::TextEdit::singleline(&mut editor.tag_input)
-                                            .hint_text(catalog.text("tag_hint"))
-                                            .desired_width(260.0),
-                                    );
-                                    let enter = input.lost_focus()
-                                        && ui.input(|state| state.key_pressed(egui::Key::Enter));
-                                    if ui.button(catalog.text("add_tag")).clicked() || enter {
-                                        editor
-                                            .profile
-                                            .tags
-                                            .push(std::mem::take(&mut editor.tag_input));
-                                        editor.profile.tags = normalize_tags(&editor.profile.tags);
-                                    }
-                                });
-                            });
-                            ui.end_row();
-
-                            form_label(ui, catalog.text("address"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut editor.profile.address)
-                                    .desired_width(420.0),
-                            );
-                            ui.end_row();
-
-                            form_label(ui, catalog.text("port"));
-                            ui.add(egui::DragValue::new(&mut editor.profile.port).range(1..=65535));
-                            ui.end_row();
-
-                            form_label(ui, catalog.text("username"));
-                            ui.add(
-                                egui::TextEdit::singleline(&mut editor.profile.username)
-                                    .desired_width(420.0),
-                            );
-                            ui.end_row();
-
-                            form_label(ui, catalog.text("protocol"));
-                            let previous_protocol = editor.profile.protocol;
-                            ui.horizontal(|ui| {
-                                ui.selectable_value(
-                                    &mut editor.profile.protocol,
-                                    Protocol::Ssh,
-                                    catalog.text("ssh"),
-                                );
-                                ui.selectable_value(
-                                    &mut editor.profile.protocol,
-                                    Protocol::Telnet,
-                                    catalog.text("telnet"),
-                                );
-                            });
-                            if previous_protocol != editor.profile.protocol {
-                                if editor.profile.port == previous_protocol.default_port() {
-                                    editor.profile.port = editor.profile.protocol.default_port();
-                                }
-                                if editor.profile.protocol == Protocol::Telnet {
-                                    editor.profile.jump_host = None;
-                                }
-                            }
-                            ui.end_row();
-
-                            if editor.profile.protocol == Protocol::Ssh {
-                                form_label(ui, catalog.text("auth_method"));
-                                egui::ComboBox::from_id_salt("ssh_auth")
-                                    .selected_text(match editor.profile.ssh_auth {
-                                        SshAuth::Password => catalog.text("password_auth"),
-                                        SshAuth::PrivateKey => catalog.text("private_key_auth"),
-                                        SshAuth::SshAgent => catalog.text("ssh_agent_auth"),
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut editor.profile.ssh_auth,
-                                            SshAuth::Password,
-                                            catalog.text("password_auth"),
-                                        );
-                                        ui.selectable_value(
-                                            &mut editor.profile.ssh_auth,
-                                            SshAuth::PrivateKey,
-                                            catalog.text("private_key_auth"),
-                                        );
-                                        ui.selectable_value(
-                                            &mut editor.profile.ssh_auth,
-                                            SshAuth::SshAgent,
-                                            catalog.text("ssh_agent_auth"),
-                                        );
-                                    });
-                                ui.end_row();
-                            }
-
-                            if editor.profile.protocol == Protocol::Telnet
-                                || editor.profile.ssh_auth == SshAuth::Password
-                            {
-                                form_label_with_hint(ui, catalog.text("password_mode"));
-                                ui.horizontal(|ui| {
-                                    ui.radio_value(
-                                        &mut editor.password_mode,
-                                        PasswordMode::Password,
-                                        catalog.text("password"),
-                                    );
-                                    ui.radio_value(
-                                        &mut editor.password_mode,
-                                        PasswordMode::NoPassword,
-                                        catalog.text("no_password"),
-                                    );
-                                });
-                                ui.end_row();
-
-                                form_label_with_hint(ui, catalog.text("password"));
-                                ui.vertical(|ui| {
-                                    ui.add_enabled(
-                                        editor.password_mode == PasswordMode::Password,
-                                        egui::TextEdit::singleline(&mut *editor.password)
-                                            .password(true)
-                                            .desired_width(420.0),
-                                    );
-                                    let password_hint =
-                                        if editor.password_mode == PasswordMode::NoPassword {
-                                            catalog.text("no_password_hint").to_owned()
-                                        } else if let Some(error) =
-                                            editor.password_read_error.as_deref()
-                                        {
-                                            catalog.format("credential_error", &[("error", error)])
-                                        } else if editor.saved_password_mode
-                                            == Some(PasswordMode::Password)
-                                        {
-                                            catalog.text("password_saved").to_owned()
-                                        } else {
-                                            catalog.text("password_required").to_owned()
-                                        };
-                                    ui.small(password_hint);
-                                });
-                                ui.end_row();
-                            } else if editor.profile.ssh_auth == SshAuth::PrivateKey {
-                                form_label_with_hint(ui, catalog.text("private_key"));
-                                ui.vertical(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(
-                                            &mut editor.profile.private_key_path,
-                                        )
-                                        .desired_width(420.0),
-                                    );
-                                    ui.small(catalog.text("private_key_hint"));
-                                    ui.horizontal_wrapped(|ui| {
-                                        if ui.button(catalog.text("browse_private_key")).clicked() {
-                                            action = Some(EditorAction::BrowsePrivateKey);
-                                        }
-                                        if ui.button(catalog.text("find_fido_key")).clicked() {
-                                            action = Some(EditorAction::DiscoverFido);
-                                        }
-                                        if ui.button(catalog.text("setup_fido_key")).clicked() {
-                                            action = Some(EditorAction::OpenFidoSetup);
-                                        }
-                                    });
-                                    ui.small(catalog.text("fido_direct_hint"));
-                                });
-                                ui.end_row();
-
-                                form_label_with_hint(ui, catalog.text("key_passphrase"));
-                                ui.vertical(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut *editor.key_passphrase)
-                                            .password(true)
-                                            .desired_width(420.0),
-                                    );
-                                    let passphrase_hint = if let Some(error) =
-                                        editor.key_passphrase_read_error.as_deref()
-                                    {
-                                        catalog.format("credential_error", &[("error", error)])
-                                    } else if editor.has_key_passphrase {
-                                        catalog.text("passphrase_saved").to_owned()
-                                    } else {
-                                        catalog.text("passphrase_optional").to_owned()
-                                    };
-                                    ui.small(passphrase_hint);
-                                });
-                                ui.end_row();
-                            } else {
-                                form_label_with_hint(ui, catalog.text("agent_key_fingerprint"));
-                                ui.vertical(|ui| {
-                                    ui.add(
-                                        egui::TextEdit::singleline(
-                                            &mut editor.profile.agent_key_fingerprint,
-                                        )
-                                        .desired_width(420.0),
-                                    );
-                                    ui.small(catalog.text("agent_key_hint"));
-                                });
-                                ui.end_row();
-                            }
-
-                            if editor.profile.protocol == Protocol::Ssh {
-                                form_label_with_hint(ui, catalog.text("host_chain"));
-                                ui.vertical(|ui| {
-                                    let selected_name = editor
-                                        .profile
-                                        .jump_host
-                                        .and_then(|id| hosts.iter().find(|host| host.id == id))
-                                        .map(|host| host.alias.as_str())
-                                        .unwrap_or(catalog.text("direct_connection"));
-                                    egui::ComboBox::from_id_salt("jump_host")
-                                        .selected_text(selected_name)
-                                        .width(300.0)
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut editor.profile.jump_host,
-                                                None,
-                                                catalog.text("direct_connection"),
-                                            );
-                                            let mut count = 0;
-                                            for candidate in &hosts {
-                                                if can_use_as_jump(
-                                                    candidate,
-                                                    &editor.profile,
-                                                    &hosts,
-                                                ) {
-                                                    count += 1;
-                                                    ui.selectable_value(
-                                                        &mut editor.profile.jump_host,
-                                                        Some(candidate.id),
-                                                        &candidate.alias,
-                                                    );
-                                                }
-                                            }
-                                            if count == 0 {
-                                                ui.add_enabled(
-                                                    false,
-                                                    egui::Label::new(
-                                                        catalog.text("no_verified_hosts"),
-                                                    ),
-                                                );
-                                            }
-                                        });
-                                    ui.small(catalog.text("chain_hint"));
-                                });
-                                ui.end_row();
-
-                                form_label(ui, catalog.text("host_key"));
-                                ui.vertical(|ui| {
-                                    ui.label(
-                                        editor
-                                            .profile
-                                            .host_fingerprint
-                                            .as_deref()
-                                            .unwrap_or(catalog.text("host_key_unverified")),
-                                    );
-                                    if let Some(algorithm) = &editor.profile.host_key_algorithm {
-                                        ui.small(format!(
-                                            "{}: {algorithm}",
-                                            catalog.text("host_key_algorithm")
-                                        ));
-                                    }
-                                });
-                                ui.end_row();
-                            }
-                        });
-                });
-
-            if editor.profile.protocol == Protocol::Telnet {
-                ui.add_space(12.0);
-                ui.colored_label(
-                    Color32::from_rgb(210, 145, 40),
-                    catalog.text("telnet_warning"),
-                );
-            }
-            if editor.connection_changed() {
-                ui.add_space(10.0);
-                ui.label(
-                    RichText::new(catalog.text("unsaved_changes"))
-                        .color(ui.visuals().warn_fg_color),
-                );
-            }
-            ui.add_space(18.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(
-                        !testing,
-                        egui::Button::new(if testing {
-                            catalog.text("testing")
-                        } else {
-                            catalog.text("test_connection")
-                        })
-                        .min_size([140.0, 38.0].into()),
-                    )
-                    .clicked()
-                {
-                    action = Some(EditorAction::Test);
-                }
-                if ui
-                    .add_enabled(
-                        !testing,
-                        egui::Button::new(catalog.text("save")).min_size([100.0, 38.0].into()),
-                    )
-                    .clicked()
-                {
-                    action = Some(EditorAction::Save);
-                }
-                if codex_edit
-                    && ui
-                        .add(
-                            egui::Button::new(catalog.text("cancel"))
-                                .min_size([100.0, 38.0].into()),
-                        )
-                        .clicked()
-                {
-                    action = Some(EditorAction::CancelCodex);
-                }
-            });
-            ui.add_space(18.0);
-            ui.separator();
-            ui.add_space(12.0);
-            ui.label(&self.status);
-            ui.add_space(28.0);
-        });
-
-        match action {
-            Some(EditorAction::Save) => self.save(context),
-            Some(EditorAction::Test) => self.start_test(),
-            Some(EditorAction::CancelCodex) => {
-                let alias = self
-                    .editor
-                    .as_ref()
-                    .map(|editor| editor.profile.alias.clone());
-                match self.write_callback("cancelled", alias.as_deref()) {
-                    Ok(()) => context.send_viewport_cmd(egui::ViewportCommand::Close),
-                    Err(error) => {
-                        self.status = self.catalog.format("callback_error", &[("error", &error)])
-                    }
-                }
-            }
-            Some(EditorAction::BrowsePrivateKey) => {
-                if let Some(path) = rfd::FileDialog::new().pick_file()
-                    && let Some(editor) = &mut self.editor
-                {
-                    editor.profile.private_key_path = path.display().to_string();
-                }
-            }
-            Some(EditorAction::DiscoverFido) => {
-                if let Some(identity) = fido::discover_handles().into_iter().next() {
-                    if let Some(editor) = &mut self.editor {
-                        editor.profile.private_key_path = identity.path.display().to_string();
-                    }
-                    self.status = self.catalog.format(
-                        "fido_found",
-                        &[("fingerprint", identity.fingerprint.as_str())],
-                    );
-                } else {
-                    self.status = self.catalog.text("fido_not_found").to_owned();
-                }
-            }
-            Some(EditorAction::OpenFidoSetup) => {
-                self.fido_setup_prompt = Some(FidoSetupPrompt {
-                    pin: Zeroizing::new(String::new()),
-                    operation: None,
-                    status: None,
-                    identity: None,
-                });
-            }
-            None => {}
-        }
     }
 
     fn start_fido_setup_operation(&mut self, action: FidoSetupAction) {
@@ -2214,426 +1389,15 @@ impl HostsApp {
             }
         });
     }
-
-    fn fido_setup_modal(&mut self, context: &egui::Context) {
-        let Some(mut prompt) = self.fido_setup_prompt.take() else {
-            return;
-        };
-        if let Some(operation) = &prompt.operation {
-            match operation.try_recv() {
-                Ok(Ok(identities)) => {
-                    if let Some(identity) = identities.into_iter().next() {
-                        if let Some(editor) = &mut self.editor {
-                            editor.profile.private_key_path = identity.path.display().to_string();
-                        }
-                        prompt.status = Some(self.catalog.format(
-                            "fido_setup_succeeded",
-                            &[("fingerprint", identity.fingerprint.as_str())],
-                        ));
-                        prompt.identity = Some(identity);
-                    }
-                    prompt.operation = None;
-                }
-                Ok(Err(error)) => {
-                    prompt.status = Some(
-                        self.catalog
-                            .format("fido_setup_failed", &[("error", error.as_str())]),
-                    );
-                    prompt.operation = None;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    prompt.status = Some(self.catalog.text("fido_setup_disconnected").to_owned());
-                    prompt.operation = None;
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        let busy = prompt.operation.is_some();
-        let choice = egui::Modal::new(egui::Id::new("fido_setup"))
-            .show(context, |ui| {
-                ui.set_max_width(620.0);
-                ui.heading(self.catalog.text("fido_setup_title"));
-                ui.add_space(8.0);
-                ui.label(self.catalog.text("fido_setup_hint"));
-                ui.add_space(12.0);
-                ui.label(RichText::new(self.catalog.text("fido_pin")).strong());
-                ui.add(
-                    egui::TextEdit::singleline(&mut *prompt.pin)
-                        .password(true)
-                        .desired_width(320.0),
-                );
-                ui.small(self.catalog.text("fido_pin_hint"));
-                ui.add_space(14.0);
-                let mut action = None;
-                ui.add_enabled_ui(!busy, |ui| {
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 40.0],
-                            egui::Button::new(self.catalog.text("fido_create_recommended")),
-                        )
-                        .clicked()
-                    {
-                        action = Some(FidoSetupAction::CreateRecommended);
-                    }
-                    ui.small(self.catalog.text("fido_create_recommended_hint"));
-                    ui.add_space(8.0);
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 40.0],
-                            egui::Button::new(self.catalog.text("fido_recover")),
-                        )
-                        .clicked()
-                    {
-                        action = Some(FidoSetupAction::RecoverResident);
-                    }
-                    ui.small(self.catalog.text("fido_recover_hint"));
-                    ui.add_space(8.0);
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 40.0],
-                            egui::Button::new(self.catalog.text("fido_create_compatible")),
-                        )
-                        .clicked()
-                    {
-                        action = Some(FidoSetupAction::CreateCompatible);
-                    }
-                    ui.small(self.catalog.text("fido_create_compatible_hint"));
-                });
-                if busy {
-                    ui.add_space(12.0);
-                    ui.spinner();
-                }
-                if let Some(status) = &prompt.status {
-                    ui.add_space(12.0);
-                    ui.label(status);
-                }
-                if let Some(identity) = &prompt.identity {
-                    ui.add_space(10.0);
-                    ui.monospace(&identity.public_key);
-                    if ui.button(self.catalog.text("copy_public_key")).clicked() {
-                        ui.ctx().copy_text(identity.public_key.clone());
-                    }
-                }
-                ui.add_space(16.0);
-                if ui
-                    .add_enabled(!busy, egui::Button::new(self.catalog.text("close")))
-                    .clicked()
-                {
-                    return (None, true);
-                }
-                (action, false)
-            })
-            .inner;
-        self.fido_setup_prompt = Some(prompt);
-        if choice.1 {
-            self.fido_setup_prompt = None;
-        } else if let Some(action) = choice.0 {
-            self.start_fido_setup_operation(action);
-        }
-    }
-
-    fn fingerprint_modal(&mut self, context: &egui::Context) {
-        let Some(prompt) = self.fingerprint_prompt.clone() else {
-            return;
-        };
-        let changed = prompt.expected.is_some();
-        let choice = egui::Modal::new(egui::Id::new("fingerprint_confirmation"))
-            .show(context, |ui| {
-                ui.set_max_width(560.0);
-                ui.heading(self.catalog.text(if changed {
-                    "fingerprint_changed_title"
-                } else {
-                    "fingerprint_new_title"
-                }));
-                ui.add_space(10.0);
-                ui.label(self.catalog.format(
-                    if changed {
-                        "fingerprint_changed_message"
-                    } else {
-                        "fingerprint_new_message"
-                    },
-                    &[("alias", &prompt.alias)],
-                ));
-                ui.add_space(14.0);
-                if let Some(expected) = &prompt.expected {
-                    ui.label(RichText::new(self.catalog.text("fingerprint_previous")).strong());
-                    ui.monospace(expected);
-                    if let Some(algorithm) = &prompt.expected_algorithm {
-                        ui.small(format!(
-                            "{}: {algorithm}",
-                            self.catalog.text("host_key_algorithm")
-                        ));
-                    }
-                    ui.add_space(10.0);
-                }
-                ui.label(RichText::new(self.catalog.text("fingerprint_detected")).strong());
-                ui.monospace(&prompt.observed);
-                if let Some(algorithm) = &prompt.observed_algorithm {
-                    ui.small(format!(
-                        "{}: {algorithm}",
-                        self.catalog.text("host_key_algorithm")
-                    ));
-                }
-                ui.add_space(18.0);
-                let mut result = None;
-                ui.horizontal(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(self.catalog.text("trust_and_retry"))
-                                .min_size([140.0, 38.0].into()),
-                        )
-                        .clicked()
-                    {
-                        result = Some(true);
-                    }
-                    if ui
-                        .add(
-                            egui::Button::new(self.catalog.text("reject"))
-                                .min_size([100.0, 38.0].into()),
-                        )
-                        .clicked()
-                    {
-                        result = Some(false);
-                    }
-                });
-                result
-            })
-            .inner;
-        if let Some(trust) = choice {
-            self.apply_fingerprint_choice(trust, context);
-        }
-    }
-
-    fn import_window(&mut self, context: &egui::Context) {
-        if !self.import_window_open {
-            return;
-        }
-        enum ImportAction {
-            Download,
-            Import,
-        }
-        let mut open = self.import_window_open;
-        let mut action = None;
-        egui::Window::new(self.catalog.text("import_title"))
-            .id(egui::Id::new("import_hosts_window"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(context, |ui| {
-                ui.set_min_width(380.0);
-                ui.label(self.catalog.text("import_hint"));
-                ui.add_space(12.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 40.0],
-                        egui::Button::new(self.catalog.text("download_template")),
-                    )
-                    .clicked()
-                {
-                    action = Some(ImportAction::Download);
-                }
-                ui.add_space(8.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 40.0],
-                        egui::Button::new(self.catalog.text("import_template")),
-                    )
-                    .clicked()
-                {
-                    action = Some(ImportAction::Import);
-                }
-            });
-        self.import_window_open = open;
-        match action {
-            Some(ImportAction::Download) => self.download_import_template(),
-            Some(ImportAction::Import) => self.import_hosts_from_template(),
-            None => {}
-        }
-    }
-
-    fn import_cleanup_modal(&mut self, context: &egui::Context) {
-        let Some(prompt) = self.import_cleanup_prompt.as_ref() else {
-            return;
-        };
-        let path = prompt.path.display().to_string();
-        let choice = egui::Modal::new(egui::Id::new("import_cleanup_confirmation"))
-            .show(context, |ui| {
-                ui.set_max_width(480.0);
-                ui.heading(self.catalog.text("import_cleanup_title"));
-                ui.add_space(8.0);
-                ui.label(
-                    self.catalog
-                        .format("import_cleanup_message", &[("path", path.as_str())]),
-                );
-                ui.add_space(16.0);
-                let mut result = None;
-                ui.horizontal(|ui| {
-                    if ui.button(self.catalog.text("delete_import_file")).clicked() {
-                        result = Some(true);
-                    }
-                    if ui.button(self.catalog.text("keep_import_file")).clicked() {
-                        result = Some(false);
-                    }
-                });
-                result
-            })
-            .inner;
-        if let Some(delete_file) = choice {
-            let prompt = self.import_cleanup_prompt.take().unwrap();
-            let path_text = prompt.path.display().to_string();
-            if delete_file {
-                match fs::remove_file(&prompt.path) {
-                    Ok(()) => {
-                        self.status = self.catalog.format(
-                            "import_file_deleted",
-                            &[
-                                ("count", &prompt.imported_count.to_string()),
-                                ("path", path_text.as_str()),
-                            ],
-                        );
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        self.status = self.catalog.format(
-                            "import_file_deleted",
-                            &[
-                                ("count", &prompt.imported_count.to_string()),
-                                ("path", path_text.as_str()),
-                            ],
-                        );
-                    }
-                    Err(error) => {
-                        self.status = self.catalog.format(
-                            "import_file_delete_failed",
-                            &[("error", &error.to_string()), ("path", path_text.as_str())],
-                        );
-                    }
-                }
-            } else {
-                self.status = self
-                    .catalog
-                    .format("import_file_kept_warning", &[("path", path_text.as_str())]);
-            }
-        }
-    }
-
-    fn batch_export_window(&mut self, context: &egui::Context) {
-        if !self.batch_export_window_open {
-            return;
-        }
-        enum ExportAction {
-            Directory,
-            File,
-        }
-        let mut open = self.batch_export_window_open;
-        let mut action = None;
-        egui::Window::new(self.catalog.text("batch_export_title"))
-            .id(egui::Id::new("batch_export_window"))
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(false)
-            .show(context, |ui| {
-                ui.set_min_width(420.0);
-                ui.label(self.catalog.text("batch_export_hint"));
-                ui.add_space(12.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 40.0],
-                        egui::Button::new(self.catalog.text("export_to_directory")),
-                    )
-                    .clicked()
-                {
-                    action = Some(ExportAction::Directory);
-                }
-                ui.add_space(8.0);
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 40.0],
-                        egui::Button::new(self.catalog.text("export_to_file")),
-                    )
-                    .clicked()
-                {
-                    action = Some(ExportAction::File);
-                }
-            });
-        self.batch_export_window_open = open;
-        match action {
-            Some(ExportAction::Directory) => self.export_batch_to_directory(),
-            Some(ExportAction::File) => self.export_batch_to_file(),
-            None => {}
-        }
-    }
-
-    fn delete_modal(&mut self, context: &egui::Context) {
-        if !self.delete_prompt {
-            return;
-        }
-        let choice = egui::Modal::new(egui::Id::new("delete_confirmation"))
-            .show(context, |ui| {
-                ui.set_max_width(440.0);
-                ui.heading(self.catalog.text("delete_title"));
-                ui.add_space(8.0);
-                ui.label(self.catalog.text("delete_message"));
-                ui.add_space(16.0);
-                let mut result = None;
-                ui.horizontal(|ui| {
-                    if ui.button(self.catalog.text("confirm_delete")).clicked() {
-                        result = Some(true);
-                    }
-                    if ui.button(self.catalog.text("cancel")).clicked() {
-                        result = Some(false);
-                    }
-                });
-                result
-            })
-            .inner;
-        if let Some(confirm) = choice {
-            self.delete_prompt = false;
-            if confirm {
-                self.remove_selected();
-            }
-        }
-    }
-
-    fn batch_delete_modal(&mut self, context: &egui::Context) {
-        if !self.batch_delete_prompt {
-            return;
-        }
-        let count = self.batch_selected.len().to_string();
-        let choice = egui::Modal::new(egui::Id::new("batch_delete_confirmation"))
-            .show(context, |ui| {
-                ui.set_max_width(440.0);
-                ui.heading(self.catalog.text("batch_delete_title"));
-                ui.add_space(8.0);
-                ui.label(
-                    self.catalog
-                        .format("batch_delete_message", &[("count", count.as_str())]),
-                );
-                ui.add_space(16.0);
-                let mut result = None;
-                ui.horizontal(|ui| {
-                    if ui
-                        .button(self.catalog.text("confirm_delete_selected"))
-                        .clicked()
-                    {
-                        result = Some(true);
-                    }
-                    if ui.button(self.catalog.text("cancel")).clicked() {
-                        result = Some(false);
-                    }
-                });
-                result
-            })
-            .inner;
-        if let Some(confirm) = choice {
-            self.batch_delete_prompt = false;
-            if confirm {
-                self.remove_batch();
-            }
-        }
-    }
 }
 
 impl eframe::App for HostsApp {
+    // eframe's default clear color is near-black regardless of theme; `App::ui`
+    // draws without a panel frame, so the window background must follow the theme.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
+    }
+
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tests();
         let mut restore = false;
@@ -2674,7 +1438,7 @@ impl eframe::App for HostsApp {
         if self.host_refresh_pending && self.tests_idle() && !self.testing_all {
             self.host_refresh_pending = false;
             if let Err(error) = self.refresh_hosts() {
-                self.status = self.catalog.format("storage_error", &[("error", &error)]);
+                self.set_status_format("storage_error", &[("error", &error)]);
             }
         }
         if should_hide_to_tray(
@@ -2689,44 +1453,81 @@ impl eframe::App for HostsApp {
                 self.hidden = true;
                 context.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
-                self.status = self.catalog.text("tray_unavailable").to_owned();
+                self.set_status_key("tray_unavailable");
             }
         }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
+    }
+}
+
+impl HostsApp {
+    /// Full window layout; separate from `App::ui` so headless tests can drive it.
+    fn render(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
-        self.top_bar(ui, &context);
-        ui.separator();
-        let body = ui.available_rect_before_wrap();
-        let divider_x = body.min.x + 340.0;
-        let sidebar = egui::Rect::from_min_max(body.min, egui::pos2(divider_x, body.max.y));
-        let editor = egui::Rect::from_min_max(egui::pos2(divider_x + 10.0, body.min.y), body.max);
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(sidebar)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-            |ui| self.sidebar(ui),
-        );
-        ui.painter().vline(
-            divider_x,
-            body.y_range(),
-            ui.visuals().widgets.noninteractive.bg_stroke,
-        );
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(editor)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-            |ui| self.editor_panel(ui, &context),
-        );
-        ui.allocate_rect(body, egui::Sense::hover());
-        self.fingerprint_modal(&context);
-        self.fido_setup_modal(&context);
-        self.import_window(&context);
-        self.import_cleanup_modal(&context);
-        self.batch_export_window(&context);
-        self.delete_modal(&context);
-        self.batch_delete_modal(&context);
+        let panel_fill = ui.visuals().panel_fill;
+        egui::Panel::top("toolbar")
+            .frame(
+                egui::Frame::new()
+                    .fill(panel_fill)
+                    .inner_margin(egui::Margin::symmetric(8, 8)),
+            )
+            .show(ui, |ui| self.toolbar(ui, &context));
+        if self.batch_mode {
+            egui::Panel::top("selection_bar")
+                .frame(egui::Frame::new().fill(panel_fill))
+                .show_separator_line(false)
+                .show(ui, |ui| self.selection_bar(ui));
+        }
+        egui::Panel::bottom("status_bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(panel_fill)
+                    .inner_margin(egui::Margin::symmetric(0, 5)),
+            )
+            .show(ui, |ui| self.status_bar(ui));
+        let window_width = ui.available_width();
+        let sidebar_max = (window_width * 0.36).clamp(240.0, 440.0);
+        let sidebar_width = self
+            .sidebar_width
+            .unwrap_or((window_width * 0.30).clamp(240.0, 340.0))
+            .clamp(240.0, sidebar_max);
+        let list_response = egui::Panel::left("host_list")
+            // Rows run edge to edge; the list inset is applied per row so the selection bar
+            // can sit flush against the window edge.
+            .frame(egui::Frame::new().fill(panel_fill))
+            .resizable(true)
+            .default_size(sidebar_width)
+            // Until the user drags the divider the list follows the window width; a
+            // dragged width is kept but never allowed past a third of the window.
+            .size_range(if self.sidebar_width.is_some() {
+                240.0..=sidebar_max
+            } else {
+                sidebar_width..=sidebar_width
+            })
+            .show(ui, |ui| self.host_list(ui));
+        let shown_width = list_response.response.rect.width();
+        if self
+            .sidebar_width
+            .is_some_and(|width| (width - shown_width).abs() > 0.5)
+        {
+            self.sidebar_width = Some(shown_width);
+        }
+        if self.sidebar_width.is_none()
+            && ui
+                .ctx()
+                .read_response(egui::Id::new("host_list").with("__resize"))
+                .is_some_and(|response| response.dragged())
+        {
+            self.sidebar_width = Some(shown_width);
+        }
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(panel_fill))
+            .show(ui, |ui| self.editor_panel(ui, &context));
+        self.show_dialogs(&context);
+        self.toasts(&context);
         if let Some(temporary) = &mut self.temporary {
             temporary.show(&context, &self.catalog);
         }
@@ -2803,14 +1604,6 @@ fn gui_test_limits(timeout: Duration) -> OperationLimits {
         command_timeout: Some(timeout),
         output_bytes: None,
         batch_scope: None,
-    }
-}
-
-fn host_row_fill(state: Option<HostTestState>) -> Option<Color32> {
-    match state {
-        Some(HostTestState::Succeeded) => Some(TEST_SUCCESS_FILL),
-        Some(HostTestState::Failed) => Some(TEST_FAILURE_FILL),
-        _ => None,
     }
 }
 
@@ -2954,66 +1747,32 @@ fn toggle_visible_selection(
     }
 }
 
-fn form_label(ui: &mut egui::Ui, text: &str) {
-    ui.add_sized(
-        [160.0, 24.0],
-        egui::Label::new(RichText::new(text).strong()).halign(egui::Align::Min),
-    );
-}
-
-fn form_label_with_hint(ui: &mut egui::Ui, text: &str) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(160.0, 48.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.add_sized(
-                [160.0, 24.0],
-                egui::Label::new(RichText::new(text).strong()).halign(egui::Align::Min),
-            );
-        },
-    );
-}
-
-fn font_candidates(locale: &str) -> Vec<(&'static str, &'static str)> {
-    const SEGOE: (&str, &str) = ("segoe", r"C:\Windows\Fonts\segoeui.ttf");
-    const YAHEI: (&str, &str) = ("yahei", r"C:\Windows\Fonts\msyh.ttc");
-    const JHENGHEI: (&str, &str) = ("jhenghei", r"C:\Windows\Fonts\msjh.ttc");
-    const MEIRYO: (&str, &str) = ("meiryo", r"C:\Windows\Fonts\meiryo.ttc");
-    let regional = match locale {
-        "zh-CN" => [YAHEI, JHENGHEI, MEIRYO],
-        "zh-TW" => [JHENGHEI, YAHEI, MEIRYO],
-        "ja" => [MEIRYO, YAHEI, JHENGHEI],
-        _ => [YAHEI, JHENGHEI, MEIRYO],
-    };
-    std::iter::once(SEGOE).chain(regional).collect()
-}
-
-pub(crate) fn configure_fonts(context: &egui::Context, locale: &str) {
-    let mut fonts = FontDefinitions::default();
-    let mut installed = Vec::new();
-    for (name, path) in font_candidates(locale) {
-        if let Ok(bytes) = fs::read(Path::new(path)) {
-            fonts
-                .font_data
-                .insert(name.to_owned(), FontData::from_owned(bytes).into());
-            installed.push(name.to_owned());
-        }
-    }
-    for family in [FontFamily::Proportional, FontFamily::Monospace] {
-        if let Some(fonts_for_family) = fonts.families.get_mut(&family) {
-            for name in installed.iter().rev() {
-                fonts_for_family.insert(0, name.clone());
-            }
-        }
-    }
-    context.set_fonts(fonts);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn metadata_test_app(context: &egui::Context, locale: &str, profile: HostProfile) -> HostsApp {
+    /// Finds the painted rectangle of an exact text run in a frame's output shapes.
+    pub(super) fn find_text_rect(
+        shapes: &[egui::epaint::ClippedShape],
+        text: &str,
+    ) -> Option<egui::Rect> {
+        fn find(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
+            match shape {
+                egui::Shape::Text(shape) if shape.galley.job.text == text => {
+                    Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| find(shape, text)),
+                _ => None,
+            }
+        }
+        shapes.iter().find_map(|shape| find(&shape.shape, text))
+    }
+
+    pub(super) fn metadata_test_app(
+        context: &egui::Context,
+        locale: &str,
+        profile: HostProfile,
+    ) -> HostsApp {
         let editor = HostEditor {
             tag_input: String::new(),
             profile: profile.clone(),
@@ -3039,7 +1798,7 @@ mod tests {
             catalog: Catalog::for_locale(Some(locale)),
             selected: Some(profile.id),
             editor: Some(editor),
-            status: String::new(),
+            status: StatusMessage::info(""),
             test_operations: HashMap::new(),
             pending_tests: VecDeque::new(),
             test_hosts_snapshot: None,
@@ -3057,113 +1816,255 @@ mod tests {
             host_filter: HostFilter::default(),
             batch_delete_prompt: false,
             batch_export_window_open: false,
+            sidebar_width: None,
+            scroll_to_selected: false,
             launch: LaunchOptions::default(),
             callback_written: false,
             pending_callback: None,
         }
     }
 
-    #[test]
-    fn metadata_controls_render_in_all_locales_without_overlapping() {
-        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
-            let context = egui::Context::default();
-            configure_fonts(&context, locale);
-            let profile = HostProfile {
-                alias: "example".into(),
-                description: "metadata notes\nsecond line".into(),
-                tags: vec!["prod".into(), "web".into()],
-                ..Default::default()
-            };
-            let mut app = metadata_test_app(&context, locale, profile);
-            fn find_text(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
-                match shape {
-                    egui::Shape::Text(shape) if shape.galley.job.text == text => {
-                        Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+    /// Every painted text run with its clip rectangle.
+    pub(super) fn painted_texts(
+        shapes: &[egui::epaint::ClippedShape],
+    ) -> Vec<(String, egui::Rect, egui::Rect)> {
+        fn collect(
+            shape: &egui::Shape,
+            clip: egui::Rect,
+            out: &mut Vec<(String, egui::Rect, egui::Rect)>,
+        ) {
+            match shape {
+                egui::Shape::Text(text) => out.push((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                    clip,
+                )),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, clip, out);
                     }
-                    egui::Shape::Vec(shapes) => {
-                        shapes.iter().find_map(|shape| find_text(shape, text))
-                    }
-                    _ => None,
                 }
+                _ => {}
             }
-            for frame in 0..3 {
-                let output = context.run_ui(
-                    egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(1040.0, 760.0),
-                        )),
-                        time: Some(frame as f64 * 0.1),
-                        ..Default::default()
-                    },
-                    |ui| {
-                        ui.set_max_width(690.0);
-                        app.editor_panel(ui, &context);
-                    },
-                );
-                if frame > 0 {
-                    let rect = |text| {
-                        output
-                            .shapes
-                            .iter()
-                            .find_map(|shape| find_text(&shape.shape, text))
-                            .unwrap_or_else(|| panic!("missing {locale} label {text}"))
-                    };
-                    let description = rect(app.catalog.text("description"));
-                    let tags = rect(app.catalog.text("tags"));
-                    let chip = rect("prod ×");
-                    assert!(tags.top() > description.bottom());
-                    assert!(chip.left() > tags.right());
-                    assert!(chip.right() < 690.0);
-                }
+        }
+        let mut out = Vec::new();
+        for shape in shapes {
+            collect(&shape.shape, shape.clip_rect, &mut out);
+        }
+        out
+    }
+
+    fn layout_test_app(context: &egui::Context, locale: &str) -> HostsApp {
+        let selected = HostProfile {
+            alias: "production-web-frontend-01".into(),
+            address: "web-frontend-01.internal.example.com".into(),
+            description: "long description ".repeat(6),
+            tags: vec!["production".into(), "web".into(), "frontend".into()],
+            verified: true,
+            ..Default::default()
+        };
+        let mut app = metadata_test_app(context, locale, selected);
+        for index in 0..12 {
+            // Alternate tagged and untagged hosts so uneven row heights would show up.
+            app.store.hosts.push(HostProfile {
+                alias: format!("host-{index}"),
+                address: format!("10.0.{index}.1"),
+                tags: if index % 2 == 0 {
+                    vec!["lab".into()]
+                } else {
+                    Vec::new()
+                },
+                ..Default::default()
+            });
+        }
+        app.set_status_key("status_ready");
+        app
+    }
+
+    const WINDOW_SIZES: [[f32; 2]; 5] = [
+        [820.0, 620.0],
+        [1040.0, 760.0],
+        [1280.0, 800.0],
+        [1600.0, 1000.0],
+        [1920.0, 1080.0],
+    ];
+
+    fn run_full_window(
+        app: &mut HostsApp,
+        context: &egui::Context,
+        size: [f32; 2],
+    ) -> egui::FullOutput {
+        let mut output = None;
+        for frame in 0..4 {
+            output = Some(context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(size[0], size[1]),
+                    )),
+                    time: Some(frame as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            ));
+        }
+        output.unwrap()
+    }
+
+    fn assert_layout_invariants(
+        app: &HostsApp,
+        output: &egui::FullOutput,
+        size: [f32; 2],
+        label: &str,
+    ) {
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(size[0], size[1]));
+        let texts = painted_texts(&output.shapes);
+        assert!(!texts.is_empty(), "{label}: nothing painted");
+        for (text, rect, clip) in &texts {
+            let visible = rect.intersect(*clip);
+            if visible.is_negative() {
+                continue; // scrolled out of view
+            }
+            assert!(
+                rect.left() >= clip.left() - 1.0 && rect.right() <= clip.right() + 1.0,
+                "{label}: text {text:?} is cut horizontally: {rect:?} clip {clip:?}"
+            );
+            assert!(
+                screen.contains_rect(visible),
+                "{label}: text {text:?} leaves the window: {rect:?}"
+            );
+        }
+        let find = |key: &str| {
+            let wanted = app.catalog.text(key);
+            texts
+                .iter()
+                .find(|(text, _, _)| text == wanted)
+                .map(|(_, rect, _)| *rect)
+                .unwrap_or_else(|| panic!("{label}: missing control {key}"))
+        };
+        let toolbar_y = find("import_hosts").center().y;
+        for key in ["test_all", "batch_manage", "tray_exit", "language"] {
+            let rect = find(key);
+            assert!(
+                (rect.center().y - toolbar_y).abs() < 4.0,
+                "{label}: toolbar control {key} wrapped to another row"
+            );
+        }
+        let save = find("save");
+        let test = find("test_connection");
+        assert!(
+            save.bottom() < size[1] - 20.0,
+            "{label}: save button hidden"
+        );
+        assert!((save.center().y - test.center().y).abs() < 4.0);
+        let status = find("status_ready");
+        assert!(status.bottom() <= size[1] && status.top() > save.bottom());
+        let list_title = texts
+            .iter()
+            .find(|(text, _, _)| text.starts_with(app.catalog.text("nav_title")))
+            .expect("host list title");
+        assert!(list_title.1.left() < size[0] * 0.3);
+        assert!(find("section_basic").left() > list_title.1.right());
+        // The row for the selected host must be readable in the list.
+        assert!(
+            texts
+                .iter()
+                .any(|(text, _, _)| text.starts_with("production-web"))
+        );
+        // Every list row must have the same pitch regardless of how many lines it fills.
+        let mut alias_tops = texts
+            .iter()
+            .filter(|(text, rect, _)| text.starts_with("host-") && rect.left() < size[0] * 0.3)
+            .map(|(_, rect, _)| rect.top())
+            .collect::<Vec<_>>();
+        alias_tops.sort_by(f32::total_cmp);
+        let pitches = alias_tops
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .collect::<Vec<_>>();
+        assert!(pitches.len() >= 3, "{label}: expected several visible rows");
+        for pitch in &pitches {
+            assert!(
+                (pitch - pitches[0]).abs() < 1.0,
+                "{label}: uneven row pitch {pitches:?}"
+            );
+        }
+        // Design decision: two-column rows from 1040 up, stacked labels only near the minimum size.
+        let alias_label = find("alias");
+        let alias_field_top = texts
+            .iter()
+            .filter(|(text, rect, _)| {
+                text == "production-web-frontend-01" && rect.left() > alias_label.left()
+            })
+            .map(|(_, rect, _)| rect.top())
+            .fold(f32::MAX, f32::min);
+        if size[0] >= 1040.0 {
+            assert!(
+                (alias_field_top - alias_label.top()).abs() < 12.0,
+                "{label}: alias field should sit beside its label"
+            );
+        } else {
+            assert!(
+                alias_field_top > alias_label.bottom(),
+                "{label}: alias field should stack under its label"
+            );
+        }
+    }
+
+    #[test]
+    fn full_window_layout_holds_at_every_size_and_locale() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            for size in WINDOW_SIZES {
+                let context = egui::Context::default();
+                configure_fonts(&context, locale);
+                apply_style(&context);
+                let mut app = layout_test_app(&context, locale);
+                let output = run_full_window(&mut app, &context, size);
+                assert_layout_invariants(&app, &output, size, &format!("{locale} {size:?}"));
             }
         }
     }
 
     #[test]
-    fn host_row_keeps_alias_details_and_tags_on_separate_lines() {
-        let context = egui::Context::default();
-        configure_fonts(&context, "en");
-        let profile = HostProfile {
-            alias: "example".into(),
-            address: "server.example.com".into(),
-            port: 22,
-            verified: true,
-            tags: vec!["prod".into(), "web".into()],
-            ..Default::default()
-        };
-        let mut app = metadata_test_app(&context, "en", profile);
-        for frame in 0..3 {
-            let output = context.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(340.0, 400.0),
-                    )),
-                    time: Some(frame as f64 * 0.1),
-                    ..Default::default()
-                },
-                |ui| app.sidebar(ui),
-            );
-            if frame > 0 {
-                fn host_rows(shape: &egui::Shape) -> Option<usize> {
-                    match shape {
-                        egui::Shape::Text(text)
-                            if text.galley.job.text
-                                == "example\nSSH · server.example.com:22  ✓\nprod · web" =>
-                        {
-                            Some(text.galley.rows.len())
-                        }
-                        egui::Shape::Vec(shapes) => shapes.iter().find_map(host_rows),
-                        _ => None,
+    fn batch_mode_layout_holds_at_every_size_and_locale() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            for size in WINDOW_SIZES {
+                let context = egui::Context::default();
+                configure_fonts(&context, locale);
+                apply_style(&context);
+                let mut app = layout_test_app(&context, locale);
+                app.begin_batch_mode();
+                app.batch_selected
+                    .extend(app.store.hosts.iter().take(3).map(|host| host.id));
+                let output = run_full_window(&mut app, &context, size);
+                let label = format!("batch {locale} {size:?}");
+                let texts = painted_texts(&output.shapes);
+                for key in ["deselect_all", "select_all", "export", "delete", "cancel"] {
+                    let wanted = app.catalog.text(key);
+                    if key == "deselect_all" || key == "select_all" {
+                        continue;
                     }
+                    assert!(
+                        texts.iter().any(|(text, _, _)| text.starts_with(wanted)),
+                        "{label}: missing selection-bar control {key}"
+                    );
                 }
-                let rows = output
-                    .shapes
-                    .iter()
-                    .find_map(|shape| host_rows(&shape.shape))
-                    .expect("the complete host row must be painted");
-                assert_eq!(rows, 3, "host metadata rows must remain visible");
+                let count = app
+                    .catalog
+                    .format("batch_selected_count", &[("count", "3")]);
+                assert!(
+                    texts.iter().any(|(text, _, _)| *text == count),
+                    "{label}: count"
+                );
+                for (text, rect, clip) in &texts {
+                    if rect.intersect(*clip).is_negative() {
+                        continue;
+                    }
+                    assert!(
+                        rect.right() <= clip.right() + 1.0,
+                        "{label}: text {text:?} is cut horizontally"
+                    );
+                }
             }
         }
     }
@@ -3226,29 +2127,6 @@ mod tests {
         reconcile_host_editor(&mut editor, &mut selected, &store);
         assert!(editor.is_none());
         assert!(selected.is_none());
-    }
-
-    #[test]
-    fn font_loading_prioritizes_the_active_language_and_keeps_cjk_fallbacks() {
-        assert_eq!(font_candidates("en").len(), 4);
-        assert_eq!(font_candidates("zh-CN").len(), 4);
-        assert_eq!(font_candidates("zh-CN")[1].0, "yahei");
-        assert_eq!(font_candidates("zh-TW")[1].0, "jhenghei");
-        assert_eq!(font_candidates("ja")[1].0, "meiryo");
-        assert_eq!(font_candidates("unknown"), font_candidates("en"));
-    }
-
-    #[test]
-    fn test_rows_use_requested_result_colors() {
-        assert_eq!(
-            host_row_fill(Some(HostTestState::Succeeded)),
-            Some(TEST_SUCCESS_FILL)
-        );
-        assert_eq!(
-            host_row_fill(Some(HostTestState::Failed)),
-            Some(TEST_FAILURE_FILL)
-        );
-        assert_eq!(host_row_fill(Some(HostTestState::Testing)), None);
     }
 
     #[test]

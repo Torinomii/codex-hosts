@@ -46,7 +46,6 @@
     "temp_op_expired": "承認期限切れ",
     "app_title": "Codex ホスト",
     "nav_title": "ホスト",
-    "nav_subtitle": "保存済みのホストを選択して確認または編集します。",
     "new_host": "ホストを追加",
     "import_hosts": "ホストをインポート",
     "test_all": "すべてテスト",
@@ -186,6 +185,15 @@
     "endpoint_summary": "{protocol} · {address}:{port}",
     "chain_in_use": "この項目は別のホストの踏み台として使用されているため削除できません。",
     "unsaved_changes": "接続情報が変更されています。保存すると以前のテスト検証状態は解除されます。",
-    "secret_not_exported": "パスワード、パスフレーズ、PIN は平文表示、ログ記録、Codex への返却を行いません。"
+    "secret_not_exported": "パスワード、パスフレーズ、PIN は平文表示、ログ記録、Codex への返却を行いません。",
+    "section_basic": "基本情報",
+    "section_connection": "接続",
+    "section_auth": "認証",
+    "section_host_key": "SSH ホスト鍵",
+    "editor_empty_hint": "左側でホストを選択するか、新規作成してください。",
+    "unsaved_changes_short": "接続情報が未保存",
+    "batch_selected_count": "{count} 台を選択中",
+    "status_testing_progress": "テスト中… 残り {remaining} 台",
+    "host_count": "ホスト {count} 台"
   }
 }

@@ -635,7 +635,7 @@ impl SecretsApp {
             }
         });
         if let Some(notice) = self.notice {
-            ui.colored_label(egui::Color32::YELLOW, self.catalog.text(notice));
+            ui.colored_label(ui.visuals().warn_fg_color, self.catalog.text(notice));
         }
         ui.add_space(16.0);
         egui::ScrollArea::vertical()
