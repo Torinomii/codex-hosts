@@ -46,7 +46,6 @@
     "temp_op_expired": "確認已過期",
     "app_title": "Codex 主機",
     "nav_title": "主機",
-    "nav_subtitle": "選擇已儲存的主機以檢視或編輯。",
     "new_host": "新增主機",
     "import_hosts": "匯入主機",
     "test_all": "全部測試",
@@ -186,6 +185,15 @@
     "endpoint_summary": "{protocol} · {address}:{port}",
     "chain_in_use": "此項目正被其他主機用作跳板，因此無法刪除。",
     "unsaved_changes": "連線資訊已變更；儲存後將清除原有的測試驗證狀態。",
-    "secret_not_exported": "密碼、密碼片語和 PIN 絕不會以明文顯示、記錄於日誌或傳回 Codex。"
+    "secret_not_exported": "密碼、密碼片語和 PIN 絕不會以明文顯示、記錄於日誌或傳回 Codex。",
+    "section_basic": "基本資訊",
+    "section_connection": "連線",
+    "section_auth": "身分驗證",
+    "section_host_key": "SSH 主機金鑰",
+    "editor_empty_hint": "在左側選擇一台主機，或新增一台。",
+    "unsaved_changes_short": "連線資訊未儲存",
+    "batch_selected_count": "已選 {count} 台",
+    "status_testing_progress": "測試中… 剩餘 {remaining} 台",
+    "host_count": "共 {count} 台主機"
   }
 }

@@ -46,7 +46,6 @@
     "temp_op_expired": "Approval expired",
     "app_title": "Codex Hosts",
     "nav_title": "Hosts",
-    "nav_subtitle": "Select a saved host to review or edit it.",
     "new_host": "New host",
     "import_hosts": "Import hosts",
     "test_all": "Test all",
@@ -186,6 +185,15 @@
     "endpoint_summary": "{protocol} · {address}:{port}",
     "chain_in_use": "Used as a jump host by another saved entry and cannot be deleted.",
     "unsaved_changes": "Connection details changed. Test verification will be cleared when saved.",
-    "secret_not_exported": "Passwords, passphrases, and PINs are never shown in plaintext, logged, or returned to Codex."
+    "secret_not_exported": "Passwords, passphrases, and PINs are never shown in plaintext, logged, or returned to Codex.",
+    "section_basic": "Basic information",
+    "section_connection": "Connection",
+    "section_auth": "Authentication",
+    "section_host_key": "SSH host key",
+    "editor_empty_hint": "Select a host on the left, or create a new one.",
+    "unsaved_changes_short": "Unsaved connection changes",
+    "batch_selected_count": "{count} selected",
+    "status_testing_progress": "Testing… {remaining} remaining",
+    "host_count": "{count} hosts"
   }
 }

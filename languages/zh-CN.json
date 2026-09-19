@@ -46,7 +46,6 @@
     "temp_op_expired": "确认已过期",
     "app_title": "Codex 主机",
     "nav_title": "主机",
-    "nav_subtitle": "选择已保存的主机以查看或编辑。",
     "new_host": "新建主机",
     "import_hosts": "导入主机",
     "test_all": "全部测试",
@@ -186,6 +185,15 @@
     "endpoint_summary": "{protocol} · {address}:{port}",
     "chain_in_use": "此条目正被其他主机用作跳板，无法删除。",
     "unsaved_changes": "连接信息已更改；保存后将清除原有测试验证状态。",
-    "secret_not_exported": "密码、口令和 PIN 绝不会以明文显示、记录到日志或返回给 Codex。"
+    "secret_not_exported": "密码、口令和 PIN 绝不会以明文显示、记录到日志或返回给 Codex。",
+    "section_basic": "基本信息",
+    "section_connection": "连接",
+    "section_auth": "身份验证",
+    "section_host_key": "SSH 主机密钥",
+    "editor_empty_hint": "在左侧选择一台主机，或新建一台。",
+    "unsaved_changes_short": "连接信息未保存",
+    "batch_selected_count": "已选 {count} 台",
+    "status_testing_progress": "测试中… 剩余 {remaining} 台",
+    "host_count": "共 {count} 台主机"
   }
 }
