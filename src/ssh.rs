@@ -30,6 +30,9 @@ use crate::fido;
 use crate::model::{HostProfile, SshAuth, resolve_ssh_chain};
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+mod input_tests;
+pub const MAX_STDIN_BYTES: usize = 1024 * 1024;
 const MAX_AGENT_IDENTITIES: usize = 32;
 const AGENT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_RETAINED_CONNECTIONS: usize = 16;
@@ -635,11 +638,32 @@ pub fn execute(
     command: &str,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
+    execute_with_input(profile, hosts, command, None, limits)
+}
+
+pub fn validate_stdin(stdin: Option<&str>) -> Result<(), RemoteFailure> {
+    if stdin.is_some_and(|input| input.len() > MAX_STDIN_BYTES) {
+        return Err(RemoteFailure::new(
+            "STDIN_TOO_LARGE",
+            "stdin exceeds the 1 MiB UTF-8 input limit.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn execute_with_input(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    command: &str,
+    stdin: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    validate_stdin(stdin)?;
     ssh_runtime().block_on(run_with_optional_timeout(
         limits.total_timeout,
         TOTAL_TIMEOUT_CODE,
         "The complete SSH operation exceeded its time limit.",
-        execute_async(profile, hosts, command, limits),
+        execute_async(profile, hosts, command, stdin, limits),
     ))
 }
 
@@ -702,6 +726,7 @@ async fn execute_async(
     profile: &HostProfile,
     hosts: &[HostProfile],
     command: &str,
+    stdin: Option<&str>,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
     let chain = resolve_ssh_chain(profile, hosts)
@@ -717,7 +742,7 @@ async fn execute_async(
             let target = sessions.last().ok_or_else(|| {
                 RemoteFailure::new("INVALID_HOST_CHAIN", "The SSH chain is empty.")
             })?;
-            run_command(target.handle.as_ref(), command, &capture_budget).await
+            run_command(target.handle.as_ref(), command, stdin, &capture_budget).await
         },
     )
     .await;
@@ -793,7 +818,7 @@ async fn execute_many_async(
                     limits.command_timeout,
                     "COMMAND_TIMEOUT",
                     "The remote command timed out.",
-                    run_command(session.handle.as_ref(), &command, &budget),
+                    run_command(session.handle.as_ref(), &command, None, &budget),
                 )
                 .await;
                 (index, result)
@@ -1366,25 +1391,70 @@ impl CaptureBudget {
     }
 }
 
+struct CloseCommandChannel(Option<Arc<russh::ChannelWriteHalf<client::Msg>>>);
+
+impl Drop for CloseCommandChannel {
+    fn drop(&mut self) {
+        if let Some(writer) = self.0.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            // Cancelling a russh Channel does not close it. Only bounded close
+            // cleanup is detached; the command's stdin sender is never detached.
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(1), writer.close()).await;
+            });
+        }
+    }
+}
+
 async fn run_command(
     session: &client::Handle<ServerKeyObserver>,
     command: &str,
+    stdin: Option<&str>,
     budget: &CaptureBudget,
 ) -> Result<CommandResult, RemoteFailure> {
-    let mut channel = session
+    let channel = session
         .channel_open_session()
         .await
         .map_err(|error| RemoteFailure::new("CHANNEL_OPEN_FAILED", error.to_string()))?;
-    channel
+    let (mut reader, writer) = channel.split();
+    let writer = Arc::new(writer);
+    let mut close_on_cancel = CloseCommandChannel(Some(Arc::clone(&writer)));
+    writer
         .exec(true, command.as_bytes())
         .await
         .map_err(|error| RemoteFailure::new("REMOTE_EXEC_FAILED", error.to_string()))?;
 
+    // Keep both directions in this future: timeouts drop input transmission too.
+    // A remote command can fill stdout before reading any of its stdin.
+    let send_input = async {
+        if let Some(input) = stdin {
+            writer.data(input.as_bytes()).await?;
+            writer.eof().await?;
+        }
+        Ok::<(), russh::Error>(())
+    };
+    tokio::pin!(send_input);
+    let mut input_done = stdin.is_none();
+    let mut input_error = None;
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
     let mut exit_code = -1;
+    let mut received_exit_status = false;
     let mut output_truncated = false;
-    while let Some(message) = channel.wait().await {
+    loop {
+        let message = tokio::select! {
+            result = &mut send_input, if !input_done && !received_exit_status => {
+                input_done = true;
+                input_error = result.err();
+                continue;
+            }
+            message = reader.wait() => message,
+        };
+        let Some(message) = message else {
+            close_on_cancel.0 = None;
+            break;
+        };
         match message {
             ChannelMsg::Data { data } => {
                 output_truncated |= append_limited(&mut stdout, &data, budget)
@@ -1393,10 +1463,28 @@ async fn run_command(
                 output_truncated |= append_limited(&mut stderr, &data, budget)
             }
             ChannelMsg::ExitStatus { exit_status } => {
+                received_exit_status = true;
                 exit_code = i32::try_from(exit_status).unwrap_or(-1)
+            }
+            ChannelMsg::Failure => {
+                return Err(RemoteFailure::new(
+                    "REMOTE_EXEC_FAILED",
+                    "The server rejected the exec request.",
+                ));
+            }
+            ChannelMsg::Close => {
+                close_on_cancel.0 = None;
+                break;
             }
             _ => {}
         }
+    }
+    // An early remote exit is authoritative, even if it consumed only part of stdin.
+    if !received_exit_status && (input_error.is_some() || !input_done) {
+        return Err(RemoteFailure::new(
+            "STDIN_WRITE_FAILED",
+            "The SSH channel closed before stdin transmission completed.",
+        ));
     }
     Ok(CommandResult {
         exit_code,

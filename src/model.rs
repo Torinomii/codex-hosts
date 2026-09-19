@@ -52,6 +52,8 @@ impl SshAuth {
 pub struct HostProfile {
     pub id: Uuid,
     pub alias: String,
+    pub description: String,
+    pub tags: Vec<String>,
     pub address: String,
     pub port: u16,
     pub username: String,
@@ -72,6 +74,8 @@ impl Default for HostProfile {
         Self {
             id: Uuid::new_v4(),
             alias: String::new(),
+            description: String::new(),
+            tags: Vec::new(),
             address: String::new(),
             port: 22,
             username: String::new(),
@@ -134,6 +138,12 @@ impl HostProfile {
     }
 
     pub fn apply_prefill(&mut self, prefill: &Prefill) {
+        if let Some(description) = &prefill.description {
+            self.description.clone_from(description);
+        }
+        if let Some(tags) = &prefill.tags {
+            self.tags = normalize_tags(tags);
+        }
         if let Some(alias) = &prefill.alias {
             self.alias.clone_from(alias);
         }
@@ -192,6 +202,8 @@ impl ValidationIssue {
 #[derive(Debug, Clone, Default)]
 pub struct Prefill {
     pub alias: Option<String>,
+    pub description: Option<String>,
+    pub tags: Option<Vec<String>>,
     pub address: Option<String>,
     pub port: Option<u16>,
     pub username: Option<String>,
@@ -200,6 +212,45 @@ pub struct Prefill {
     pub private_key_path: Option<String>,
     pub agent_key_fingerprint: Option<String>,
     pub jump_alias: Option<String>,
+}
+
+pub fn normalize_tags(tags: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    tags.into_iter()
+        .map(|tag| tag.as_ref().trim().to_owned())
+        .filter(|tag| !tag.is_empty() && seen.insert(tag.to_lowercase()))
+        .collect()
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HostFilter {
+    pub search: String,
+    pub tags: Vec<String>,
+}
+
+impl HostFilter {
+    pub fn matches(&self, host: &HostProfile) -> bool {
+        let search = self.search.trim().to_lowercase();
+        let text_matches = search.is_empty()
+            || [
+                &host.alias,
+                &host.address,
+                &host.username,
+                &host.description,
+            ]
+            .into_iter()
+            .chain(host.tags.iter())
+            .any(|value| value.to_lowercase().contains(&search));
+        text_matches
+            && self.tags.iter().all(|required| {
+                let required = required.trim().to_lowercase();
+                required.is_empty()
+                    || host
+                        .tags
+                        .iter()
+                        .any(|tag| tag.trim().to_lowercase() == required)
+            })
+    }
 }
 
 pub fn resolve_ssh_chain<'a>(
@@ -254,6 +305,65 @@ pub fn can_use_as_jump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_is_backward_compatible_and_does_not_change_connection_identity() {
+        let old: HostProfile = serde_json::from_str(
+            r#"{"alias":"legacy","address":"server","username":"user","verified":true}"#,
+        )
+        .unwrap();
+        assert!(old.description.is_empty());
+        assert!(old.tags.is_empty());
+        let mut edited = old.clone();
+        edited.description = "  中文备注\nsecond line\n".into();
+        edited.tags = normalize_tags([" Prod ", "prod", "", "WEB", "web", "日本語"]);
+        assert_eq!(edited.tags, ["Prod", "WEB", "日本語"]);
+        assert!(edited.connection_details_equal(&old));
+        assert!(edited.verified);
+        let restored: HostProfile =
+            serde_json::from_str(&serde_json::to_string(&edited).unwrap()).unwrap();
+        assert_eq!(restored, edited);
+        edited.apply_prefill(&Prefill::default());
+        assert_eq!(restored, edited);
+        edited.apply_prefill(&Prefill {
+            description: Some(String::new()),
+            tags: Some(vec![]),
+            ..Default::default()
+        });
+        assert!(edited.description.is_empty() && edited.tags.is_empty());
+    }
+
+    #[test]
+    fn host_filter_combines_text_and_all_tags() {
+        let host = HostProfile {
+            alias: "gateway".into(),
+            description: "Tokyo 日本語".into(),
+            tags: vec!["Prod".into(), "Web".into()],
+            ..Default::default()
+        };
+        assert!(HostFilter::default().matches(&host));
+        assert!(
+            HostFilter {
+                search: "日本語".into(),
+                tags: vec!["prod".into(), " WEB ".into()]
+            }
+            .matches(&host)
+        );
+        assert!(
+            !HostFilter {
+                search: String::new(),
+                tags: vec!["prod".into(), "db".into()]
+            }
+            .matches(&host)
+        );
+        assert!(
+            !HostFilter {
+                search: "absent".into(),
+                tags: vec![]
+            }
+            .matches(&host)
+        );
+    }
 
     fn verified_ssh(alias: &str) -> HostProfile {
         HostProfile {

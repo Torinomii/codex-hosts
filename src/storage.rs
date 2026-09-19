@@ -354,6 +354,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn metadata_survives_store_save_and_reload() {
+        let directory =
+            std::env::temp_dir().join(format!("codex-hosts-metadata-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("hosts.json");
+        let mut store = HostStore::default();
+        store.hosts.push(HostProfile {
+            description: "  notes\n中文\n".into(),
+            tags: vec!["prod".into()],
+            verified: true,
+            ..Default::default()
+        });
+        store.save_to_path(&path).unwrap();
+        let restored = read_store(&path).unwrap();
+        assert_eq!(restored.hosts, store.hosts);
+        fs::remove_file(&path).unwrap();
+        fs::remove_file(path.with_extension("lock")).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
     fn stale_window_cannot_overwrite_callback_edits_or_locale() {
         let directory = std::env::temp_dir().join(format!("codex-hosts-review-{}", Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();

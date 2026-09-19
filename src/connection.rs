@@ -19,8 +19,23 @@ pub fn execute(
     command: &str,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
+    execute_with_input(profile, hosts, command, None, limits)
+}
+
+pub fn execute_with_input(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    command: &str,
+    stdin: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    ssh::validate_stdin(stdin)?;
     match profile.protocol {
-        Protocol::Ssh => ssh::execute(profile, hosts, command, limits),
+        Protocol::Ssh => ssh::execute_with_input(profile, hosts, command, stdin, limits),
+        Protocol::Telnet if stdin.is_some() => Err(RemoteFailure::new(
+            "STDIN_UNSUPPORTED",
+            "Optional stdin requires an SSH host; Telnet has no separate command input channel.",
+        )),
         Protocol::Telnet => telnet::execute(profile, command, limits),
     }
 }
@@ -38,5 +53,24 @@ pub fn execute_many(
             "SSH_REQUIRED",
             "exec_many is available only for SSH hosts.",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provided_telnet_input_fails_before_credentials_or_network() {
+        let host = HostProfile {
+            protocol: Protocol::Telnet,
+            ..Default::default()
+        };
+        for input in ["", "data"] {
+            let error =
+                execute_with_input(&host, &[], "cat", Some(input), OperationLimits::default())
+                    .unwrap_err();
+            assert_eq!(error.code, "STDIN_UNSUPPORTED");
+        }
     }
 }

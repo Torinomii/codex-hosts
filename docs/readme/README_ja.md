@@ -393,6 +393,21 @@ Codex の詳細な動作、呼び出し手順、安全ルールは [`SKILL.md`](
 
 </details>
 
+## ホストの説明・タグ・コマンド入力
+
+ホストに複数行の `description` と複数の `tags` を保存できます。編集画面でタグを追加・削除できます。前後の空白、空のタグ、大文字小文字を区別しない重複は除去し、最初の表記を保持します。説明・タグだけの変更では接続確認やホスト鍵の信頼状態は維持されます。検索対象はエイリアス、アドレス、ユーザー名、説明、タグです。複数のタグ条件はすべて一致する必要があります。一括全選択は表示中のホストだけが対象で、フィルター変更時は非表示ホストの選択を解除します。
+
+`list_hosts` は両フィールドを返し、任意の `tags` 配列で絞り込めます。省略または空配列は全ホスト、存在しないタグは空一覧になります。編集画面の事前入力は `--description "説明"` と繰り返し指定する `--tag prod --tag web` に対応します。省略した値は保持し、空の説明や単独の空タグで消去できます。CSV テンプレート・インポート・エクスポートは任意の `description`、`tags` 列に対応します。タグのセルは `["prod","web"]` のような JSON 配列を CSV の規則で引用します。従来の設定と CSV も利用できます。
+
+```json
+{"action":"list_hosts","tags":["prod","web"]}
+{"action":"exec","alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
+```
+
+単一ホストの SSH `exec` は最大 1 MiB の UTF-8 `stdin` を任意で受け取ります。改行を追加せずそのまま送信し、最後に EOF を送ります。省略または `null` は従来の動作を維持し、`""` は即座に EOF を送ります。入力送信と出力受信は同時に進み、既存のタイムアウトと出力制限が適用されます。リモートプログラムが全入力を読む前に終了した場合、その終了状態を優先します。
+
+`capabilities` は `exec_stdin`、`exec_stdin_protocols`、`max_stdin_bytes`、`host_metadata_fields`、`list_hosts_tag_filter` を返します。入力超過は `STDIN_TOO_LARGE`、Telnet・`exec_many`・`batch_exec` への stdin 指定は `STDIN_UNSUPPORTED` になります。コマンドは自動再実行されません。
+
 ## 実行制限
 
 異常なコマンドによる過剰な出力やメモリ使用を防ぐため、実行には制限があります。

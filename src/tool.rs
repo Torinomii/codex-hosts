@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
-use crate::model::{HostProfile, Protocol, SshAuth};
+use crate::model::{HostFilter, HostProfile, Protocol, SshAuth, normalize_tags};
 use crate::ssh::{self, AgentKeyInfo, OperationLimits, RemoteFailure, VerifiedHostKey};
 use crate::storage::HostStore;
 
@@ -41,7 +41,10 @@ enum ToolRequest {
     },
     AgentIdentities,
     FidoIdentities,
-    ListHosts,
+    ListHosts {
+        #[serde(default)]
+        tags: Vec<String>,
+    },
     Probe {
         alias: String,
         #[serde(default)]
@@ -53,6 +56,8 @@ enum ToolRequest {
         alias: String,
         command: String,
         #[serde(default)]
+        stdin: Option<String>,
+        #[serde(default)]
         connect_timeout_ms: Option<u64>,
         #[serde(default)]
         command_timeout_ms: Option<u64>,
@@ -60,6 +65,8 @@ enum ToolRequest {
     ExecMany {
         alias: String,
         commands: Vec<String>,
+        #[serde(default)]
+        stdin: Option<String>,
         #[serde(default)]
         max_concurrency: Option<usize>,
         #[serde(default)]
@@ -84,6 +91,8 @@ enum ToolRequest {
         aliases: Vec<String>,
         command: String,
         #[serde(default)]
+        stdin: Option<String>,
+        #[serde(default)]
         max_concurrency: Option<usize>,
         #[serde(default)]
         connect_timeout_ms: Option<u64>,
@@ -103,6 +112,8 @@ fn default_continue_on_error() -> bool {
 #[derive(Debug, Serialize)]
 struct HostSummary {
     alias: String,
+    description: String,
+    tags: Vec<String>,
     address: String,
     port: u16,
     username: String,
@@ -144,6 +155,11 @@ struct FidoIdentitiesResult {
 
 #[derive(Debug, Serialize)]
 struct CapabilitiesResult {
+    host_metadata_fields: [&'static str; 2],
+    list_hosts_tag_filter: bool,
+    exec_stdin: bool,
+    exec_stdin_protocols: [&'static str; 1],
+    max_stdin_bytes: usize,
     schema_version: u32,
     status: &'static str,
     app_version: &'static str,
@@ -260,9 +276,15 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         .map_err(|error| RemoteFailure::new("REQUEST_READ_FAILED", error.to_string()))?;
     let request: ToolRequest = serde_json::from_slice(&bytes)
         .map_err(|error| RemoteFailure::new("REQUEST_INVALID", error.to_string()))?;
+    validate_request_input(&request)?;
 
     if matches!(&request, ToolRequest::Capabilities) {
         return Ok(ToolResponse::Capabilities(CapabilitiesResult {
+            host_metadata_fields: ["description", "tags"],
+            list_hosts_tag_filter: true,
+            exec_stdin: true,
+            exec_stdin_protocols: ["ssh"],
+            max_stdin_bytes: ssh::MAX_STDIN_BYTES,
             schema_version: SCHEMA_VERSION,
             status: "ok",
             app_version: env!("CARGO_PKG_VERSION"),
@@ -340,7 +362,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         | ToolRequest::TemporarySecrets { .. } => unreachable!(),
         ToolRequest::AgentIdentities => unreachable!(),
         ToolRequest::FidoIdentities => unreachable!(),
-        ToolRequest::ListHosts => list_hosts(&store),
+        ToolRequest::ListHosts { tags } => list_hosts(&store, tags),
         ToolRequest::Probe {
             alias,
             connect_timeout_ms,
@@ -359,21 +381,24 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         ToolRequest::Exec {
             alias,
             command,
+            stdin,
             connect_timeout_ms,
             command_timeout_ms,
         } => {
             let host = find_host(&store, &alias)?;
             validate_profile(host)?;
-            Ok(ToolResponse::Remote(connection::execute(
+            Ok(ToolResponse::Remote(connection::execute_with_input(
                 host,
                 &store.hosts,
                 &command,
+                stdin.as_deref(),
                 limits(connect_timeout_ms, command_timeout_ms, None),
             )?))
         }
         ToolRequest::ExecMany {
             alias,
             commands,
+            stdin: _,
             max_concurrency,
             connect_timeout_ms,
             command_timeout_ms,
@@ -417,6 +442,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         ToolRequest::BatchExec {
             aliases,
             command,
+            stdin: _,
             max_concurrency,
             connect_timeout_ms,
             command_timeout_ms,
@@ -436,9 +462,25 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
     }
 }
 
-fn list_hosts(store: &HostStore) -> Result<ToolResponse, RemoteFailure> {
+fn validate_request_input(request: &ToolRequest) -> Result<(), RemoteFailure> {
+    match request {
+        ToolRequest::Exec { stdin, .. } => ssh::validate_stdin(stdin.as_deref()),
+        ToolRequest::ExecMany { stdin: Some(_), .. }
+        | ToolRequest::BatchExec { stdin: Some(_), .. } => Err(RemoteFailure::new(
+            "STDIN_UNSUPPORTED",
+            "stdin is supported only by single-host SSH exec.",
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn list_hosts(store: &HostStore, tags: Vec<String>) -> Result<ToolResponse, RemoteFailure> {
+    let filter = HostFilter {
+        search: String::new(),
+        tags: normalize_tags(tags),
+    };
     let mut hosts = Vec::with_capacity(store.hosts.len());
-    for host in &store.hosts {
+    for host in store.hosts.iter().filter(|host| filter.matches(host)) {
         let has_required_secret = match (host.protocol, host.ssh_auth) {
             (Protocol::Ssh, SshAuth::PrivateKey | SshAuth::SshAgent) => true,
             _ => credentials::has(host.id, CredentialKind::Password)
@@ -446,6 +488,8 @@ fn list_hosts(store: &HostStore) -> Result<ToolResponse, RemoteFailure> {
         };
         hosts.push(HostSummary {
             alias: host.alias.clone(),
+            description: host.description.clone(),
+            tags: normalize_tags(&host.tags),
             address: host.address.clone(),
             port: host.port,
             username: host.username.clone(),
@@ -932,6 +976,64 @@ fn failure_for_alias(alias: &str, code: &'static str, message: impl Into<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_filters_metadata_without_touching_excluded_credentials() {
+        let mut store = HostStore::default();
+        store.hosts.push(HostProfile {
+            alias: "include".into(),
+            description: "notes".into(),
+            tags: vec!["Prod".into(), "web".into()],
+            ssh_auth: SshAuth::SshAgent,
+            ..Default::default()
+        });
+        store.hosts.push(HostProfile {
+            alias: "exclude".into(),
+            ..Default::default()
+        });
+        let result = list_hosts(&store, vec![" prod ".into(), "WEB".into()]).unwrap();
+        let ToolResponse::List(result) = result else {
+            panic!("expected host list")
+        };
+        assert_eq!(result.hosts.len(), 1);
+        assert_eq!(result.hosts[0].description, "notes");
+        assert_eq!(result.hosts[0].tags, ["Prod", "web"]);
+        let request: ToolRequest = serde_json::from_str(r#"{"action":"list_hosts"}"#).unwrap();
+        assert!(matches!(request, ToolRequest::ListHosts { tags } if tags.is_empty()));
+    }
+
+    #[test]
+    fn optional_stdin_contract_rejects_wrong_types_and_oversized_utf8() {
+        for suffix in ["", ",\"stdin\":null", ",\"stdin\":\"\""] {
+            let request: ToolRequest = serde_json::from_str(&format!(
+                "{{\"action\":\"exec\",\"alias\":\"a\",\"command\":\"cat\"{suffix}}}"
+            ))
+            .unwrap();
+            assert!(validate_request_input(&request).is_ok());
+        }
+        assert!(
+            serde_json::from_str::<ToolRequest>(
+                r#"{"action":"exec","alias":"a","command":"cat","stdin":123}"#
+            )
+            .is_err()
+        );
+        let input = "中".repeat(ssh::MAX_STDIN_BYTES / 3 + 1);
+        let request: ToolRequest = serde_json::from_value(
+            serde_json::json!({"action":"exec","alias":"a","command":"cat","stdin":input}),
+        )
+        .unwrap();
+        assert_eq!(
+            validate_request_input(&request).unwrap_err().code,
+            "STDIN_TOO_LARGE"
+        );
+        for action in ["exec_many", "batch_exec"] {
+            let request: ToolRequest = serde_json::from_value(serde_json::json!({"action":action,"alias":"a","aliases":["a"],"command":"cat","commands":["cat"],"stdin":"data"})).unwrap();
+            assert_eq!(
+                validate_request_input(&request).unwrap_err().code,
+                "STDIN_UNSUPPORTED"
+            );
+        }
+    }
 
     #[test]
     fn rejects_implicit_all_host_batch() {
