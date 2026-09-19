@@ -28,6 +28,15 @@
 - Memory-only temporary secrets for API keys, tokens, and other values that should not be exposed to Codex.
 - A complete Codex Skill for host lookup, connection, authentication, and command execution.
 
+## What's new in 0.3.0
+
+- Host descriptions and tags: search and filter the list by notes or tags, and let Codex prefill them (`--description`, `--tag`). `list_hosts` returns both fields and accepts a `tags` filter, and `exec` accepts `stdin` for command input.
+- Redesigned window: a resizable host list with a compact header, host details grouped into Basic information / Connection / Authentication / SSH host key cards, and a fixed action bar for Test connection and Save.
+- Status bar and notifications: every outcome is shown in the bottom status bar, and warnings or errors also appear as a dismissible notice in the top-right corner.
+- Batch management: a selection bar with the selected count, Select all, Export and Delete appears below the toolbar; rows get checkboxes and `Esc` leaves the mode.
+- Import and export now open as dialogs that must be closed before continuing; all confirmation dialogs share one layout, with destructive actions highlighted.
+- Layout adapts to the window size: the form uses two columns from 1040 px wide and stacks labels above fields at the minimum window size; light and dark Windows themes are both supported.
+
 ## Installation
 
 ### Download a release
@@ -102,6 +111,7 @@ Enter:
 - User name
 - Protocol
 - Authentication method
+- Description and tags (optional)
 
 Then save the profile.
 
