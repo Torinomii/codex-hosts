@@ -21,7 +21,7 @@ use model::{Prefill, Protocol, SshAuth};
 
 fn main() {
     match parse_args(std::env::args().skip(1).collect()) {
-        Ok(LaunchMode::Gui(options)) => launch_gui(options),
+        Ok(LaunchMode::Gui(options)) => launch_gui(*options),
         Ok(LaunchMode::TemporarySecrets(session)) => {
             let _ = session;
             if !temporary_secrets::restore_existing(true) {
@@ -67,7 +67,7 @@ fn launch_gui(options: ui::LaunchOptions) {
 
 enum LaunchMode {
     TemporarySecrets(uuid::Uuid),
-    Gui(ui::LaunchOptions),
+    Gui(Box<ui::LaunchOptions>),
     Tool {
         request_path: PathBuf,
         result_path: PathBuf,
@@ -92,6 +92,8 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
         match flag {
             "--codex-edit" => options.codex_edit = true,
             "--alias" => options.prefill.alias = Some(next_value(&args, &mut index, flag)?),
+            "--description" => options.prefill.description = Some(next_value(&args, &mut index, flag)?),
+            "--tag" => options.prefill.tags.get_or_insert_with(Vec::new).push(next_value(&args, &mut index, flag)?),
             "--host" => options.prefill.address = Some(next_value(&args, &mut index, flag)?),
             "--port" => {
                 options.prefill.port = Some(
@@ -157,7 +159,7 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
             result_path: result_path.ok_or_else(|| "missing --tool-result".to_owned())?,
         });
     }
-    Ok(LaunchMode::Gui(options))
+    Ok(LaunchMode::Gui(Box::new(options)))
 }
 
 fn next_value(args: &[String], index: &mut usize, flag: &str) -> Result<String, String> {
@@ -179,6 +181,36 @@ impl From<Prefill> for ui::LaunchOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_prefill_distinguishes_omission_and_explicit_values() {
+        let args = [
+            "--codex-edit",
+            "--alias",
+            "example",
+            "--description",
+            " notes\n中文 ",
+            "--tag",
+            " Prod ",
+            "--tag",
+            "web",
+            "--tag",
+            "prod",
+        ];
+        let LaunchMode::Gui(options) =
+            parse_args(args.into_iter().map(str::to_owned).collect()).unwrap()
+        else {
+            panic!("expected editor")
+        };
+        let mut host = crate::model::HostProfile::default();
+        host.apply_prefill(&options.prefill);
+        assert_eq!(host.description, " notes\n中文 ");
+        assert_eq!(host.tags, ["Prod", "web"]);
+        let LaunchMode::Gui(options) = parse_args(vec![]).unwrap() else {
+            panic!("expected GUI")
+        };
+        assert!(options.prefill.description.is_none() && options.prefill.tags.is_none());
+    }
 
     #[test]
     fn fido_handle_cli_alias_selects_direct_key_file_route() {

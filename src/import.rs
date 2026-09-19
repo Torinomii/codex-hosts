@@ -5,11 +5,13 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::model::{HostProfile, Protocol, SshAuth, resolve_ssh_chain};
+use crate::model::{HostProfile, Protocol, SshAuth, normalize_tags, resolve_ssh_chain};
 
 #[derive(Debug)]
 struct ImportHost {
     alias: String,
+    description: String,
+    tags: Vec<String>,
     address: String,
     port: Option<u16>,
     username: String,
@@ -35,6 +37,8 @@ pub struct ImportBatch {
 
 #[derive(Debug, Error)]
 pub enum ImportError {
+    #[error("host {alias} has invalid tags; use a JSON array of strings")]
+    InvalidTags { alias: String },
     #[error("the template CSV is invalid: {0}")]
     Csv(#[from] csv::Error),
     #[error("the template is missing the required column: {0}")]
@@ -64,7 +68,7 @@ pub enum ImportError {
 }
 
 pub fn template_bytes() -> Vec<u8> {
-    b"\xEF\xBB\xBFalias,address,port,username,protocol,ssh_auth,private_key_path,agent_key_fingerprint,jump_host,password,key_passphrase\r\nexample,server.example.com,22,operator,ssh,password,,,,,\r\n".to_vec()
+    b"\xEF\xBB\xBFalias,address,port,username,protocol,ssh_auth,private_key_path,agent_key_fingerprint,jump_host,password,key_passphrase,description,tags\r\nexample,server.example.com,22,operator,ssh,password,,,,,,,[]\r\n".to_vec()
 }
 
 pub fn parse_template(
@@ -106,6 +110,8 @@ pub fn parse_template(
         let profile = HostProfile {
             id: Uuid::new_v4(),
             alias: alias.clone(),
+            description: item.description,
+            tags: item.tags,
             address: item.address.trim().to_owned(),
             port,
             username: item.username.trim().to_owned(),
@@ -196,6 +202,8 @@ pub fn export_bytes(selected: &[HostProfile], all_hosts: &[HostProfile]) -> csv:
             "host_key_first_seen_unix",
             "host_key_last_verified_unix",
             "verified",
+            "description",
+            "tags",
         ])?;
         for host in selected {
             let jump_alias = host
@@ -204,6 +212,9 @@ pub fn export_bytes(selected: &[HostProfile], all_hosts: &[HostProfile]) -> csv:
                 .map(|host| host.alias.as_str())
                 .unwrap_or_default();
             let alias = excel_safe_cell(&host.alias);
+            let description = excel_safe_cell(&host.description);
+            let tags = serde_json::to_string(&normalize_tags(&host.tags))
+                .expect("string arrays serialize without failure");
             let address = excel_safe_cell(&host.address);
             let username = excel_safe_cell(&host.username);
             let private_key_path = excel_safe_cell(&host.private_key_path);
@@ -232,6 +243,8 @@ pub fn export_bytes(selected: &[HostProfile], all_hosts: &[HostProfile]) -> csv:
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
                 if host.verified { "true" } else { "false" },
+                description.as_ref(),
+                &tags,
             ])?;
         }
         writer.flush()?;
@@ -241,6 +254,8 @@ pub fn export_bytes(selected: &[HostProfile], all_hosts: &[HostProfile]) -> csv:
 
 #[derive(Debug)]
 struct ImportColumns {
+    description: Option<usize>,
+    tags: Option<usize>,
     alias: usize,
     address: usize,
     port: Option<usize>,
@@ -262,6 +277,8 @@ impl ImportColumns {
             if !matches!(
                 name.as_str(),
                 "alias"
+                    | "description"
+                    | "tags"
                     | "address"
                     | "port"
                     | "username"
@@ -286,6 +303,8 @@ impl ImportColumns {
                 .ok_or(ImportError::MissingColumn(name))
         };
         Ok(Self {
+            description: known.get("description").copied(),
+            tags: known.get("tags").copied(),
             alias: required("alias")?,
             address: required("address")?,
             port: known.get("port").copied(),
@@ -345,6 +364,18 @@ impl ImportColumns {
             )
         };
         Ok(ImportHost {
+            description: decode_excel_safe_cell(raw_optional(self.description)).to_owned(),
+            tags: if raw_optional(self.tags).trim().is_empty() {
+                Vec::new()
+            } else {
+                normalize_tags(
+                    serde_json::from_str::<Vec<String>>(raw_optional(self.tags)).map_err(|_| {
+                        ImportError::InvalidTags {
+                            alias: alias.clone(),
+                        }
+                    })?,
+                )
+            },
             alias,
             address: value(self.address).to_owned(),
             port,
@@ -368,7 +399,7 @@ fn excel_safe_cell(value: &str) -> Cow<'_, str> {
     if value
         .as_bytes()
         .first()
-        .is_some_and(|byte| matches!(*byte, b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'))
+        .is_some_and(|byte| matches!(*byte, b'\'' | b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'))
     {
         Cow::Owned(format!("'{value}"))
     } else {
@@ -380,9 +411,9 @@ fn decode_excel_safe_cell(value: &str) -> &str {
     value
         .strip_prefix('\'')
         .filter(|rest| {
-            rest.as_bytes()
-                .first()
-                .is_some_and(|byte| matches!(*byte, b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r'))
+            rest.as_bytes().first().is_some_and(|byte| {
+                matches!(*byte, b'\'' | b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r')
+            })
         })
         .unwrap_or(value)
 }
@@ -407,6 +438,38 @@ fn strip_excel_prefix(bytes: &[u8]) -> (&[u8], u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_csv_round_trip_preserves_notes_and_punctuation() {
+        for description in [
+            "  中文\nsecond line\r\n",
+            "=SUM(1,2)",
+            "'quoted",
+            "'=literal",
+            "\tleading tab",
+        ] {
+            let host = HostProfile {
+                alias: "notes".into(),
+                address: "server".into(),
+                username: "user".into(),
+                description: description.into(),
+                tags: vec!["a,b".into(), "quote\"tag".into(), "prod".into()],
+                ..Default::default()
+            };
+            let bytes =
+                export_bytes(std::slice::from_ref(&host), std::slice::from_ref(&host)).unwrap();
+            let batch = parse_template(&bytes, &[]).unwrap();
+            assert_eq!(batch.hosts[0].profile.description, host.description);
+            assert_eq!(batch.hosts[0].profile.tags, host.tags);
+        }
+        let error = parse_template(
+            b"alias,address,username,tags\nx,server,user,not-json\n",
+            &[],
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error, ImportError::InvalidTags { .. }));
+    }
 
     #[test]
     fn built_in_template_is_importable_and_contains_no_credentials() {

@@ -387,6 +387,21 @@ See [`SKILL.md`](skill/codex-hosts/SKILL.md) for the full Codex behavior, workfl
 
 </details>
 
+## Host descriptions, tags and command input
+
+Hosts can store a multiline `description` and multiple `tags`. Add/remove tags in the editor; surrounding whitespace, empty tags and case-insensitive duplicates are removed, preserving the first spelling. Saving only metadata preserves connection verification and host-key trust. Search matches alias, address, username, notes and tags; selecting multiple tag filters requires all of them. Batch select-all applies only to visible hosts, and changing filters drops hidden selections.
+
+`list_hosts` includes both fields and accepts an optional `tags` array. Missing/empty filters return all hosts; unknown tags return no matches. Editor prefill supports `--description "notes"` and repeated `--tag prod --tag web`. Omitted fields preserve saved metadata; an empty description or a sole empty tag clears that field. CSV templates/import/export include optional `description` and `tags` columns; the tags cell is a JSON array such as `["prod","web"]` (CSV quoting applies). Legacy stores and CSV files remain supported.
+
+```json
+{"action":"list_hosts","tags":["prod","web"]}
+{"action":"exec","alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
+```
+
+Single-host SSH `exec` accepts optional UTF-8 `stdin`, up to 1 MiB. The client sends exact bytes without adding a newline, then EOF. Missing or `null` input keeps previous behavior; `""` sends EOF immediately. Input and output progress concurrently under the existing deadlines and output limits. A remote program can still exit before consuming all input; its exit status remains authoritative.
+
+`capabilities` advertises `exec_stdin`, `exec_stdin_protocols`, `max_stdin_bytes`, `host_metadata_fields` and `list_hosts_tag_filter`. Oversized input returns `STDIN_TOO_LARGE`; provided stdin for Telnet, `exec_many` or `batch_exec` returns `STDIN_UNSUPPORTED`. No command is automatically replayed.
+
 ## Execution limits
 
 Command execution is deliberately bounded to prevent excessive output or memory use.

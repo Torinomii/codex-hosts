@@ -19,7 +19,9 @@ use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
 use crate::i18n::Catalog;
 use crate::import;
-use crate::model::{HostProfile, Prefill, Protocol, SshAuth, can_use_as_jump};
+use crate::model::{
+    HostFilter, HostProfile, Prefill, Protocol, SshAuth, can_use_as_jump, normalize_tags,
+};
 use crate::ssh::{
     OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE, VerifiedHostKey,
 };
@@ -42,6 +44,7 @@ struct PendingCallback {
 }
 
 struct HostEditor {
+    tag_input: String,
     profile: HostProfile,
     original: HostProfile,
     password: Zeroizing<String>,
@@ -81,6 +84,7 @@ impl HostEditor {
             };
         Self {
             original: profile.clone(),
+            tag_input: String::new(),
             profile,
             password: Zeroizing::new(String::new()),
             key_passphrase: Zeroizing::new(String::new()),
@@ -98,6 +102,7 @@ impl HostEditor {
 
     fn has_unsaved_changes(&self) -> bool {
         self.profile != self.original
+            || !self.tag_input.trim().is_empty()
             || !self.password.is_empty()
             || !self.key_passphrase.is_empty()
             || self.password_mode != self.saved_password_mode.unwrap_or(PasswordMode::Password)
@@ -227,6 +232,7 @@ pub struct HostsApp {
     fido_setup_prompt: Option<FidoSetupPrompt>,
     batch_mode: bool,
     batch_selected: HashSet<Uuid>,
+    host_filter: HostFilter,
     batch_delete_prompt: bool,
     batch_export_window_open: bool,
     launch: LaunchOptions,
@@ -358,6 +364,7 @@ impl HostsApp {
             fido_setup_prompt: None,
             batch_mode: false,
             batch_selected: HashSet::new(),
+            host_filter: HostFilter::default(),
             batch_delete_prompt: false,
             batch_export_window_open: false,
             launch,
@@ -455,6 +462,12 @@ impl HostsApp {
         };
         let id = editor.profile.id;
         let mut profile = editor.profile.clone();
+        profile.tags = normalize_tags(
+            profile
+                .tags
+                .iter()
+                .chain(std::iter::once(&editor.tag_input)),
+        );
         profile.alias = profile.alias.trim().to_owned();
         profile.address = profile.address.trim().to_owned();
         profile.username = profile.username.trim().to_owned();
@@ -530,6 +543,7 @@ impl HostsApp {
         let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
         editor.profile = profile.clone();
         editor.original = profile;
+        editor.tag_input.clear();
         if store_password {
             editor.saved_password_mode = Some(editor.password_mode);
             editor.password_read_error = None;
@@ -999,11 +1013,11 @@ impl HostsApp {
     }
 
     fn toggle_batch_selection(&mut self) {
-        if batch_all_selected(&self.store.hosts, &self.batch_selected) {
-            self.batch_selected.clear();
-        } else {
-            self.batch_selected = self.store.hosts.iter().map(|host| host.id).collect();
-        }
+        toggle_visible_selection(
+            &self.store.hosts,
+            &self.host_filter,
+            &mut self.batch_selected,
+        );
     }
 
     fn cancel_batch_mode(&mut self) {
@@ -1300,6 +1314,11 @@ impl HostsApp {
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        retain_visible_selection(
+            &self.store.hosts,
+            &self.host_filter,
+            &mut self.batch_selected,
+        );
         let mut open_import = false;
         let mut test_all = false;
         let mut begin_batch = false;
@@ -1313,10 +1332,19 @@ impl HostsApp {
             |ui| {
                 ui.add_space(18.0);
                 if self.batch_mode {
-                    let all_selected = batch_all_selected(&self.store.hosts, &self.batch_selected);
+                    let visible = self
+                        .store
+                        .hosts
+                        .iter()
+                        .filter(|host| self.host_filter.matches(host))
+                        .collect::<Vec<_>>();
+                    let all_selected = !visible.is_empty()
+                        && visible
+                            .iter()
+                            .all(|host| self.batch_selected.contains(&host.id));
                     if ui
                         .add_enabled(
-                            !self.store.hosts.is_empty(),
+                            !visible.is_empty(),
                             egui::Button::new(self.catalog.text(if all_selected {
                                 "deselect_all"
                             } else {
@@ -1496,7 +1524,66 @@ impl HostsApp {
         ui.separator();
         ui.add_space(8.0);
 
-        let hosts = &self.store.hosts;
+        ui.add(
+            egui::TextEdit::singleline(&mut self.host_filter.search)
+                .hint_text(self.catalog.text("search_hosts"))
+                .desired_width(f32::INFINITY),
+        );
+        let mut available_tags = normalize_tags(
+            self.store
+                .hosts
+                .iter()
+                .flat_map(|host| host.tags.iter())
+                .chain(self.host_filter.tags.iter()),
+        );
+        available_tags.sort_by_key(|tag| tag.to_lowercase());
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("host_tag_filter")
+                .selected_text(format!(
+                    "{} ({})",
+                    self.catalog.text("filter_tags"),
+                    self.host_filter.tags.len()
+                ))
+                .show_ui(ui, |ui| {
+                    for tag in &available_tags {
+                        let mut checked = self
+                            .host_filter
+                            .tags
+                            .iter()
+                            .any(|selected| selected.to_lowercase() == tag.to_lowercase());
+                        if ui.checkbox(&mut checked, tag).changed() {
+                            if checked {
+                                self.host_filter.tags.push(tag.clone());
+                            } else {
+                                self.host_filter.tags.retain(|selected| {
+                                    selected.to_lowercase() != tag.to_lowercase()
+                                });
+                            }
+                        }
+                    }
+                });
+            if ui
+                .small_button(self.catalog.text("clear_filters"))
+                .clicked()
+            {
+                self.host_filter = HostFilter::default();
+            }
+        });
+        retain_visible_selection(
+            &self.store.hosts,
+            &self.host_filter,
+            &mut self.batch_selected,
+        );
+        ui.add_space(8.0);
+        let hosts = self
+            .store
+            .hosts
+            .iter()
+            .filter(|host| self.host_filter.matches(host))
+            .collect::<Vec<_>>();
+        if hosts.is_empty() {
+            ui.label(self.catalog.text("no_matching_hosts"));
+        }
         let selected_id = self.selected;
         let batch_mode = self.batch_mode;
         let batch_selected = &self.batch_selected;
@@ -1509,7 +1596,7 @@ impl HostsApp {
         egui::ScrollArea::vertical()
             .id_salt("host_list_scroll")
             .auto_shrink([false, false])
-            .show_rows(ui, 62.0, hosts.len(), |ui, row_range| {
+            .show_rows(ui, 82.0, hosts.len(), |ui, row_range| {
                 ui.set_width(ui.available_width());
                 for row in row_range {
                     let host = &hosts[row];
@@ -1534,14 +1621,17 @@ impl HostsApp {
                                 ""
                             };
                             let text = RichText::new(format!(
-                                "{}\n{} · {}:{}{}",
+                                "{}\n{} · {}:{}{}\n{}",
                                 host.alias,
                                 host.protocol.stable_name().to_ascii_uppercase(),
                                 host.address,
                                 host.port,
-                                verified_marker
+                                verified_marker,
+                                host.tags.join(" · ")
                             ))
                             .line_height(Some(20.0));
+                            // Preserve the explicit alias/details/tags rows. Button::truncate()
+                            // limits the whole galley to one row in egui 0.35.
                             let mut button = egui::Button::new(()).left_text(text);
                             if let Some(fill) = host_row_fill(test_state) {
                                 button = button.fill(fill);
@@ -1549,7 +1639,7 @@ impl HostsApp {
                             if selected {
                                 button = button.stroke(egui::Stroke::new(2.0, SELECTED_ROW_STROKE));
                             }
-                            let size = [ui.available_width(), 62.0];
+                            let size = [ui.available_width(), 82.0];
                             ui.scope(|ui| {
                                 ui.spacing_mut().button_padding.x = 12.0;
                                 ui.add_sized(size, button)
@@ -1557,6 +1647,11 @@ impl HostsApp {
                             .inner
                         })
                         .inner;
+                    let response = response.on_hover_text(format!(
+                        "{}\n{}",
+                        host.description,
+                        host.tags.join(", ")
+                    ));
                     if response.clicked() || response.secondary_clicked() {
                         if batch_mode {
                             batch_toggle_request = Some((id, !batch_selected.contains(&id)));
@@ -1637,6 +1732,54 @@ impl HostsApp {
                                 egui::TextEdit::singleline(&mut editor.profile.alias)
                                     .desired_width(420.0),
                             );
+                            ui.end_row();
+
+                            form_label(ui, catalog.text("description"));
+                            ui.add(
+                                egui::TextEdit::multiline(&mut editor.profile.description)
+                                    .desired_width(420.0)
+                                    .desired_rows(3),
+                            );
+                            ui.end_row();
+
+                            form_label(ui, catalog.text("tags"));
+                            ui.vertical(|ui| {
+                                ui.set_max_width(420.0);
+                                let mut remove = None;
+                                ui.horizontal_wrapped(|ui| {
+                                    for (index, tag) in editor.profile.tags.iter().enumerate() {
+                                        if ui
+                                            .add(
+                                                egui::Button::new(format!("{tag} ×"))
+                                                    .small()
+                                                    .truncate(),
+                                            )
+                                            .clicked()
+                                        {
+                                            remove = Some(index);
+                                        }
+                                    }
+                                });
+                                if let Some(index) = remove {
+                                    editor.profile.tags.remove(index);
+                                }
+                                ui.horizontal(|ui| {
+                                    let input = ui.add(
+                                        egui::TextEdit::singleline(&mut editor.tag_input)
+                                            .hint_text(catalog.text("tag_hint"))
+                                            .desired_width(260.0),
+                                    );
+                                    let enter = input.lost_focus()
+                                        && ui.input(|state| state.key_pressed(egui::Key::Enter));
+                                    if ui.button(catalog.text("add_tag")).clicked() || enter {
+                                        editor
+                                            .profile
+                                            .tags
+                                            .push(std::mem::take(&mut editor.tag_input));
+                                        editor.profile.tags = normalize_tags(&editor.profile.tags);
+                                    }
+                                });
+                            });
                             ui.end_row();
 
                             form_label(ui, catalog.text("address"));
@@ -2776,8 +2919,39 @@ fn batch_has_external_dependents(hosts: &[HostProfile], selected: &HashSet<Uuid>
     })
 }
 
+#[cfg(test)]
 fn batch_all_selected(hosts: &[HostProfile], selected: &HashSet<Uuid>) -> bool {
     !hosts.is_empty() && hosts.iter().all(|host| selected.contains(&host.id))
+}
+
+fn retain_visible_selection(
+    hosts: &[HostProfile],
+    filter: &HostFilter,
+    selected: &mut HashSet<Uuid>,
+) {
+    let visible = hosts
+        .iter()
+        .filter(|host| filter.matches(host))
+        .map(|host| host.id)
+        .collect::<HashSet<_>>();
+    selected.retain(|id| visible.contains(id));
+}
+
+fn toggle_visible_selection(
+    hosts: &[HostProfile],
+    filter: &HostFilter,
+    selected: &mut HashSet<Uuid>,
+) {
+    let visible = hosts
+        .iter()
+        .filter(|host| filter.matches(host))
+        .map(|host| host.id)
+        .collect::<HashSet<_>>();
+    if !visible.is_empty() && visible.iter().all(|id| selected.contains(id)) {
+        selected.clear();
+    } else {
+        *selected = visible;
+    }
 }
 
 fn form_label(ui: &mut egui::Ui, text: &str) {
@@ -2838,6 +3012,183 @@ pub(crate) fn configure_fonts(context: &egui::Context, locale: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_test_app(context: &egui::Context, locale: &str, profile: HostProfile) -> HostsApp {
+        let editor = HostEditor {
+            tag_input: String::new(),
+            profile: profile.clone(),
+            original: profile.clone(),
+            password: Zeroizing::new(String::new()),
+            key_passphrase: Zeroizing::new(String::new()),
+            password_mode: PasswordMode::Password,
+            saved_password_mode: None,
+            password_read_error: None,
+            has_key_passphrase: false,
+            key_passphrase_read_error: None,
+        };
+        let mut store = HostStore::default();
+        store.hosts.push(profile.clone());
+        HostsApp {
+            temporary: None,
+            tray: None,
+            exiting: false,
+            hidden: false,
+            tray_available: false,
+            host_refresh_pending: false,
+            store,
+            catalog: Catalog::for_locale(Some(locale)),
+            selected: Some(profile.id),
+            editor: Some(editor),
+            status: String::new(),
+            test_operations: HashMap::new(),
+            pending_tests: VecDeque::new(),
+            test_hosts_snapshot: None,
+            test_states: HashMap::new(),
+            testing_all: false,
+            test_store_dirty: false,
+            repaint_context: context.clone(),
+            fingerprint_prompt: None,
+            delete_prompt: false,
+            import_window_open: false,
+            import_cleanup_prompt: None,
+            fido_setup_prompt: None,
+            batch_mode: false,
+            batch_selected: HashSet::new(),
+            host_filter: HostFilter::default(),
+            batch_delete_prompt: false,
+            batch_export_window_open: false,
+            launch: LaunchOptions::default(),
+            callback_written: false,
+            pending_callback: None,
+        }
+    }
+
+    #[test]
+    fn metadata_controls_render_in_all_locales_without_overlapping() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            configure_fonts(&context, locale);
+            let profile = HostProfile {
+                alias: "example".into(),
+                description: "metadata notes\nsecond line".into(),
+                tags: vec!["prod".into(), "web".into()],
+                ..Default::default()
+            };
+            let mut app = metadata_test_app(&context, locale, profile);
+            fn find_text(shape: &egui::Shape, text: &str) -> Option<egui::Rect> {
+                match shape {
+                    egui::Shape::Text(shape) if shape.galley.job.text == text => {
+                        Some(shape.galley.rect.translate(shape.pos.to_vec2()))
+                    }
+                    egui::Shape::Vec(shapes) => {
+                        shapes.iter().find_map(|shape| find_text(shape, text))
+                    }
+                    _ => None,
+                }
+            }
+            for frame in 0..3 {
+                let output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(1040.0, 760.0),
+                        )),
+                        time: Some(frame as f64 * 0.1),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        ui.set_max_width(690.0);
+                        app.editor_panel(ui, &context);
+                    },
+                );
+                if frame > 0 {
+                    let rect = |text| {
+                        output
+                            .shapes
+                            .iter()
+                            .find_map(|shape| find_text(&shape.shape, text))
+                            .unwrap_or_else(|| panic!("missing {locale} label {text}"))
+                    };
+                    let description = rect(app.catalog.text("description"));
+                    let tags = rect(app.catalog.text("tags"));
+                    let chip = rect("prod ×");
+                    assert!(tags.top() > description.bottom());
+                    assert!(chip.left() > tags.right());
+                    assert!(chip.right() < 690.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn host_row_keeps_alias_details_and_tags_on_separate_lines() {
+        let context = egui::Context::default();
+        configure_fonts(&context, "en");
+        let profile = HostProfile {
+            alias: "example".into(),
+            address: "server.example.com".into(),
+            port: 22,
+            verified: true,
+            tags: vec!["prod".into(), "web".into()],
+            ..Default::default()
+        };
+        let mut app = metadata_test_app(&context, "en", profile);
+        for frame in 0..3 {
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(340.0, 400.0),
+                    )),
+                    time: Some(frame as f64 * 0.1),
+                    ..Default::default()
+                },
+                |ui| app.sidebar(ui),
+            );
+            if frame > 0 {
+                fn host_rows(shape: &egui::Shape) -> Option<usize> {
+                    match shape {
+                        egui::Shape::Text(text)
+                            if text.galley.job.text
+                                == "example\nSSH · server.example.com:22  ✓\nprod · web" =>
+                        {
+                            Some(text.galley.rows.len())
+                        }
+                        egui::Shape::Vec(shapes) => shapes.iter().find_map(host_rows),
+                        _ => None,
+                    }
+                }
+                let rows = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| host_rows(&shape.shape))
+                    .expect("the complete host row must be painted");
+                assert_eq!(rows, 3, "host metadata rows must remain visible");
+            }
+        }
+    }
+
+    #[test]
+    fn filtered_bulk_selection_never_keeps_hidden_hosts() {
+        let visible = HostProfile {
+            tags: vec!["prod".into()],
+            ..Default::default()
+        };
+        let hidden = HostProfile::default();
+        let filter = crate::model::HostFilter {
+            search: String::new(),
+            tags: vec!["PROD".into()],
+        };
+        let hosts = vec![visible.clone(), hidden.clone()];
+        let mut selected = HashSet::from([hidden.id]);
+        toggle_visible_selection(&hosts, &filter, &mut selected);
+        assert_eq!(selected, HashSet::from([visible.id]));
+        toggle_visible_selection(&hosts, &filter, &mut selected);
+        assert!(selected.is_empty());
+        selected.extend([visible.id, hidden.id]);
+        retain_visible_selection(&hosts, &filter, &mut selected);
+        assert_eq!(selected, HashSet::from([visible.id]));
+    }
 
     #[test]
     fn refresh_preserves_dirty_drafts_and_reloads_clean_or_deleted_hosts() {
@@ -2933,6 +3284,7 @@ mod tests {
             ..HostProfile::default()
         };
         let mut editor = HostEditor {
+            tag_input: String::new(),
             profile: profile.clone(),
             original: profile,
             password: Zeroizing::new(String::new()),

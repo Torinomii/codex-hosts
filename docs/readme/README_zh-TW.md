@@ -393,6 +393,21 @@ Tool 模式透過 UTF-8 JSON 要求檔案與結果檔案通訊，兩者都不得
 
 </details>
 
+## 主機備註、標籤與命令輸入
+
+主機支援多行 `description` 備註與多個 `tags` 標籤。編輯器可新增、移除標籤；標籤會去除前後空白、空項及不分大小寫的重複項，保留首次輸入的寫法。僅修改備註或標籤不會清除連線驗證與主機金鑰信任。搜尋涵蓋別名、位址、使用者名稱、備註及標籤；多個標籤篩選條件必須全部符合。批次全選只選取可見主機，切換篩選會移除隱藏主機的選取。
+
+`list_hosts` 傳回這兩個欄位，並接受選用的 `tags` 陣列。省略或空陣列會傳回全部主機；不存在的標籤會傳回空清單。編輯器預填支援 `--description "備註"` 及重複的 `--tag prod --tag web`。省略欄位保留原值；空備註或單個空標籤可清空對應欄位。CSV 範本及匯入匯出新增選用的 `description`、`tags` 欄；標籤儲存格使用 `["prod","web"]` 這類 JSON 陣列，依 CSV 規則引用。舊設定與 CSV 仍可使用。
+
+```json
+{"action":"list_hosts","tags":["prod","web"]}
+{"action":"exec","alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
+```
+
+單主機 SSH `exec` 支援選用的 UTF-8 `stdin`，上限為 1 MiB。用戶端原樣傳送，不自行加入換行，完成後傳送 EOF。省略或 `null` 保留原有行為；`""` 立即傳送 EOF。輸入傳送與輸出讀取同時進行，沿用原有逾時及輸出限制。遠端程式可在讀完輸入前結束，此時以遠端結束狀態為準。
+
+`capabilities` 傳回 `exec_stdin`、`exec_stdin_protocols`、`max_stdin_bytes`、`host_metadata_fields` 及 `list_hosts_tag_filter`。輸入過大傳回 `STDIN_TOO_LARGE`；對 Telnet、`exec_many` 或 `batch_exec` 提供 stdin 會傳回 `STDIN_UNSUPPORTED`。程式不會自動重播命令。
+
 ## 執行限制
 
 為了避免異常命令產生無限輸出或占用過多記憶體，命令執行有明確限制。

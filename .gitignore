@@ -3,7 +3,3 @@
 /bin/*.exe
 *.pdb
 *.tmp
-*.bak
-assist.md
-docs/history-session/
-tests/
