@@ -84,6 +84,24 @@ pub async fn execute_with_input_async(
     }
 }
 
+pub async fn execute_many_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    commands: &[String],
+    max_concurrency: usize,
+    limits: OperationLimits,
+) -> Result<RemoteManyResult, RemoteFailure> {
+    match profile.protocol {
+        Protocol::Ssh => {
+            ssh::execute_many_bounded(profile, hosts, commands, max_concurrency, limits).await
+        }
+        Protocol::Telnet => Err(RemoteFailure::new(
+            "SSH_REQUIRED",
+            "exec_many is available only for SSH hosts.",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

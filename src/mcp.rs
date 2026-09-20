@@ -9,13 +9,18 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 use crate::connection;
 use crate::fido;
 use crate::ssh::{self, OperationLimits, RemoteFailure};
 use crate::storage::HostStore;
-use crate::tool::{self, AgentIdentitiesResult, FidoIdentitiesResult, SCHEMA_VERSION};
+use crate::tool::{
+    self, AgentIdentitiesResult, DEFAULT_BATCH_CONCURRENCY, FidoIdentitiesResult,
+    MAX_BATCH_CONCURRENCY, MAX_BATCH_OUTPUT_BYTES, SCHEMA_VERSION,
+};
 
 /// Authentication may involve a hardware touch or PIN, so the default leaves room for it.
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -62,6 +67,53 @@ struct ProbeParams {
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
     /// Bounds the remote `hostname` command.
+    #[serde(default)]
+    command_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExecParams {
+    /// Saved host alias.
+    alias: String,
+    /// The exact command line to run on the remote host; sent as-is, never rewritten.
+    command: String,
+    /// Bounds connection and authentication; leave room for a hardware touch or PIN.
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    /// Bounds the remote command; defaults to 10 minutes.
+    #[serde(default)]
+    command_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExecStdinParams {
+    /// Saved SSH host alias (Telnet has no separate input channel).
+    alias: String,
+    /// The exact command line to run on the remote host; sent as-is, never rewritten.
+    command: String,
+    /// Exact UTF-8 text written to the command's stdin (up to 1 MiB, no newline added), then EOF.
+    stdin: String,
+    /// Bounds connection and authentication.
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    /// Bounds the remote command; defaults to 10 minutes.
+    #[serde(default)]
+    command_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExecManyParams {
+    /// Saved SSH host alias.
+    alias: String,
+    /// 2 to 64 independent short commands, run concurrently over one authenticated connection.
+    commands: Vec<String>,
+    /// Concurrent channels on the connection (1-16, default 8).
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+    /// Bounds connection and authentication.
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    /// Bounds each command; defaults to 10 minutes.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
 }
@@ -119,8 +171,76 @@ impl Server {
         description = "Connect to one saved host, authenticate, and run `hostname`. Use it to test a host, to surface an unknown or changed SSH host key (the failure carries observed_fingerprint and observed_algorithm for the editor), or to pre-authenticate a host. Success updates the local trust metadata (verified) for that host.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
-    async fn probe(&self, Parameters(params): Parameters<ProbeParams>) -> CallToolResult {
-        finish(probe_host(params).await)
+    async fn probe(
+        &self,
+        Parameters(params): Parameters<ProbeParams>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(cancellable(ct, probe_host(params)).await)
+    }
+
+    #[tool(
+        name = "exec",
+        description = "Run one command on a saved SSH or Telnet host and return its exit code and captured output (up to 1 MiB). The command is sent exactly as given. Telnet returns the login transcript with exit_code 0 even when the command failed, so judge from the output. Never retry automatically: the command may not be idempotent.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn exec(
+        &self,
+        Parameters(params): Parameters<ExecParams>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(cancellable(ct, exec_host(params, None)).await)
+    }
+
+    #[tool(
+        name = "exec_stdin",
+        description = "Run one command on a saved SSH host with exact UTF-8 text on its stdin (for example `python3 -` with a script). The program text is opaque to policy review, which is why this is a separate tool. Same result shape and rules as exec.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn exec_stdin(
+        &self,
+        Parameters(params): Parameters<ExecStdinParams>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        let ExecStdinParams {
+            alias,
+            command,
+            stdin,
+            connect_timeout_ms,
+            command_timeout_ms,
+        } = params;
+        let params = ExecParams {
+            alias,
+            command,
+            connect_timeout_ms,
+            command_timeout_ms,
+        };
+        finish(cancellable(ct, exec_host(params, Some(stdin))).await)
+    }
+
+    #[tool(
+        name = "exec_many",
+        description = "Run 2 to 64 independent short commands concurrently on one saved SSH host over a single authenticated connection (one hardware touch for the whole set). Results keep input order. Use it to bundle status checks instead of separate calls.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn exec_many(
+        &self,
+        Parameters(params): Parameters<ExecManyParams>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(cancellable(ct, exec_many_host(params)).await)
     }
 }
 
@@ -148,6 +268,58 @@ async fn probe_host(params: ProbeParams) -> Result<ssh::RemoteResult, RemoteFail
     .await?;
     tool::merge_verified_host_keys(&store.hosts, &result.verified_host_keys)?;
     Ok(result)
+}
+
+async fn exec_host(
+    params: ExecParams,
+    stdin: Option<String>,
+) -> Result<ssh::RemoteResult, RemoteFailure> {
+    let store = load_store()?;
+    let host = tool::find_host(&store, &params.alias)?.clone();
+    tool::validate_profile(&host)?;
+    connection::execute_with_input_async(
+        &host,
+        &store.hosts,
+        &params.command,
+        stdin.as_deref(),
+        mcp_limits(params.connect_timeout_ms, params.command_timeout_ms),
+    )
+    .await
+}
+
+async fn exec_many_host(params: ExecManyParams) -> Result<ssh::RemoteManyResult, RemoteFailure> {
+    tool::validate_commands(&params.commands)?;
+    let store = load_store()?;
+    let host = tool::find_host(&store, &params.alias)?.clone();
+    tool::validate_profile(&host)?;
+    let concurrency = params
+        .max_concurrency
+        .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
+        .clamp(1, MAX_BATCH_CONCURRENCY);
+    let mut limits = mcp_limits(params.connect_timeout_ms, params.command_timeout_ms);
+    limits.output_bytes = Some(MAX_BATCH_OUTPUT_BYTES);
+    let mut result =
+        connection::execute_many_async(&host, &store.hosts, &params.commands, concurrency, limits)
+            .await?;
+    tool::fit_many_result_budget(&mut result, MAX_BATCH_OUTPUT_BYTES)?;
+    Ok(result)
+}
+
+/// Dropping the operation future on cancellation releases its channel, pooled
+/// session, and hardware lock; a remote command that already started may keep
+/// running, which the result says explicitly.
+async fn cancellable<T, F>(ct: CancellationToken, operation: F) -> Result<T, RemoteFailure>
+where
+    F: Future<Output = Result<T, RemoteFailure>>,
+{
+    tokio::select! {
+        biased;
+        _ = ct.cancelled() => Err(RemoteFailure::new(
+            "CANCELLED",
+            "The call was cancelled before it finished; a remote command that already started may still be running.",
+        )),
+        outcome = operation => outcome,
+    }
 }
 
 fn load_store() -> Result<HostStore, RemoteFailure> {
@@ -231,17 +403,29 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["agent_identities", "fido_identities", "list_hosts", "probe"]
+            [
+                "agent_identities",
+                "exec",
+                "exec_many",
+                "exec_stdin",
+                "fido_identities",
+                "list_hosts",
+                "probe"
+            ]
         );
         for tool in &tools {
             let annotations = tool.annotations.as_ref().expect("annotations");
-            assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+            let name = tool.name.as_ref();
+            let executes = name.starts_with("exec");
+            assert_eq!(annotations.read_only_hint, Some(!executes), "{name}");
             assert_eq!(
                 annotations.open_world_hint,
-                Some(tool.name.as_ref() == "probe"),
-                "{}",
-                tool.name
+                Some(executes || name == "probe"),
+                "{name}"
             );
+            if executes {
+                assert_eq!(annotations.destructive_hint, Some(true), "{name}");
+            }
         }
     }
 
@@ -267,6 +451,21 @@ mod tests {
         let explicit = mcp_limits(Some(5000), Some(1000));
         assert_eq!(explicit.connect_timeout, Some(Duration::from_secs(5)));
         assert_eq!(explicit.command_timeout, Some(Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn cancellation_returns_a_structured_failure_and_drops_the_operation() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let ct = CancellationToken::new();
+        ct.cancel();
+        let outcome = runtime.block_on(cancellable(ct, async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<(), RemoteFailure>(())
+        }));
+        assert_eq!(outcome.unwrap_err().code, "CANCELLED");
     }
 
     #[test]

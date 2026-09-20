@@ -21,9 +21,7 @@ use tokio::task::JoinSet;
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0};
 #[cfg(windows)]
-use windows_sys::Win32::System::Threading::{
-    CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject,
-};
+use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
 use crate::credentials::{self, CredentialKind};
 use crate::fido;
@@ -581,9 +579,25 @@ impl Drop for CrossProcessHardwareGuard {
     }
 }
 
+/// Waits in short slices so a blocking wait abandoned by a cancelled or timed-out
+/// caller stops instead of holding a thread until the mutex frees up.
+#[cfg(windows)]
+const HARDWARE_LOCK_WAIT_SLICE_MS: u32 = 500;
+
 #[cfg(windows)]
 async fn acquire_cross_process_hardware_lock() -> Result<CrossProcessHardwareGuard, RemoteFailure> {
-    tokio::task::spawn_blocking(|| {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+
+    struct Interest(Arc<AtomicBool>);
+    impl Drop for Interest {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let _interest = Interest(Arc::clone(&abandoned));
+    tokio::task::spawn_blocking(move || {
         let name = "Local\\codex-hosts-hardware-auth-v1\0"
             .encode_utf16()
             .collect::<Vec<_>>();
@@ -594,17 +608,26 @@ async fn acquire_cross_process_hardware_lock() -> Result<CrossProcessHardwareGua
                 std::io::Error::last_os_error().to_string(),
             ));
         }
-        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        loop {
+            let wait = unsafe { WaitForSingleObject(handle, HARDWARE_LOCK_WAIT_SLICE_MS) };
+            if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+                return Ok(CrossProcessHardwareGuard(handle as usize));
+            }
+            if wait == WAIT_TIMEOUT && !abandoned.load(Ordering::Acquire) {
+                continue;
+            }
             unsafe {
                 CloseHandle(handle);
             }
             return Err(RemoteFailure::new(
                 "HARDWARE_AUTH_LOCK_FAILED",
-                format!("Windows hardware-authentication lock wait failed with code {wait}."),
+                if wait == WAIT_TIMEOUT {
+                    "The caller stopped waiting for the hardware-authentication lock.".to_owned()
+                } else {
+                    format!("Windows hardware-authentication lock wait failed with code {wait}.")
+                },
             ));
         }
-        Ok(CrossProcessHardwareGuard(handle as usize))
     })
     .await
     .map_err(|error| RemoteFailure::new("HARDWARE_AUTH_LOCK_FAILED", error.to_string()))?
