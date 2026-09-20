@@ -97,6 +97,18 @@ target\release\codex-hosts.exe
 
 建置完成後，將它放入 Skill 的 `bin` 目錄即可。
 
+### 連結本機原始碼目錄
+
+若在固定路徑的本機原始碼目錄中開發，可安裝軟連結，之後每次建置都不必再複製：
+
+```powershell
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1
+```
+
+此指令碼會把已安裝的 `SKILL.md`、`agents` 與 `references` 連結到 `skill\codex-hosts`，並把已安裝的 `bin\codex-hosts.exe` 直接連結到 `target\release\codex-hosts.exe`。替換現有安裝前會驗證所有來源，安裝後會核對連結目標；若安裝失敗，則還原原有安裝。可隨時再次執行以驗證相同配置。目前的 Windows 使用者必須有建立符號連結的權限。
+
+此連結方式只適用於本機原始碼目錄。從 Release 壓縮檔安裝時，仍請使用上方的複製方式。
+
 ## 快速上手
 
 ### 1. 新增主機

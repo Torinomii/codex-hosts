@@ -97,6 +97,18 @@ target\release\codex-hosts.exe
 
 Place it in the Skill's `bin` directory after the build completes.
 
+### Link a local source checkout
+
+When developing from a stable local checkout, install symbolic links instead of copying after every build:
+
+```powershell
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1
+```
+
+The script links `SKILL.md`, `agents`, and `references` to `skill\codex-hosts`, and links the installed `bin\codex-hosts.exe` directly to `target\release\codex-hosts.exe`. It validates all sources before replacing an existing installation, verifies the final targets, and rolls back if installation fails. Run it again at any time to verify the same layout. Windows must permit symbolic-link creation for the current user.
+
+This linked workflow is for a local source checkout. Keep using the copy-based steps above for downloaded release archives.
+
 ## Quick start
 
 ### 1. Add a host

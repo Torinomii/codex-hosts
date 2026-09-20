@@ -3,3 +3,35 @@
 /bin/*.exe
 *.pdb
 *.tmp
+
+# codex-workflow-managed-start
+.codex_workflow_hidden_resources/
+AGENTS.md
+# codex-workflow-managed-end
+
+# workflow-local-ignore-start
+/AGENTS.md
+/AGENTS.override.md
+/agent_docs/
+/.codex_workflow_hidden_resources/
+/.codex_workflow_hidden_resource/
+/.codex-local/
+/artifacts/codex-workflow-*/
+/Codex_Workflow/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+/htmlcov/
+/coverage/
+/playwright-report/
+/test-results/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/target/
+# workflow-local-ignore-end

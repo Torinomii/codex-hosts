@@ -1,0 +1,272 @@
+[CmdletBinding()]
+param(
+    [string]$RepositoryRoot,
+    [string]$CodexHome
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+function Get-NormalizedPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [string]$BasePath = (Get-Location).Path
+    )
+
+    $candidate = if ([System.IO.Path]::IsPathRooted($Path)) {
+        $Path
+    }
+    else {
+        [System.IO.Path]::Combine($BasePath, $Path)
+    }
+
+    $trimCharacters = [char[]]@(
+        [System.IO.Path]::DirectorySeparatorChar,
+        [System.IO.Path]::AltDirectorySeparatorChar
+    )
+    return [System.IO.Path]::GetFullPath($candidate).TrimEnd($trimCharacters)
+}
+
+function Get-ExistingItem {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LiteralPath
+    )
+
+    return (Get-Item -LiteralPath $LiteralPath -Force -ErrorAction SilentlyContinue)
+}
+
+function Get-LinkTargetPath {
+    param(
+        [Parameter(Mandatory)]
+        [System.IO.FileSystemInfo]$Item
+    )
+
+    if ($Item.LinkType -ne 'SymbolicLink') {
+        return $null
+    }
+
+    $targetValue = @($Item.Target)[0]
+    if ([string]::IsNullOrWhiteSpace($targetValue)) {
+        return $null
+    }
+
+    $parentPath = Split-Path -Parent $Item.FullName
+    return (Get-NormalizedPath -Path $targetValue -BasePath $parentPath)
+}
+
+function Test-ExpectedLink {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LinkPath,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedTarget
+    )
+
+    $item = Get-ExistingItem -LiteralPath $LinkPath
+    if ($null -eq $item) {
+        return $false
+    }
+
+    $actualTarget = Get-LinkTargetPath -Item $item
+    if ($null -eq $actualTarget) {
+        return $false
+    }
+
+    return $actualTarget.Equals(
+        (Get-NormalizedPath -Path $ExpectedTarget),
+        [System.StringComparison]::OrdinalIgnoreCase
+    )
+}
+
+function Assert-ExpectedLayout {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LayoutRoot,
+
+        [Parameter(Mandatory)]
+        [object[]]$Mappings
+    )
+
+    foreach ($mapping in $Mappings) {
+        $linkPath = Join-Path $LayoutRoot $mapping.RelativePath
+        if (-not (Test-ExpectedLink -LinkPath $linkPath -ExpectedTarget $mapping.Target)) {
+            throw "Symbolic link verification failed: '$linkPath' must target '$($mapping.Target)'."
+        }
+    }
+}
+
+function Assert-SafeSiblingPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedParent,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedNamePrefix
+    )
+
+    $fullPath = Get-NormalizedPath -Path $Path
+    $parent = Get-NormalizedPath -Path (Split-Path -Parent $fullPath)
+    $name = Split-Path -Leaf $fullPath
+
+    if (-not $parent.Equals($ExpectedParent, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to modify path outside '$ExpectedParent': '$fullPath'."
+    }
+
+    if (-not $name.StartsWith($ExpectedNamePrefix, [System.StringComparison]::Ordinal)) {
+        throw "Refusing to modify unexpected sibling path: '$fullPath'."
+    }
+}
+
+function Remove-ExactTree {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedParent,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedNamePrefix
+    )
+
+    Assert-SafeSiblingPath -Path $Path -ExpectedParent $ExpectedParent -ExpectedNamePrefix $ExpectedNamePrefix
+    if ($null -ne (Get-ExistingItem -LiteralPath $Path)) {
+        Remove-Item -LiteralPath $Path -Recurse -Force
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
+    $RepositoryRoot = Split-Path -Parent $PSScriptRoot
+}
+$RepositoryRoot = Get-NormalizedPath -Path $RepositoryRoot
+
+if ([string]::IsNullOrWhiteSpace($CodexHome)) {
+    if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
+        $CodexHome = $env:CODEX_HOME
+    }
+    else {
+        $CodexHome = Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex'
+    }
+}
+$CodexHome = Get-NormalizedPath -Path $CodexHome
+
+$skillSource = Join-Path $RepositoryRoot 'skill\codex-hosts'
+$releaseExecutable = Join-Path $RepositoryRoot 'target\release\codex-hosts.exe'
+$skillFile = Join-Path $skillSource 'SKILL.md'
+$agentsDirectory = Join-Path $skillSource 'agents'
+$referencesDirectory = Join-Path $skillSource 'references'
+
+foreach ($requiredDirectory in @($RepositoryRoot, $skillSource, $agentsDirectory, $referencesDirectory)) {
+    if (-not (Test-Path -LiteralPath $requiredDirectory -PathType Container)) {
+        throw "Required directory does not exist: '$requiredDirectory'."
+    }
+}
+
+foreach ($requiredFile in @($skillFile, $releaseExecutable)) {
+    if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
+        throw "Required file does not exist: '$requiredFile'."
+    }
+}
+
+if ((Get-Item -LiteralPath $releaseExecutable -Force).Length -le 0) {
+    throw "Release executable is empty: '$releaseExecutable'."
+}
+
+$skillsRoot = Get-NormalizedPath -Path (Join-Path $CodexHome 'skills')
+$installedSkill = Join-Path $skillsRoot 'codex-hosts'
+Assert-SafeSiblingPath -Path $installedSkill -ExpectedParent $skillsRoot -ExpectedNamePrefix 'codex-hosts'
+
+$mappings = @(
+    [pscustomobject]@{ RelativePath = 'SKILL.md'; Target = $skillFile },
+    [pscustomobject]@{ RelativePath = 'agents'; Target = $agentsDirectory },
+    [pscustomobject]@{ RelativePath = 'references'; Target = $referencesDirectory },
+    [pscustomobject]@{ RelativePath = 'bin\codex-hosts.exe'; Target = $releaseExecutable }
+)
+
+$alreadyCorrect = $null -ne (Get-ExistingItem -LiteralPath $installedSkill)
+if ($alreadyCorrect) {
+    foreach ($mapping in $mappings) {
+        $linkPath = Join-Path $installedSkill $mapping.RelativePath
+        if (-not (Test-ExpectedLink -LinkPath $linkPath -ExpectedTarget $mapping.Target)) {
+            $alreadyCorrect = $false
+            break
+        }
+    }
+}
+
+if ($alreadyCorrect) {
+    Write-Output "Linked codex-hosts Skill is already current: $installedSkill"
+    foreach ($mapping in $mappings) {
+        Write-Output "Verified: $($mapping.RelativePath) -> $($mapping.Target)"
+    }
+    return
+}
+
+New-Item -ItemType Directory -Path $skillsRoot -Force | Out-Null
+
+$operationId = [Guid]::NewGuid().ToString('N')
+$stagingPath = Join-Path $skillsRoot ".codex-hosts.install-$operationId"
+$backupPath = Join-Path $skillsRoot ".codex-hosts.backup-$operationId"
+Assert-SafeSiblingPath -Path $stagingPath -ExpectedParent $skillsRoot -ExpectedNamePrefix '.codex-hosts.install-'
+Assert-SafeSiblingPath -Path $backupPath -ExpectedParent $skillsRoot -ExpectedNamePrefix '.codex-hosts.backup-'
+
+$previousMoved = $false
+$newInstalled = $false
+
+try {
+    New-Item -ItemType Directory -Path $stagingPath | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $stagingPath 'bin') | Out-Null
+
+    foreach ($mapping in $mappings) {
+        $linkPath = Join-Path $stagingPath $mapping.RelativePath
+        New-Item -ItemType SymbolicLink -Path $linkPath -Target $mapping.Target | Out-Null
+    }
+
+    Assert-ExpectedLayout -LayoutRoot $stagingPath -Mappings $mappings
+
+    if ($null -ne (Get-ExistingItem -LiteralPath $installedSkill)) {
+        Move-Item -LiteralPath $installedSkill -Destination $backupPath
+        $previousMoved = $true
+    }
+
+    Move-Item -LiteralPath $stagingPath -Destination $installedSkill
+    $newInstalled = $true
+    Assert-ExpectedLayout -LayoutRoot $installedSkill -Mappings $mappings
+
+    if ($previousMoved) {
+        Remove-ExactTree -Path $backupPath -ExpectedParent $skillsRoot -ExpectedNamePrefix '.codex-hosts.backup-'
+        $previousMoved = $false
+    }
+}
+catch {
+    $failure = $_
+
+    if ($newInstalled -and $null -ne (Get-ExistingItem -LiteralPath $installedSkill)) {
+        Remove-ExactTree -Path $installedSkill -ExpectedParent $skillsRoot -ExpectedNamePrefix 'codex-hosts'
+        $newInstalled = $false
+    }
+
+    if ($previousMoved -and $null -ne (Get-ExistingItem -LiteralPath $backupPath)) {
+        Move-Item -LiteralPath $backupPath -Destination $installedSkill
+        $previousMoved = $false
+    }
+
+    throw $failure
+}
+finally {
+    if ($null -ne (Get-ExistingItem -LiteralPath $stagingPath)) {
+        Remove-ExactTree -Path $stagingPath -ExpectedParent $skillsRoot -ExpectedNamePrefix '.codex-hosts.install-'
+    }
+}
+
+Write-Output "Installed linked codex-hosts Skill: $installedSkill"
+foreach ($mapping in $mappings) {
+    Write-Output "Verified: $($mapping.RelativePath) -> $($mapping.Target)"
+}

@@ -97,6 +97,18 @@ target\release\codex-hosts.exe
 
 构建完成后，将它放入 Skill 的 `bin` 目录即可。
 
+### 链接本地源码目录
+
+如果在固定路径的本地源码目录中开发，可以安装软链接，之后每次构建无需再复制：
+
+```powershell
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1
+```
+
+脚本会将已安装的 `SKILL.md`、`agents` 和 `references` 链接到 `skill\codex-hosts`，并将已安装的 `bin\codex-hosts.exe` 直接链接到 `target\release\codex-hosts.exe`。替换现有安装前会验证全部源文件，安装后会核对链接目标；如果安装失败，则恢复原有安装。可随时再次运行以验证同一套链接。当前 Windows 用户必须具备创建符号链接的权限。
+
+这种链接方式仅用于本地源码目录。从 Release 压缩包安装时，仍使用上面的复制方式。
+
 ## 快速上手
 
 ### 1. 添加主机
