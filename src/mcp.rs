@@ -41,6 +41,19 @@ pub(crate) const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60
 const MAX_CONCURRENT_CALLS: usize = 4;
 
 pub fn run() -> i32 {
+    match crate::storage::owner_check() {
+        crate::storage::OwnerCheck::Ok => {}
+        crate::storage::OwnerCheck::Mismatch { owner, current } => {
+            eprintln!(
+                "codex-hosts --mcp: refusing to start: the host store is owned by {owner}, not by the current user {current}. Fix it with: {}",
+                crate::storage::owner_repair_hint()
+            );
+            return 2;
+        }
+        crate::storage::OwnerCheck::Unavailable(reason) => {
+            eprintln!("codex-hosts --mcp: could not verify the host store owner: {reason}");
+        }
+    }
     ssh::runtime().block_on(async {
         let service = match Server::new().serve(rmcp::transport::stdio()).await {
             Ok(service) => service,

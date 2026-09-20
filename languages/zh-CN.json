@@ -227,6 +227,7 @@
     "telnet_prompts": "Telnet 提示符",
     "telnet_prompts_hint": "为登录横幅与默认值不同的设备覆盖登录和密码提示文本。",
     "telnet_login_prompt": "登录",
-    "telnet_password_prompt": "密码"
+    "telnet_password_prompt": "密码",
+    "store_owner_warning": "主机列表文件的所有者是另一个账户（{owner}）。在它归还给你之前，Codex 将被拒绝访问：{command}"
   }
 }

@@ -858,6 +858,18 @@ impl SecretsApp {
     }
 }
 
+/// The current process user's SID as text, shared with the store owner check.
+pub fn current_user_sid() -> std::io::Result<String> {
+    #[cfg(windows)]
+    {
+        ipc::current_user_sid()
+    }
+    #[cfg(not(windows))]
+    {
+        Err(std::io::Error::other("PLATFORM_UNSUPPORTED"))
+    }
+}
+
 pub fn restore_existing(temporary: bool) -> bool {
     #[cfg(windows)]
     {

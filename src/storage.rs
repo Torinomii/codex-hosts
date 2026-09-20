@@ -323,6 +323,110 @@ fn hosts_path() -> Result<PathBuf, StorageError> {
     Ok(data_directory()?.join("hosts.json"))
 }
 
+/// Result of comparing the host store's owner with the current user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerCheck {
+    /// Owned by the current user, by the Administrators group, or not present yet.
+    Ok,
+    /// Another account owns the file that decides which hosts Codex can reach.
+    Mismatch { owner: String, current: String },
+    /// Security information could not be read (non-NTFS volume, network share).
+    Unavailable(String),
+}
+
+/// A file created while elevated is owned by BUILTIN\Administrators rather than
+/// the user; no unprivileged account can produce that owner, so it is accepted.
+const ADMINISTRATORS_SID: &str = "S-1-5-32-544";
+
+/// Only the owner is compared: a full DACL evaluation is hundreds of lines and
+/// misfires on exFAT and network volumes, while a foreign owner catches the case
+/// of a file created or taken over by another account.
+pub fn owner_check() -> OwnerCheck {
+    let path = match hosts_path() {
+        Ok(path) => path,
+        Err(error) => return OwnerCheck::Unavailable(error.to_string()),
+    };
+    if !path.is_file() {
+        return OwnerCheck::Ok;
+    }
+    match (
+        file_owner_sid(&path),
+        crate::temporary_secrets::current_user_sid(),
+    ) {
+        (Ok(owner), Ok(current)) => {
+            if owner == current || owner == ADMINISTRATORS_SID {
+                OwnerCheck::Ok
+            } else {
+                OwnerCheck::Mismatch { owner, current }
+            }
+        }
+        (Err(error), _) | (_, Err(error)) => OwnerCheck::Unavailable(error.to_string()),
+    }
+}
+
+/// The command that hands the file back to the current user.
+pub fn owner_repair_hint() -> String {
+    let path = hosts_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "%LOCALAPPDATA%\\CodexHosts\\hosts.json".to_owned());
+    format!("icacls \"{path}\" /setowner \"%USERNAME%\"")
+}
+
+#[cfg(windows)]
+fn file_owner_sid(path: &Path) -> std::io::Result<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertSidToStringSidW, GetNamedSecurityInfoW, SE_FILE_OBJECT,
+    };
+    use windows_sys::Win32::Security::OWNER_SECURITY_INFORMATION;
+
+    let wide = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
+    // SAFETY: out-pointers are valid for the call; the descriptor and SID string
+    // are LocalAlloc'd by Windows and freed below.
+    unsafe {
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let status = GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut descriptor,
+        );
+        if status != ERROR_SUCCESS {
+            return Err(std::io::Error::from_raw_os_error(status as i32));
+        }
+        let mut sid_text = std::ptr::null_mut();
+        let converted = ConvertSidToStringSidW(owner, &mut sid_text);
+        let result = if converted == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            let mut len = 0;
+            while *sid_text.add(len) != 0 {
+                len += 1;
+            }
+            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(sid_text, len));
+            LocalFree(sid_text.cast());
+            Ok(sid)
+        };
+        LocalFree(descriptor);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+fn file_owner_sid(_path: &Path) -> std::io::Result<String> {
+    Err(std::io::Error::other("owner check is Windows-only"))
+}
+
 fn legacy_hosts_path() -> Option<PathBuf> {
     env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)

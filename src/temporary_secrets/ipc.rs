@@ -220,7 +220,7 @@ async fn write_frame<T: AsyncWrite + Unpin>(stream: &mut T, bytes: &[u8]) -> io:
     stream.flush().await
 }
 
-fn current_user_sid() -> io::Result<String> {
+pub(super) fn current_user_sid() -> io::Result<String> {
     use std::ptr;
     use windows_sys::Win32::{
         Foundation::{CloseHandle, HANDLE, LocalFree},

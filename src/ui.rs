@@ -387,6 +387,19 @@ impl HostsApp {
                 StatusKind::Error,
                 catalog.format("storage_error", &[("error", &error)]),
             )
+        } else if let crate::storage::OwnerCheck::Mismatch { owner, .. } =
+            crate::storage::owner_check()
+        {
+            StatusMessage::new(
+                StatusKind::Warning,
+                catalog.format(
+                    "store_owner_warning",
+                    &[
+                        ("owner", &owner),
+                        ("command", &crate::storage::owner_repair_hint()),
+                    ],
+                ),
+            )
         } else if launch.codex_edit {
             StatusMessage::info(catalog.text("draft_waiting"))
         } else {
