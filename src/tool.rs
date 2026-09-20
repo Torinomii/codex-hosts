@@ -14,7 +14,7 @@ use tokio::task::JoinSet;
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
-use crate::model::{HostFilter, HostProfile, Protocol, SshAuth, normalize_tags};
+use crate::model::{AuthPersistence, HostFilter, HostProfile, Protocol, SshAuth, normalize_tags};
 use crate::ssh::{self, AgentKeyInfo, OperationLimits, RemoteFailure, VerifiedHostKey};
 use crate::storage::HostStore;
 
@@ -125,6 +125,7 @@ pub(crate) struct HostSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) jump_host: Option<String>,
     pub(crate) verified: bool,
+    pub(crate) auth_persistence: AuthPersistence,
     pub(crate) has_required_secret: bool,
     pub(crate) has_host_fingerprint: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -509,6 +510,7 @@ pub(crate) fn list_hosts(
                 .and_then(|id| store.hosts.iter().find(|item| item.id == id))
                 .map(|item| item.alias.clone()),
             verified: host.verified,
+            auth_persistence: host.effective_auth_persistence(),
             has_required_secret,
             has_host_fingerprint: host.host_fingerprint.is_some(),
             host_key_algorithm: host.host_key_algorithm.clone(),

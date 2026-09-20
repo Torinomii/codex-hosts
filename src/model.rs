@@ -47,6 +47,57 @@ impl SshAuth {
     }
 }
 
+/// How long an authenticated session may outlive the tool call that opened it.
+/// The default keeps today's behaviour: every call authenticates again, so a
+/// hardware key is touched once per action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AuthPersistence {
+    #[default]
+    PerCall,
+    Session,
+    Idle {
+        minutes: u32,
+    },
+}
+
+pub const MAX_IDLE_PERSISTENCE_MINUTES: u32 = 24 * 60;
+
+/// Retention decided for a whole connection (or jump chain): the strictest hop wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retention {
+    Session,
+    Idle(std::time::Duration),
+}
+
+impl AuthPersistence {
+    pub fn retention(self) -> Option<Retention> {
+        match self {
+            Self::PerCall => None,
+            Self::Session => Some(Retention::Session),
+            Self::Idle { minutes } => Some(Retention::Idle(std::time::Duration::from_secs(
+                u64::from(minutes.clamp(1, MAX_IDLE_PERSISTENCE_MINUTES)) * 60,
+            ))),
+        }
+    }
+}
+
+/// Retention for a chain is the strictest of its hops; any per-call hop makes
+/// the whole chain per-call, because a retained jump session would otherwise
+/// let later calls skip that hop's authentication.
+pub fn chain_retention<'a>(chain: impl IntoIterator<Item = &'a HostProfile>) -> Option<Retention> {
+    let mut retention = None;
+    for host in chain {
+        let hop = host.effective_auth_persistence().retention()?;
+        retention = Some(match (retention, hop) {
+            (None, hop) => hop,
+            (Some(Retention::Session), other) | (Some(other), Retention::Session) => other,
+            (Some(Retention::Idle(a)), Retention::Idle(b)) => Retention::Idle(a.min(b)),
+        });
+    }
+    retention
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostProfile {
@@ -67,6 +118,7 @@ pub struct HostProfile {
     pub host_key_last_verified_unix: Option<u64>,
     pub jump_host: Option<Uuid>,
     pub verified: bool,
+    pub auth_persistence: AuthPersistence,
 }
 
 impl Default for HostProfile {
@@ -89,6 +141,7 @@ impl Default for HostProfile {
             host_key_last_verified_unix: None,
             jump_host: None,
             verified: false,
+            auth_persistence: AuthPersistence::PerCall,
         }
     }
 }
@@ -124,6 +177,14 @@ impl HostProfile {
             return Some(ValidationIssue::TelnetChain);
         }
         None
+    }
+
+    /// Telnet has no session layer yet, so its profiles always authenticate per call.
+    pub fn effective_auth_persistence(&self) -> AuthPersistence {
+        match self.protocol {
+            Protocol::Ssh => self.auth_persistence,
+            Protocol::Telnet => AuthPersistence::PerCall,
+        }
     }
 
     pub fn connection_details_equal(&self, other: &Self) -> bool {
@@ -305,6 +366,65 @@ pub fn can_use_as_jump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_persistence_migrates_old_profiles_and_round_trips() {
+        let old: HostProfile = serde_json::from_str(r#"{"alias":"a","address":"h"}"#).unwrap();
+        assert_eq!(old.auth_persistence, AuthPersistence::PerCall);
+        let mut idle = old.clone();
+        idle.auth_persistence = AuthPersistence::Idle { minutes: 15 };
+        let json = serde_json::to_value(&idle).unwrap();
+        assert_eq!(
+            json["auth_persistence"],
+            serde_json::json!({"mode": "idle", "minutes": 15})
+        );
+        let restored: HostProfile = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, idle);
+        assert_eq!(
+            serde_json::to_value(AuthPersistence::Session).unwrap(),
+            serde_json::json!({"mode": "session"})
+        );
+    }
+
+    #[test]
+    fn telnet_profiles_always_authenticate_per_call() {
+        let host = HostProfile {
+            protocol: Protocol::Telnet,
+            auth_persistence: AuthPersistence::Session,
+            ..Default::default()
+        };
+        assert_eq!(host.effective_auth_persistence(), AuthPersistence::PerCall);
+        assert_eq!(chain_retention([&host]), None);
+    }
+
+    #[test]
+    fn chain_retention_takes_the_strictest_hop() {
+        let session = HostProfile {
+            auth_persistence: AuthPersistence::Session,
+            ..Default::default()
+        };
+        let idle = HostProfile {
+            auth_persistence: AuthPersistence::Idle { minutes: 5 },
+            ..Default::default()
+        };
+        let per_call = HostProfile::default();
+        assert_eq!(chain_retention([&session]), Some(Retention::Session));
+        assert_eq!(
+            chain_retention([&session, &idle]),
+            Some(Retention::Idle(std::time::Duration::from_secs(300)))
+        );
+        assert_eq!(chain_retention([&idle, &session, &per_call]), None);
+        assert_eq!(
+            AuthPersistence::Idle { minutes: 0 }.retention(),
+            Some(Retention::Idle(std::time::Duration::from_secs(60)))
+        );
+        assert_eq!(
+            AuthPersistence::Idle { minutes: 99_999 }.retention(),
+            Some(Retention::Idle(std::time::Duration::from_secs(
+                u64::from(MAX_IDLE_PERSISTENCE_MINUTES) * 60
+            )))
+        );
+    }
 
     #[test]
     fn metadata_is_backward_compatible_and_does_not_change_connection_identity() {

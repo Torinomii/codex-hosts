@@ -5,7 +5,9 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::model::{HostProfile, Protocol, SshAuth, normalize_tags, resolve_ssh_chain};
+use crate::model::{
+    AuthPersistence, HostProfile, Protocol, SshAuth, normalize_tags, resolve_ssh_chain,
+};
 
 #[derive(Debug)]
 struct ImportHost {
@@ -125,6 +127,7 @@ pub fn parse_template(
             host_key_last_verified_unix: None,
             jump_host: None,
             verified: false,
+            auth_persistence: AuthPersistence::PerCall,
         };
         if profile.validation_issue().is_some() {
             return Err(ImportError::InvalidHost { alias });

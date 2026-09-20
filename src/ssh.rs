@@ -25,7 +25,7 @@ use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForS
 
 use crate::credentials::{self, CredentialKind};
 use crate::fido;
-use crate::model::{HostProfile, SshAuth, resolve_ssh_chain};
+use crate::model::{HostProfile, Retention, SshAuth, chain_retention, resolve_ssh_chain};
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 #[cfg(test)]
@@ -37,6 +37,10 @@ pub const DEFAULT_RETAINED_CONNECTIONS: usize = 16;
 pub const MAX_RETAINED_CONNECTIONS: usize = 32;
 pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONNECTION_REAPER_INTERVAL: Duration = Duration::from_secs(30);
+/// Retained sessions send keepalives so NAT and idle-cutting middleboxes keep the
+/// path open between calls; three misses count as a dead link.
+const RETAINED_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const RETAINED_KEEPALIVE_MAX: usize = 3;
 #[cfg(windows)]
 const WINDOWS_OPENSSH_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
@@ -268,6 +272,24 @@ struct PooledSession {
 struct PoolEntry {
     session: Arc<PooledSession>,
     last_used: Instant,
+    /// `Some` keeps the session across tool calls (the host opted in); `None`
+    /// entries are released after the call that used them.
+    retention: Option<Retention>,
+}
+
+impl PoolEntry {
+    fn unused(&self) -> bool {
+        Arc::strong_count(&self.session) == 1
+    }
+
+    fn idle_expired(&self, now: Instant) -> bool {
+        let limit = match self.retention {
+            None => CONNECTION_IDLE_TIMEOUT,
+            Some(Retention::Session) => return false,
+            Some(Retention::Idle(limit)) => limit,
+        };
+        now.duration_since(self.last_used) >= limit
+    }
 }
 
 #[derive(Default)]
@@ -365,10 +387,7 @@ impl SessionPool {
         let idle_keys = state
             .entries
             .iter()
-            .filter(|(_, entry)| {
-                Arc::strong_count(&entry.session) == 1
-                    && now.duration_since(entry.last_used) >= CONNECTION_IDLE_TIMEOUT
-            })
+            .filter(|(_, entry)| entry.unused() && entry.idle_expired(now))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         for key in idle_keys {
@@ -381,7 +400,7 @@ impl SessionPool {
             let oldest = state
                 .entries
                 .iter()
-                .filter(|(_, entry)| Arc::strong_count(&entry.session) == 1)
+                .filter(|(_, entry)| entry.unused() && entry.retention.is_none())
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| key.clone());
             let Some(oldest) = oldest else {
@@ -413,6 +432,7 @@ impl SessionPool {
     fn finish_connection(
         &self,
         session: Result<Arc<PooledSession>, RemoteFailure>,
+        retention: Option<Retention>,
     ) -> Result<Arc<PooledSession>, RemoteFailure> {
         let mut state = self.state.lock().map_err(|_| {
             RemoteFailure::new("SSH_POOL_FAILED", "The SSH connection pool lock failed.")
@@ -423,6 +443,7 @@ impl SessionPool {
                 PoolEntry {
                     session: Arc::clone(session),
                     last_used: Instant::now(),
+                    retention,
                 },
             );
         }
@@ -482,14 +503,14 @@ impl SessionPool {
             .collect()
     }
 
-    fn take_unused(&self) -> Vec<Arc<PooledSession>> {
+    fn take_unused(&self, include_retained: bool) -> Vec<Arc<PooledSession>> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
         let keys = state
             .entries
             .iter()
-            .filter(|(_, entry)| Arc::strong_count(&entry.session) == 1)
+            .filter(|(_, entry)| entry.unused() && (include_retained || entry.retention.is_none()))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         keys.into_iter()
@@ -505,10 +526,7 @@ impl SessionPool {
         let keys = state
             .entries
             .iter()
-            .filter(|(_, entry)| {
-                Arc::strong_count(&entry.session) == 1
-                    && now.duration_since(entry.last_used) >= CONNECTION_IDLE_TIMEOUT
-            })
+            .filter(|(_, entry)| entry.unused() && entry.idle_expired(now))
             .map(|(key, _)| key.clone())
             .collect::<Vec<_>>();
         keys.into_iter()
@@ -760,7 +778,20 @@ pub(crate) async fn execute_many_bounded(
 /// this after each tool call so a long-lived process still authenticates once
 /// per call unless a host opts into retention.
 pub(crate) fn release_unused_connections() -> usize {
-    let sessions = session_pool().take_unused();
+    disconnect_sessions(session_pool().take_unused(false))
+}
+
+/// Disconnect every session no operation is using, including retained ones.
+pub(crate) fn disconnect_all() -> usize {
+    disconnect_sessions(session_pool().take_unused(true))
+}
+
+/// Disconnect every session whose chain includes the host, retained or not.
+pub(crate) fn disconnect_host(host_id: uuid::Uuid) -> usize {
+    disconnect_sessions(session_pool().invalidate_host(host_id))
+}
+
+fn disconnect_sessions(sessions: Vec<Arc<PooledSession>>) -> usize {
     let count = sessions.len();
     for session in sessions {
         ssh_runtime().spawn(async move {
@@ -987,10 +1018,11 @@ async fn connect_chain(
     let mut sessions = Vec::with_capacity(chain.len());
     let mut verified_host_keys = Vec::with_capacity(chain.len());
     let mut auth_key_fingerprints = Vec::with_capacity(chain.len());
+    let retention = chain_retention(chain.iter().copied());
 
     for host in chain {
         let parent = sessions.last().cloned();
-        let session = pooled_connection(host, parent.as_ref(), limits).await?;
+        let session = pooled_connection(host, parent.as_ref(), limits, retention).await?;
         verified_host_keys.push(session.verified_host_key.clone());
         auth_key_fingerprints.push(session.auth_key_fingerprint.clone());
         sessions.push(session);
@@ -1002,6 +1034,7 @@ async fn pooled_connection(
     host: &HostProfile,
     parent: Option<&Arc<PooledSession>>,
     limits: OperationLimits,
+    retention: Option<Retention>,
 ) -> Result<Arc<PooledSession>, RemoteFailure> {
     let key = SessionKey::new(host, parent.map(|session| &session.key));
     if let Some(session) = session_pool().ready(&key, limits.batch_scope)? {
@@ -1021,7 +1054,7 @@ async fn pooled_connection(
             .disconnect(Disconnect::ByApplication, "LRU eviction", "")
             .await;
     }
-    let connected = connect_one(host, parent, key.clone(), limits).await;
+    let connected = connect_one(host, parent, key.clone(), limits, retention).await;
     if let Err(error) = &connected {
         session_pool().block_reconnect(limits.batch_scope, &key);
         if error.code == "JUMP_CHANNEL_FAILED"
@@ -1031,7 +1064,7 @@ async fn pooled_connection(
             session_pool().block_reconnect(limits.batch_scope, &parent.key);
         }
     }
-    let result = pool.finish_connection(connected);
+    let result = pool.finish_connection(connected, retention);
     if let Ok(session) = &result {
         pool.record_batch_connection(limits.batch_scope, &session.key);
     }
@@ -1044,11 +1077,24 @@ async fn connect_one(
     parent: Option<&Arc<PooledSession>>,
     key: SessionKey,
     limits: OperationLimits,
+    retention: Option<Retention>,
 ) -> Result<Arc<PooledSession>, RemoteFailure> {
-    let config = Arc::new(client::Config {
-        inactivity_timeout: limits.command_timeout,
-        nodelay: true,
-        ..Default::default()
+    // A retained session must survive quiet stretches between calls, so the
+    // link is watched with keepalives instead of the first call's command timeout.
+    let config = Arc::new(if retention.is_some() {
+        client::Config {
+            inactivity_timeout: None,
+            keepalive_interval: Some(RETAINED_KEEPALIVE_INTERVAL),
+            keepalive_max: RETAINED_KEEPALIVE_MAX,
+            nodelay: true,
+            ..Default::default()
+        }
+    } else {
+        client::Config {
+            inactivity_timeout: limits.command_timeout,
+            nodelay: true,
+            ..Default::default()
+        }
     });
     let observed = Arc::new(Mutex::new(None));
     let observer = ServerKeyObserver {

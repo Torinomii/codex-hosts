@@ -9,12 +9,19 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, ServiceExt, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::future::Future;
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
+use tokio::sync::{
+    Mutex as AsyncMutex, OwnedMutexGuard, OwnedRwLockReadGuard, OwnedRwLockWriteGuard,
+    OwnedSemaphorePermit, RwLock, Semaphore,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::connection;
 use crate::fido;
+use crate::model::{AuthPersistence, HostProfile, resolve_ssh_chain};
 use crate::ssh::{self, OperationLimits, RemoteFailure};
 use crate::storage::HostStore;
 use crate::tool::{
@@ -27,6 +34,8 @@ pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
 /// A bounded default keeps an abandoned call from holding a host forever; Codex
 /// passes an explicit value for anything longer.
 pub(crate) const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Upper bound on tool calls in flight; per-host locks decide who may share a session.
+const MAX_CONCURRENT_CALLS: usize = 4;
 
 pub fn run() -> i32 {
     ssh::runtime().block_on(async {
@@ -50,6 +59,91 @@ pub fn run() -> i32 {
 #[derive(Clone)]
 struct Server {
     tool_router: ToolRouter<Self>,
+    gates: Arc<CallGates>,
+}
+
+/// Serialises calls that would otherwise share one authenticated session
+/// without the host having opted in: two calls on the same per-call host run
+/// one after the other, batches run alone, retained hosts run concurrently.
+struct CallGates {
+    calls: Arc<Semaphore>,
+    batch: Arc<RwLock<()>>,
+    hosts: Mutex<HashMap<uuid::Uuid, Weak<AsyncMutex<()>>>>,
+}
+
+struct CallGuard {
+    _permit: OwnedSemaphorePermit,
+    _batch: BatchGuard,
+    _hosts: Vec<OwnedMutexGuard<()>>,
+}
+
+#[allow(dead_code)] // held only for its drop
+enum BatchGuard {
+    Shared(OwnedRwLockReadGuard<()>),
+    Exclusive(OwnedRwLockWriteGuard<()>),
+}
+
+impl CallGates {
+    fn new() -> Self {
+        Self {
+            calls: Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS)),
+            batch: Arc::new(RwLock::new(())),
+            hosts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn host_lock(&self, host_id: uuid::Uuid) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .hosts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lock) = locks.get(&host_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(host_id, Arc::downgrade(&lock));
+        lock
+    }
+
+    async fn single_host(&self, target: &HostProfile, hosts: &[HostProfile]) -> CallGuard {
+        let permit = self.permit().await;
+        let batch = BatchGuard::Shared(Arc::clone(&self.batch).read_owned().await);
+        let mut per_call = resolve_ssh_chain(target, hosts)
+            .map(|chain| chain.into_iter().cloned().collect::<Vec<_>>())
+            .unwrap_or_else(|_| vec![target.clone()])
+            .into_iter()
+            .filter(|host| host.effective_auth_persistence() == AuthPersistence::PerCall)
+            .map(|host| host.id)
+            .collect::<Vec<_>>();
+        per_call.sort_unstable();
+        per_call.dedup();
+        let mut guards = Vec::with_capacity(per_call.len());
+        for host_id in per_call {
+            guards.push(self.host_lock(host_id).lock_owned().await);
+        }
+        CallGuard {
+            _permit: permit,
+            _batch: batch,
+            _hosts: guards,
+        }
+    }
+
+    async fn batch(&self) -> CallGuard {
+        let permit = self.permit().await;
+        let batch = BatchGuard::Exclusive(Arc::clone(&self.batch).write_owned().await);
+        CallGuard {
+            _permit: permit,
+            _batch: batch,
+            _hosts: Vec::new(),
+        }
+    }
+
+    async fn permit(&self) -> OwnedSemaphorePermit {
+        Arc::clone(&self.calls)
+            .acquire_owned()
+            .await
+            .expect("call semaphore is never closed")
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -69,6 +163,20 @@ struct ProbeParams {
     /// Bounds the remote `hostname` command.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct DisconnectParams {
+    /// Alias whose retained connections to drop, including chains that pass through it; omit to drop every retained connection.
+    #[serde(default)]
+    alias: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DisconnectResult {
+    schema_version: u32,
+    status: &'static str,
+    disconnected: usize,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -171,7 +279,22 @@ impl Server {
     fn new() -> Self {
         Self {
             tool_router: Self::tool_router(),
+            gates: Arc::new(CallGates::new()),
         }
+    }
+
+    #[tool(
+        name = "disconnect",
+        description = "Drop authenticated connections this server is keeping for hosts whose profile retains sessions (optionally only those involving one alias). The next call to such a host authenticates again. Safe to repeat.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn disconnect(&self, Parameters(params): Parameters<DisconnectParams>) -> CallToolResult {
+        finish(disconnect_hosts(params))
     }
 
     #[tool(
@@ -224,7 +347,7 @@ impl Server {
         Parameters(params): Parameters<ProbeParams>,
         ct: CancellationToken,
     ) -> CallToolResult {
-        finish(cancellable(ct, probe_host(params)).await)
+        finish(cancellable(ct, probe_host(&self.gates, params)).await)
     }
 
     #[tool(
@@ -241,7 +364,7 @@ impl Server {
         Parameters(params): Parameters<ExecParams>,
         ct: CancellationToken,
     ) -> CallToolResult {
-        finish(cancellable(ct, exec_host(params, None)).await)
+        finish(cancellable(ct, exec_host(&self.gates, params, None)).await)
     }
 
     #[tool(
@@ -271,7 +394,7 @@ impl Server {
             connect_timeout_ms,
             command_timeout_ms,
         };
-        finish(cancellable(ct, exec_host(params, Some(stdin))).await)
+        finish(cancellable(ct, exec_host(&self.gates, params, Some(stdin))).await)
     }
 
     #[tool(
@@ -288,7 +411,7 @@ impl Server {
         Parameters(params): Parameters<ExecManyParams>,
         ct: CancellationToken,
     ) -> CallToolResult {
-        finish(cancellable(ct, exec_many_host(params)).await)
+        finish(cancellable(ct, exec_many_host(&self.gates, params)).await)
     }
 
     #[tool(
@@ -303,6 +426,7 @@ impl Server {
     ) -> CallToolResult {
         finish(
             cancellable(ct, async move {
+                let _guard = self.gates.batch().await;
                 let hosts = load_store()?.hosts;
                 tool::execute_batch(
                     &hosts,
@@ -336,6 +460,7 @@ impl Server {
     ) -> CallToolResult {
         finish(
             cancellable(ct, async move {
+                let _guard = self.gates.batch().await;
                 let hosts = load_store()?.hosts;
                 tool::execute_batch(
                     &hosts,
@@ -366,10 +491,14 @@ impl ServerHandler for Server {
     }
 }
 
-async fn probe_host(params: ProbeParams) -> Result<ssh::RemoteResult, RemoteFailure> {
+async fn probe_host(
+    gates: &CallGates,
+    params: ProbeParams,
+) -> Result<ssh::RemoteResult, RemoteFailure> {
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
+    let _guard = gates.single_host(&host, &store.hosts).await;
     let result = connection::probe_async(
         &host,
         &store.hosts,
@@ -381,12 +510,14 @@ async fn probe_host(params: ProbeParams) -> Result<ssh::RemoteResult, RemoteFail
 }
 
 async fn exec_host(
+    gates: &CallGates,
     params: ExecParams,
     stdin: Option<String>,
 ) -> Result<ssh::RemoteResult, RemoteFailure> {
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
+    let _guard = gates.single_host(&host, &store.hosts).await;
     connection::execute_with_input_async(
         &host,
         &store.hosts,
@@ -397,11 +528,15 @@ async fn exec_host(
     .await
 }
 
-async fn exec_many_host(params: ExecManyParams) -> Result<ssh::RemoteManyResult, RemoteFailure> {
+async fn exec_many_host(
+    gates: &CallGates,
+    params: ExecManyParams,
+) -> Result<ssh::RemoteManyResult, RemoteFailure> {
     tool::validate_commands(&params.commands)?;
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
+    let _guard = gates.single_host(&host, &store.hosts).await;
     let concurrency = params
         .max_concurrency
         .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
@@ -430,6 +565,22 @@ where
         )),
         outcome = operation => outcome,
     }
+}
+
+fn disconnect_hosts(params: DisconnectParams) -> Result<DisconnectResult, RemoteFailure> {
+    let disconnected = match params.alias {
+        Some(alias) => {
+            let store = load_store()?;
+            let host = tool::find_host(&store, &alias)?;
+            ssh::disconnect_host(host.id)
+        }
+        None => ssh::disconnect_all(),
+    };
+    Ok(DisconnectResult {
+        schema_version: SCHEMA_VERSION,
+        status: "ok",
+        disconnected,
+    })
 }
 
 fn load_store() -> Result<HostStore, RemoteFailure> {
@@ -526,6 +677,7 @@ mod tests {
                 "agent_identities",
                 "batch_exec",
                 "batch_probe",
+                "disconnect",
                 "exec",
                 "exec_many",
                 "exec_stdin",
@@ -539,8 +691,13 @@ mod tests {
             let name = tool.name.as_ref();
             let executes = name.starts_with("exec") || name == "batch_exec";
             let connects = executes || name == "probe" || name == "batch_probe";
-            assert_eq!(annotations.read_only_hint, Some(!executes), "{name}");
+            let mutates = executes || name == "disconnect";
+            assert_eq!(annotations.read_only_hint, Some(!mutates), "{name}");
             assert_eq!(annotations.open_world_hint, Some(connects), "{name}");
+            if name == "disconnect" {
+                assert_eq!(annotations.idempotent_hint, Some(true));
+                assert_eq!(annotations.destructive_hint, Some(false));
+            }
             if executes {
                 assert_eq!(annotations.destructive_hint, Some(true), "{name}");
             }
@@ -584,6 +741,49 @@ mod tests {
             Ok::<(), RemoteFailure>(())
         }));
         assert_eq!(outcome.unwrap_err().code, "CANCELLED");
+    }
+
+    #[test]
+    fn per_call_hosts_serialise_while_retained_hosts_share() {
+        use crate::model::Protocol;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let per_call = HostProfile {
+            alias: "strict".into(),
+            protocol: Protocol::Ssh,
+            ..Default::default()
+        };
+        let retained = HostProfile {
+            alias: "kept".into(),
+            protocol: Protocol::Ssh,
+            auth_persistence: AuthPersistence::Session,
+            ..Default::default()
+        };
+        let hosts = vec![per_call.clone(), retained.clone()];
+        runtime.block_on(async {
+            let gates = CallGates::new();
+            let first = gates.single_host(&per_call, &hosts).await;
+            let second = tokio::time::timeout(
+                Duration::from_millis(50),
+                gates.single_host(&per_call, &hosts),
+            )
+            .await;
+            assert!(second.is_err(), "same per-call host must wait");
+            let shared = tokio::time::timeout(
+                Duration::from_millis(50),
+                gates.single_host(&retained, &hosts),
+            )
+            .await;
+            assert!(shared.is_ok(), "retained host runs alongside");
+            let batch = tokio::time::timeout(Duration::from_millis(50), gates.batch()).await;
+            assert!(batch.is_err(), "batch waits for single-host calls");
+            drop(first);
+            drop(shared);
+            let batch = tokio::time::timeout(Duration::from_millis(50), gates.batch()).await;
+            assert!(batch.is_ok());
+        });
     }
 
     #[test]
