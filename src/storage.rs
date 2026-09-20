@@ -353,14 +353,16 @@ pub fn owner_check() -> OwnerCheck {
         file_owner_sid(&path),
         crate::temporary_secrets::current_user_sid(),
     ) {
-        (Ok(owner), Ok(current)) => {
-            if owner == current || owner == ADMINISTRATORS_SID {
-                OwnerCheck::Ok
-            } else {
-                OwnerCheck::Mismatch { owner, current }
-            }
-        }
+        (Ok(owner), Ok(current)) => judge_owner(owner, current),
         (Err(error), _) | (_, Err(error)) => OwnerCheck::Unavailable(error.to_string()),
+    }
+}
+
+fn judge_owner(owner: String, current: String) -> OwnerCheck {
+    if owner == current || owner == ADMINISTRATORS_SID {
+        OwnerCheck::Ok
+    } else {
+        OwnerCheck::Mismatch { owner, current }
     }
 }
 
@@ -456,6 +458,24 @@ pub enum StorageError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owner_judgement_accepts_self_and_administrators_only() {
+        let me = "S-1-5-21-1-2-3-1001".to_owned();
+        assert_eq!(judge_owner(me.clone(), me.clone()), OwnerCheck::Ok);
+        assert_eq!(
+            judge_owner(ADMINISTRATORS_SID.to_owned(), me.clone()),
+            OwnerCheck::Ok
+        );
+        assert_eq!(
+            judge_owner("S-1-5-21-1-2-3-1002".to_owned(), me.clone()),
+            OwnerCheck::Mismatch {
+                owner: "S-1-5-21-1-2-3-1002".to_owned(),
+                current: me,
+            }
+        );
+        assert!(owner_repair_hint().contains("/setowner"));
+    }
 
     #[test]
     fn metadata_survives_store_save_and_reload() {
