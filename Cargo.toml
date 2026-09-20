@@ -15,7 +15,7 @@ keyring = "4.1.6"
 rfd = "0.17.2"
 rmcp = { version = "3.4", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }
 russh = "0.62.5"
-schemars = "1"
+schemars = { version = "1", features = ["uuid1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sys-locale = "0.3.2"
@@ -29,7 +29,7 @@ zeroize = "1"
 ciborium = "0.2"
 p256 = { version = "0.14", features = ["ecdsa"] }
 sha2 = "0.11"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_Security", "Win32_Security_Authorization", "Win32_Networking_WindowsWebServices", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_Security", "Win32_Security_Authorization", "Win32_Networking_WindowsWebServices", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 serde_json = "1"

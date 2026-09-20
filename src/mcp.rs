@@ -4,6 +4,9 @@
 //! the connection pool. Tool handlers must stay on the async path: calling a
 //! `block_on` wrapper from here would panic inside the runtime.
 
+mod editor;
+mod secrets;
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -446,6 +449,84 @@ impl Server {
     }
 
     #[tool(
+        name = "open_host_editor",
+        description = "Open the codex-hosts editor window for one alias, prefilled with every non-secret detail given, so the user can add the password, passphrase or PIN, or confirm a reported host key. Returns saved, trusted, or cancelled; a missing result is a failure, never success. Use it as soon as an alias is missing or incomplete instead of asking for connection details in chat.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn open_host_editor(
+        &self,
+        Parameters(params): Parameters<editor::OpenHostEditorParams>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(cancellable(ct, editor::open_host_editor(params)).await)
+    }
+
+    #[tool(
+        name = "temporary_secrets_open",
+        description = "Declare memory-only secret field names (API keys, tokens) and open the app's masked editor for the user to fill them. Returns the session UUID and per-field readiness; values are never returned. Reuse fields that are already ready.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn temporary_secrets_open(
+        &self,
+        Parameters(params): Parameters<secrets::OpenParams>,
+    ) -> CallToolResult {
+        finish(secrets::open(params).await)
+    }
+
+    #[tool(
+        name = "temporary_secrets_status",
+        description = "Report readiness of the declared secret fields and the last operations in a temporary-secrets session.",
+        annotations(read_only_hint = true, open_world_hint = false)
+    )]
+    async fn temporary_secrets_status(
+        &self,
+        Parameters(params): Parameters<secrets::StatusParams>,
+    ) -> CallToolResult {
+        finish(secrets::status(params).await)
+    }
+
+    #[tool(
+        name = "temporary_secrets_run",
+        description = "Start a trusted local program with secret fields injected into its environment by name, after the user approves the exact program, arguments, directory and mappings in a popup. Returns an operation_id to poll with temporary_secrets_status; no child output is returned. This executes code and is reviewed like exec.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn temporary_secrets_run(
+        &self,
+        Parameters(params): Parameters<secrets::RunParams>,
+    ) -> CallToolResult {
+        finish(secrets::run(params).await)
+    }
+
+    #[tool(
+        name = "temporary_secrets_clear",
+        description = "Clear named secret values from the session (an empty list clears all) and cancel pending approvals.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn temporary_secrets_clear(
+        &self,
+        Parameters(params): Parameters<secrets::ClearParams>,
+    ) -> CallToolResult {
+        finish(secrets::clear(params).await)
+    }
+
+    #[tool(
         name = "batch_probe",
         description = "Connect to and authenticate against an explicit list of saved hosts, running `hostname` on each, with results in input order. Host keys are never trusted automatically; failures carry the observed fingerprint for the editor. Success updates local trust metadata.",
         annotations(read_only_hint = true, open_world_hint = true)
@@ -728,16 +809,30 @@ mod tests {
                 "exec_stdin",
                 "fido_identities",
                 "list_hosts",
-                "probe"
+                "open_host_editor",
+                "probe",
+                "temporary_secrets_clear",
+                "temporary_secrets_open",
+                "temporary_secrets_run",
+                "temporary_secrets_status"
             ]
         );
         for tool in &tools {
             let annotations = tool.annotations.as_ref().expect("annotations");
             let name = tool.name.as_ref();
-            let executes = name.starts_with("exec") || name == "batch_exec";
+            let executes =
+                name.starts_with("exec") || name == "batch_exec" || name == "temporary_secrets_run";
             let connects = executes || name == "probe" || name == "batch_probe";
-            let mutates = executes || name == "disconnect";
-            assert_eq!(annotations.read_only_hint, Some(!mutates), "{name}");
+            let read_only = matches!(
+                name,
+                "agent_identities"
+                    | "fido_identities"
+                    | "list_hosts"
+                    | "probe"
+                    | "batch_probe"
+                    | "temporary_secrets_status"
+            );
+            assert_eq!(annotations.read_only_hint, Some(read_only), "{name}");
             assert_eq!(annotations.open_world_hint, Some(connects), "{name}");
             if name == "disconnect" {
                 assert_eq!(annotations.idempotent_hint, Some(true));
