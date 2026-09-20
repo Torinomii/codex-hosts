@@ -10,7 +10,7 @@
 
 [English](../../README.md) | [简体中文](README_zh-CN.md) | [繁體中文](README_zh-TW.md) | [日本語](README_ja.md)
 
-`codex-hosts` は Codex 向けの Windows SSH / Telnet ホスト管理ツールです。パスワード、秘密鍵のパスフレーズ、FIDO PIN などの機密情報を会話・コマンド引数・リクエストファイルで直接扱わずに、Codex からリモートホストへ接続して操作できます。
+`codex-hosts` は Codex 向けの Windows SSH / Telnet ホスト管理ツールです。MCP サーバーとして動作し、Codex は構造化されたツールを通じてリモートホストへ接続・操作します。パスワード、秘密鍵のパスフレーズ、FIDO PIN などの機密情報は会話・コマンド引数・ファイルに一切現れません。
 
 ![Codex Hosts メインウィンドウ](../../Main.png)
 
@@ -26,16 +26,16 @@
 - 1 本の SSH 接続上で複数コマンドを並行実行。
 - SSH / Telnet の複数ホストをまとめて疎通確認・実行。
 - API Key、Token など Codex に直接渡したくない値をメモリ上だけで保持する一時シークレット機能。
-- ホスト検索、接続、認証、コマンド実行を自動化する完全な Codex Skill。
+- リスク注釈付きツールを備えた MCP サーバーと、ホスト検索、接続、認証、コマンド実行のための Codex Skill。
+- ホストごとの認証の保持：操作ごとに再認証（既定）、Codex セッション中は保持、またはアイドル後に切断。
 
-## 0.3.0 の変更点
+## 0.3.1 の変更点
 
-- ホストの説明とタグ: メモやタグで一覧を検索・絞り込みでき、Codex からも `--description`、`--tag` で事前入力できます。`list_hosts` は両フィールドを返し `tags` フィルターを受け付け、`exec` はコマンド入力用の `stdin` を受け付けます。
-- 画面の再設計: 幅を調整できるホスト一覧とコンパクトなヘッダー、「基本情報 / 接続 / 認証 / SSH ホスト鍵」に分かれたホスト詳細、画面下部に固定された「接続テスト」「保存」の操作バー。
-- ステータスバーと通知: すべての結果を下部のステータスバーに表示し、警告とエラーは右上に閉じられる通知としても表示します。
-- 一括管理: ツールバーの下に選択数、すべて選択、エクスポート、削除を備えた選択バーが表示され、各行にチェックボックスが付きます。`Esc` で終了します。
-- インポートとエクスポートはダイアログになり、閉じるまで他の操作はできません。確認ダイアログは共通レイアウトになり、破壊的な操作は強調表示されます。
-- ウィンドウサイズに合わせてレイアウトが変わります: 幅 1040 px 以上ではフォームが 2 列、最小サイズではラベルがフィールドの上に配置されます。Windows のライト / ダークテーマの両方に対応します。
+- MCP サーバー：`codex-hosts.exe --mcp` が stdio 経由で Codex にサービスを提供します。ホスト、プローブ、コマンド、バッチ、ホストエディター、一時シークレットはすべてリスク注釈付きの MCP ツールになり、シェルや PowerShell ラッパー、一時リクエストファイルは不要になりました。従来のファイル方式の Tool モードはそのまま残り、未更新の Skill でも動作します。
+- 認証の保持：各ホストで、Codex が操作ごとに再認証する（既定、従来の動作）か、Codex セッション中はセッションを保持するか、指定したアイドル時間後に切断するかを選択します。セッションを保持するホストは一覧にマークが付き、エディターに警告が表示されます。
+- エディター：必須項目に `*` が付き、未入力のまま保存すると強調表示されます。新しい「詳細」カードには、ホストごとの同時チャネル数、既定タイムアウト、キープアライブ間隔、Codex 向けのリモート環境ヒント、Codex からの非表示、Telnet プロンプトの上書きが含まれます。
+- Codex の呼び出しをキャンセルすると待機を停止しチャネルを閉じます。長時間の作業は長い待機ではなく、リモートホスト自身の `tmux` / `screen` を使う手順として文書化しました。
+- `codex-hosts.exe --version` がバージョンを表示し、引数エラーは stderr に出力されます。
 
 ## インストール
 
@@ -70,13 +70,25 @@
 %USERPROFILE%\.codex\skills\codex-hosts
 ```
 
+3. `%USERPROFILE%\.codex\config.toml`（またはワークスペースの `.codex\config.toml`）に MCP サーバーを登録します：
+
+```toml
+[mcp_servers.codex-hosts]
+command = "C:\\Users\\<user>\\.codex\\skills\\codex-hosts\\bin\\codex-hosts.exe"
+args = ["--mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 86400
+```
+
+`tool_timeout_sec` は上限にすぎず、各呼び出しは独自のタイムアウトを持ちます。長時間ジョブでブロッキング待機を使わないなら Codex の既定値のままで構いません。
+
 `SKILL.md` または実行ファイルだけをコピーせず、Skill ディレクトリ全体を保持してください。
 
 Codex にインストールを依頼することもできます：
 
 ```text
 https://github.com/Torinomii/codex-hosts/releases/latest から最新版の codex-hosts をダウンロードしてインストールしてください。
-現在の環境の Skill インストールディレクトリを自動的に特定し、完全な Skill と実行ファイルをインストールして、必要なファイルがすべて配置されていることを確認してください。
+現在の環境の Skill インストールディレクトリを自動的に特定し、完全な Skill と実行ファイルをインストールし、SKILL.md の説明に従って config.toml に codex-hosts MCP サーバーを登録して、必要なファイルがすべて配置されていることを確認してください。
 ```
 
 ### ソースからビルド
@@ -169,7 +181,7 @@ Codex Skill が次を処理します：
 - コマンド実行
 - 構造化された結果の返却
 
-通常の利用では Tool JSON を手動で書く必要はありません。
+通常の利用ではツールを手動で呼び出す必要はありません。
 
 ## セキュリティ境界
 
@@ -180,7 +192,7 @@ Codex Skill が次を処理します：
 これらの機密値は：
 
 - ホスト設定へ書き込まれません
-- Tool JSON に含まれません
+- MCP ツールのパラメーターや結果に含まれません
 - コマンドライン引数として渡されません
 - Codex に返されません
 
@@ -196,6 +208,18 @@ SSH ホストのフィンガープリントはユーザーが明示的に確認�
 
 その後サーバーの Host Key が変更された場合も、保存済みのフィンガープリントを自動で置き換えることはありません。再度ユーザー確認が必要です。
 
+### 認証の保持
+
+既定では Codex の呼び出しごとに再認証するため、ハードウェアキーは操作ごとに一度タッチが必要で、Codex は呼び出しの間にセッションを保持しません。各ホストの「認証」カードでこれを緩和できます：
+
+| オプション | 動作 |
+| --- | --- |
+| 操作ごとに再認証する | 既定。呼び出し終了時に接続を閉じます。 |
+| Codex セッション中は保持する | 認証済みセッションをキープアライブ付きで開いたままにし、Codex の終了、リンク切断、または `disconnect` の呼び出しまで保持します。 |
+| アイドル後に切断する | 指定した分数アイドル状態が続くまでセッションを保持します。 |
+
+セッションを保持している間、そのホストへの Codex の後続コマンドは再認証もセキュリティキーのタッチも求めず、「操作ごとに一度確認する」保護が失われます。エディターはこの警告を表示し、セッションを保持するホストは一覧にマークが付き、Codex にはこの設定の変更を提案しないよう指示しています。Telnet ホストは常に再認証します。資格情報、PIN、ホスト鍵の確認は影響を受けず、再利用されるのは有効なセッションだけです。
+
 ### 一時シークレット
 
 `codex-hosts` は、ホストログインとは無関係な API Key、Token などの機密値を一時的に保持することもできます。
@@ -204,7 +228,7 @@ SSH ホストのフィンガープリントはユーザーが明示的に確認�
 
 ユーザー承認後、指定したプログラムの環境変数へ直接注入できます。
 
-`codex-hosts` の終了、Windows のサインアウト、またはシステム再起動で一時値は失効します。
+`codex-hosts` トレイアプリの終了、Windows のサインアウト、またはシステム再起動で一時値は失効します。Codex の起動や終了は影響しません。
 
 詳細は [`temporary-secrets.md`](../../skill/codex-hosts/references/temporary-secrets.md) を参照してください。
 
@@ -306,7 +330,6 @@ target
 
 ```json
 {
-  "action": "exec_many",
   "alias": "example",
   "commands": [
     "hostname",
@@ -329,7 +352,6 @@ FIDO / セキュリティキーでは、複数コマンドが通常 1 回の認�
 
 ```json
 {
-  "action": "batch_exec",
   "aliases": [
     "web-1",
     "web-2",
@@ -345,7 +367,6 @@ FIDO / セキュリティキーでは、複数コマンドが通常 1 回の認�
 
 ```json
 {
-  "action": "batch_probe",
   "aliases": [
     "web-1",
     "web-2"
@@ -360,58 +381,27 @@ FIDO / セキュリティキーでは、複数コマンドが通常 1 回の認�
 空の一覧が「全ホスト」として扱われることはありません。
 
 <details>
-<summary>Codex / Tool インターフェース</summary>
+<summary>MCP ツール</summary>
 
-### GUI 編集モード
+Codex は stdio 経由で `codex-hosts.exe --mcp` と通信します。各ツールは同じ JSON を `structuredContent` とテキストの両方で返し、ポリシー層が読み取り専用ツールとコードを実行するツールを区別できるよう MCP 注釈を持ちます。
 
-Codex またはスクリプトからホストエディターを開き、機密情報を含まない接続情報を初期値として渡せます：
+| ツール | 用途 |
+| --- | --- |
+| `list_hosts` | 保存済みホストの非機密情報、信頼状態、`auth_persistence`、`max_channels`、`remote_env` |
+| `agent_identities`、`fido_identities` | 読み込まれた Agent 鍵と FIDO Handle の公開情報 |
+| `probe`、`batch_probe` | 認証して `hostname` を実行し、未知または変更されたホスト鍵を明らかにする |
+| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | コマンドを実行する。`exec_stdin` は stdin のプログラム本文がレビューに対して不透明なため別ツール |
+| `disconnect` | セッション保持を選択したホストのために保持している接続を切断する |
+| `open_host_editor` | 非機密情報を事前入力したエディターウィンドウを開く、または報告されたホスト鍵を確認する |
+| `temporary_secrets_open`、`_status`、`_run`、`_clear` | トレイアプリが保持するメモリ限定シークレット |
 
-```powershell
-.\bin\codex-hosts.exe --codex-edit `
-  --alias example `
-  --host server.example.com `
-  --port 22 `
-  --user operator `
-  --protocol ssh `
-  --auth password `
-  --result-file result.json
-```
+パラメーターにパスワード、パスフレーズ、PIN が含まれることはなく、エディターがマスク付き入力欄で受け取ります。タイムアウト（`connect_timeout_ms`、`command_timeout_ms`、`batch_timeout_ms`）は呼び出しごとに指定し、省略時は接続 120 秒、コマンド 10 分、またはホストの「詳細」カードの既定値が使われます。
 
-パスワード、秘密鍵のパスフレーズ、FIDO PIN を引数として渡さないでください。
+`open_host_editor` の認証引数は安定した名前を使います：`password`、通常の秘密鍵ファイルまたは FIDO Handle には `private-key` / `private_key`（`fido-handle` も可）、Windows OpenSSH Agent または Pageant には `ssh-agent` / `ssh_agent`。
 
-認証引数には固定名を使用します：
+リモートコマンドを実行したら、サイズ制限で出力が省略されていないか `output_truncated` を確認してください。
 
-- `password`：パスワード認証。
-- `private-key` / `private_key`：通常の秘密鍵ファイルまたは FIDO Handle。`fido-handle` も使用できます。
-- `ssh-agent` / `ssh_agent`：Windows OpenSSH Agent または Pageant。
-
-`private-key` は通常の OpenSSH 秘密鍵と FIDO Handle の両方に使用されます。
-
-`ssh-agent` は Agent / Pageant モードだけを表し、すべてのハードウェアキー認証を意味するものではありません。
-
-### Tool モード
-
-Tool モードは UTF-8 JSON のリクエストファイルと結果ファイルを使用します。どちらにも資格情報を含めてはいけません。
-
-主なリクエスト：
-
-```json
-{"action":"capabilities"}
-{"action":"list_hosts"}
-{"action":"agent_identities"}
-{"action":"fido_identities"}
-{"action":"probe","alias":"example"}
-{"action":"exec","alias":"example","command":"hostname"}
-{"action":"exec_many","alias":"example","commands":["hostname","uptime"],"max_concurrency":8}
-{"action":"batch_probe","aliases":["web-1","web-2"],"max_concurrency":8,"batch_timeout_ms":30000}
-{"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
-```
-
-`agent_identities` と `fido_identities` が返すのは公開 ID 情報と公開鍵だけです。
-
-リモートコマンドの実行結果では `output_truncated` を確認し、サイズ制限によって出力が省略されていないか確認してください。
-
-Codex の詳細な動作、呼び出し手順、安全ルールは [`SKILL.md`](../../skill/codex-hosts/SKILL.md) を参照してください。
+Codex の完全な動作、ワークフロー、安全規則は [`SKILL.md`](../../skill/codex-hosts/SKILL.md) を参照してください。
 
 </details>
 
@@ -419,16 +409,14 @@ Codex の詳細な動作、呼び出し手順、安全ルールは [`SKILL.md`](
 
 ホストに複数行の `description` と複数の `tags` を保存できます。編集画面でタグを追加・削除できます。前後の空白、空のタグ、大文字小文字を区別しない重複は除去し、最初の表記を保持します。説明・タグだけの変更では接続確認やホスト鍵の信頼状態は維持されます。検索対象はエイリアス、アドレス、ユーザー名、説明、タグです。複数のタグ条件はすべて一致する必要があります。一括全選択は表示中のホストだけが対象で、フィルター変更時は非表示ホストの選択を解除します。
 
-`list_hosts` は両フィールドを返し、任意の `tags` 配列で絞り込めます。省略または空配列は全ホスト、存在しないタグは空一覧になります。編集画面の事前入力は `--description "説明"` と繰り返し指定する `--tag prod --tag web` に対応します。省略した値は保持し、空の説明や単独の空タグで消去できます。CSV テンプレート・インポート・エクスポートは任意の `description`、`tags` 列に対応します。タグのセルは `["prod","web"]` のような JSON 配列を CSV の規則で引用します。従来の設定と CSV も利用できます。
+`list_hosts` は両フィールドを返し、任意の `tags` 配列で絞り込めます。省略または空配列は全ホスト、存在しないタグは空一覧になります。`open_host_editor` は `description` と `tags` を事前入力できます。省略した値は保持し、空の説明や単独の空タグで消去できます。CSV テンプレート・インポート・エクスポートは任意の `description`、`tags` 列に対応します。タグのセルは `["prod","web"]` のような JSON 配列を CSV の規則で引用します。従来の設定と CSV も利用できます。
 
 ```json
-{"action":"list_hosts","tags":["prod","web"]}
-{"action":"exec","alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
+{"tags":["prod","web"]}
+{"alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
 ```
 
-単一ホストの SSH `exec` は最大 1 MiB の UTF-8 `stdin` を任意で受け取ります。改行を追加せずそのまま送信し、最後に EOF を送ります。省略または `null` は従来の動作を維持し、`""` は即座に EOF を送ります。入力送信と出力受信は同時に進み、既存のタイムアウトと出力制限が適用されます。リモートプログラムが全入力を読む前に終了した場合、その終了状態を優先します。
-
-`capabilities` は `exec_stdin`、`exec_stdin_protocols`、`max_stdin_bytes`、`host_metadata_fields`、`list_hosts_tag_filter` を返します。入力超過は `STDIN_TOO_LARGE`、Telnet・`exec_many`・`batch_exec` への stdin 指定は `STDIN_UNSUPPORTED` になります。コマンドは自動再実行されません。
+`exec_stdin` は単一の SSH ホストのコマンドに最大 1 MiB の UTF-8 テキストを、改行を追加せずそのまま送信し、最後に EOF を送ります。`""` は即座に EOF を送ります。入力送信と出力受信は同時に進み、既存のタイムアウトと出力制限が適用されます。リモートプログラムが全入力を読む前に終了した場合、その終了状態を優先します。入力超過は `STDIN_TOO_LARGE`、Telnet ホストでは `STDIN_UNSUPPORTED` になります。コマンドは自動再実行されません。
 
 ## 実行制限
 
@@ -439,6 +427,8 @@ Codex の詳細な動作、呼び出し手順、安全ルールは [`SKILL.md`](
 - `exec_many` とバッチ処理は同時実行数を制限します。
 - 出力が省略された場合は `output_truncated` で確認できます。
 - ネットワーク障害が発生してもリモートコマンドを自動再実行しません。
+- Codex の呼び出しをキャンセルするとチャネルを閉じて `CANCELLED` を返します。すでに開始したリモートコマンドは実行を続ける場合があります。
+- 数分を超える作業はリモートホストの `tmux` / `screen` で行ってください。[`long-running.md`](../../skill/codex-hosts/references/long-running.md) を参照。
 
 自動再試行を行わないのは、リモートコマンドが冪等とは限らないためです。例：
 

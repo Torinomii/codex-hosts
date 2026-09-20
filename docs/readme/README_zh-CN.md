@@ -10,7 +10,7 @@
 
 [English](../../README.md) | [简体中文](README_zh-CN.md) | [繁體中文](README_zh-TW.md) | [日本語](README_ja.md)
 
-`codex-hosts` 是一个供 Codex 使用的 Windows SSH / Telnet 主机管理工具，让 Codex 可以连接和操作远程主机，而无需在对话、命令参数或请求文件中直接处理密码、私钥口令和 FIDO PIN 等敏感凭据。
+`codex-hosts` 是一个供 Codex 使用的 Windows SSH / Telnet 主机管理工具。它以 MCP 服务器的形式运行，Codex 通过结构化工具连接和操作远程主机，密码、私钥口令和 FIDO PIN 等敏感凭据从不出现在对话、命令参数或文件中。
 
 ![Codex Hosts 主界面](../../Main.png)
 
@@ -26,16 +26,16 @@
 - 支持 SSH 单连接并发执行多条命令。
 - 支持 SSH / Telnet 多主机批量探测和执行。
 - 支持内存中的临时秘密，可用于 API Key、Token 等不适合直接交给 Codex 的敏感参数。
-- 提供完整 Codex Skill，可由 Codex 自动完成主机查找、连接、认证和命令执行。
+- 带风险注解的 MCP 服务器，加上一份 Codex Skill，覆盖主机查找、连接、认证和命令执行。
+- 按主机设置认证保持：每次操作重新认证（默认）、Codex 会话期间保持，或空闲后断开。
 
-## 0.3.0 更新内容
+## 0.3.1 更新内容
 
-- 主机备注与标签：可按备注或标签搜索、筛选列表，Codex 也能通过 `--description`、`--tag` 预填；`list_hosts` 会返回这两个字段并支持 `tags` 过滤，`exec` 新增 `stdin` 用于传入命令输入。
-- 界面重新设计：主机列表可拖动调整宽度、头部更紧凑；主机详情按"基本信息 / 连接 / 身份验证 / SSH 主机密钥"分区显示；"测试连接"和"保存"固定在底部操作栏。
-- 状态栏与通知：所有操作结果显示在底部状态栏，警告和错误还会在右上角弹出可关闭的提示。
-- 批量管理：工具栏下方出现选择栏，显示已选数量以及全选、导出、删除；列表行带复选框，按 `Esc` 退出。
-- 导入和导出改为对话框，需要关闭后才能继续操作；所有确认对话框统一样式，破坏性操作会高亮显示。
-- 布局随窗口大小自适应：窗口宽度 1040 px 起表单为两列，最小窗口下标签改为上下排列；同时支持 Windows 浅色与深色主题。
+- MCP 服务器：`codex-hosts.exe --mcp` 通过 stdio 为 Codex 提供服务。主机、探测、命令、批量、主机编辑器和临时秘密都是带风险注解的 MCP 工具，不再经过 shell、PowerShell 包装或临时请求文件。原有的文件式 Tool 模式原样保留，尚未更新的 Skill 仍可正常工作。
+- 认证保持：每台主机现在都要选择 Codex 是每次操作重新认证（默认，即原有行为）、在 Codex 会话期间保持会话，还是空闲指定分钟后断开。保持会话的主机在列表中带有标记，编辑器中显示警告。
+- 编辑器：必填项标有 `*`，保存时留空会被高亮；新增"高级"卡片，提供按主机的并发通道数、默认超时、Keepalive 间隔、供 Codex 参考的远端环境提示、对 Codex 隐藏主机以及 Telnet 提示符覆盖。
+- 取消 Codex 调用会立即停止等待并关闭通道；长时间作业的做法改为依赖远端主机自己的 `tmux` / `screen`，而不是长时间等待。
+- `codex-hosts.exe --version` 输出版本号，参数错误会写到 stderr。
 
 ## 安装
 
@@ -70,13 +70,25 @@
 %USERPROFILE%\.codex\skills\codex-hosts
 ```
 
+3. 在 `%USERPROFILE%\.codex\config.toml`（或工作区的 `.codex\config.toml`）中注册 MCP 服务器：
+
+```toml
+[mcp_servers.codex-hosts]
+command = "C:\\Users\\<user>\\.codex\\skills\\codex-hosts\\bin\\codex-hosts.exe"
+args = ["--mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 86400
+```
+
+`tool_timeout_sec` 只是上限；每次调用都带有自己的超时。如果从不使用阻塞等待处理长作业，可以保留 Codex 的默认值。
+
 不要只复制 `SKILL.md` 或可执行文件，应保留完整 Skill 目录。
 
 也可以直接让 Codex 安装：
 
 ```text
 从 https://github.com/Torinomii/codex-hosts/releases/latest 下载并安装最新版 codex-hosts。
-请自动找到当前环境的 Skill 安装目录，安装完整的 Skill 和可执行文件，并确认所需文件都已就位。
+请自动找到当前环境的 Skill 安装目录，安装完整的 Skill 和可执行文件，按 SKILL.md 的说明在 config.toml 中注册 codex-hosts MCP 服务器，并确认所需文件都已就位。
 ```
 
 ### 从源代码构建
@@ -169,7 +181,7 @@ Codex Skill 会负责：
 - 执行命令
 - 返回结构化结果
 
-正常使用时不需要手动编写 Tool JSON。
+正常使用时不需要手动调用这些工具。
 
 ## 安全边界
 
@@ -180,7 +192,7 @@ Codex Skill 会负责：
 这些敏感值不会：
 
 - 写入主机配置
-- 放入 Tool JSON
+- 放入 MCP 工具参数或结果
 - 作为命令行参数传递
 - 返回给 Codex
 
@@ -196,6 +208,18 @@ SSH 主机指纹必须由用户明确确认。
 
 如果服务器 Host Key 后续发生变化，程序不会自动替换已经保存的指纹，必须再次由用户明确确认。
 
+### 认证保持
+
+默认情况下，Codex 的每次调用都重新认证：硬件密钥每个动作触碰一次，Codex 在两次调用之间不持有任何打开的会话。每台主机可以在"认证"卡片中放宽这一点：
+
+| 选项 | 行为 |
+| --- | --- |
+| 每次操作重新认证 | 默认。调用结束即断开连接。 |
+| Codex 会话期间保持 | 已认证的会话保持打开并发送 keepalive，直到 Codex 退出、链路断开或调用 `disconnect`。 |
+| 空闲后断开 | 会话保持到空闲达到设定的分钟数为止。 |
+
+保持会话期间，Codex 对该主机的后续命令不再重新认证或触碰安全密钥，也就取消了"每个动作一次确认"的保护。编辑器会显示这条警告，保持会话的主机在列表中带有标记，并且 Skill 禁止 Codex 建议修改这一设置。Telnet 主机始终每次重新认证。凭据、PIN 和主机密钥检查均不受影响，被复用的只是活动会话。
+
 ### 临时秘密
 
 `codex-hosts` 还可以临时保存 API Key、Token 等与主机登录无关的敏感参数。
@@ -204,7 +228,7 @@ SSH 主机指纹必须由用户明确确认。
 
 使用时可以在用户批准后直接注入指定程序的环境变量。
 
-退出 `codex-hosts`、注销或重启系统后，这些临时值会失效。
+退出 `codex-hosts` 托盘程序、注销或重启系统后，这些临时值会失效；Codex 的启动或退出不影响它们。
 
 完整说明见 [`temporary-secrets.md`](../../skill/codex-hosts/references/temporary-secrets.md)。
 
@@ -306,7 +330,6 @@ target
 
 ```json
 {
-  "action": "exec_many",
   "alias": "example",
   "commands": [
     "hostname",
@@ -329,7 +352,6 @@ target
 
 ```json
 {
-  "action": "batch_exec",
   "aliases": [
     "web-1",
     "web-2",
@@ -345,7 +367,6 @@ target
 
 ```json
 {
-  "action": "batch_probe",
   "aliases": [
     "web-1",
     "web-2"
@@ -360,58 +381,27 @@ target
 空列表不会被解释为“全部主机”。
 
 <details>
-<summary>Codex / Tool 接口</summary>
+<summary>MCP 工具</summary>
 
-### GUI 编辑模式
+Codex 通过 stdio 与 `codex-hosts.exe --mcp` 通信。每个工具都同时以 `structuredContent` 和文本返回同一份 JSON，并带有 MCP 注解，便于策略层区分只读工具和会执行代码的工具。
 
-可以从 Codex 或脚本打开主机编辑器，并预填非敏感连接信息：
+| 工具 | 用途 |
+| --- | --- |
+| `list_hosts` | 已保存主机的非敏感信息、信任状态、`auth_persistence`、`max_channels`、`remote_env` |
+| `agent_identities`、`fido_identities` | 已加载 Agent 身份与 FIDO Handle 的公开信息 |
+| `probe`、`batch_probe` | 认证并运行 `hostname`；暴露未知或变更的主机密钥 |
+| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 执行命令；`exec_stdin` 单独成工具，因为 stdin 里的程序正文对审查不透明 |
+| `disconnect` | 断开为已选择保持会话的主机保留的连接 |
+| `open_host_editor` | 打开预填了非敏感信息的编辑器窗口，或确认上报的主机密钥 |
+| `temporary_secrets_open`、`_status`、`_run`、`_clear` | 由托盘程序持有的仅内存秘密 |
 
-```powershell
-.\bin\codex-hosts.exe --codex-edit `
-  --alias example `
-  --host server.example.com `
-  --port 22 `
-  --user operator `
-  --protocol ssh `
-  --auth password `
-  --result-file result.json
-```
+参数中永远不包含密码、口令或 PIN；编辑器在遮罩输入框中收集它们。超时（`connect_timeout_ms`、`command_timeout_ms`、`batch_timeout_ms`）按调用传入，省略时默认连接 120 秒、单条命令 10 分钟，或取主机"高级"卡片中的默认值。
 
-不要将密码、私钥口令或 FIDO PIN 作为参数传递。
+`open_host_editor` 的认证参数使用稳定名称：`password`；`private-key` / `private_key` 表示普通私钥文件或 FIDO Handle（也接受 `fido-handle`）；`ssh-agent` / `ssh_agent` 表示 Windows OpenSSH Agent 或 Pageant。
 
-认证参数使用稳定名称：
+执行远程命令时请检查 `output_truncated`，判断输出是否因大小限制被截断。
 
-- `password`：密码认证。
-- `private-key` / `private_key`：普通私钥文件或 FIDO Handle，也接受 `fido-handle`。
-- `ssh-agent` / `ssh_agent`：Windows OpenSSH Agent 或 Pageant。
-
-`private-key` 同时用于普通 OpenSSH 私钥和 FIDO Handle。
-
-`ssh-agent` 只表示 Agent / Pageant 模式，并不代表所有硬件密钥认证方式。
-
-### Tool 模式
-
-Tool 模式通过 UTF-8 JSON 请求文件和结果文件通信，请求和结果文件中不得包含凭据。
-
-常见请求：
-
-```json
-{"action":"capabilities"}
-{"action":"list_hosts"}
-{"action":"agent_identities"}
-{"action":"fido_identities"}
-{"action":"probe","alias":"example"}
-{"action":"exec","alias":"example","command":"hostname"}
-{"action":"exec_many","alias":"example","commands":["hostname","uptime"],"max_concurrency":8}
-{"action":"batch_probe","aliases":["web-1","web-2"],"max_concurrency":8,"batch_timeout_ms":30000}
-{"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
-```
-
-`agent_identities` 和 `fido_identities` 只返回公开身份信息和公钥。
-
-执行远程命令时，请检查结果中的 `output_truncated`，确认输出是否因为长度限制被截断。
-
-完整的 Codex 行为、调用流程和安全规则见 [`SKILL.md`](../../skill/codex-hosts/SKILL.md)。
+完整的 Codex 行为、工作流和安全规则见 [`SKILL.md`](../../skill/codex-hosts/SKILL.md)。
 
 </details>
 
@@ -419,16 +409,14 @@ Tool 模式通过 UTF-8 JSON 请求文件和结果文件通信，请求和结果
 
 主机支持多行 `description` 备注和多个 `tags` 标签。编辑器可以添加、移除标签；标签会去除首尾空格、空项及不区分大小写的重复项，并保留首次输入的写法。仅修改备注或标签不会清除连接验证和主机密钥信任。搜索覆盖别名、地址、用户名、备注和标签；多个标签筛选条件必须全部匹配。批量全选仅选择可见主机，切换筛选会移除隐藏主机的选择。
 
-`list_hosts` 返回这两个字段，并接受可选的 `tags` 数组。省略或传入空数组时返回全部主机；不存在的标签返回空列表。编辑器预填支持 `--description "备注"` 和重复的 `--tag prod --tag web`。省略字段保留原值；空备注或单个空标签可清空对应字段。CSV 模板及导入导出增加可选的 `description`、`tags` 列；标签单元格采用 `["prod","web"]` 这样的 JSON 数组，按 CSV 规则引用。旧配置和旧 CSV 继续兼容。
+`list_hosts` 返回这两个字段，并接受可选的 `tags` 数组。省略或传入空数组时返回全部主机；不存在的标签返回空列表。`open_host_editor` 可预填 `description` 和 `tags`。省略字段保留原值；空备注或单个空标签可清空对应字段。CSV 模板及导入导出增加可选的 `description`、`tags` 列；标签单元格采用 `["prod","web"]` 这样的 JSON 数组，按 CSV 规则引用。旧配置和旧 CSV 继续兼容。
 
 ```json
-{"action":"list_hosts","tags":["prod","web"]}
-{"action":"exec","alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
+{"tags":["prod","web"]}
+{"alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
 ```
 
-单主机 SSH `exec` 支持可选的 UTF-8 `stdin`，上限为 1 MiB。客户端原样发送，不自动追加换行，结束后发送 EOF。省略或 `null` 保持原有行为；`""` 立即发送 EOF。输入发送和输出读取并发进行，并沿用原有超时及输出限制。远端程序可以在读完输入前退出，此时以远端退出状态为准。
-
-`capabilities` 返回 `exec_stdin`、`exec_stdin_protocols`、`max_stdin_bytes`、`host_metadata_fields` 和 `list_hosts_tag_filter`。输入过大返回 `STDIN_TOO_LARGE`；对 Telnet、`exec_many` 或 `batch_exec` 提供 stdin 返回 `STDIN_UNSUPPORTED`。程序不会自动重放命令。
+`exec_stdin` 向单台 SSH 主机的命令发送精确的 UTF-8 文本，上限 1 MiB，不追加换行，结束后发送 EOF；`""` 立即发送 EOF。输入发送和输出读取并发进行，并沿用原有超时及输出限制。远端程序可以在读完输入前退出，此时以远端退出状态为准。输入过大返回 `STDIN_TOO_LARGE`；Telnet 主机返回 `STDIN_UNSUPPORTED`。程序不会自动重放命令。
 
 ## 执行限制
 
@@ -439,6 +427,8 @@ Tool 模式通过 UTF-8 JSON 请求文件和结果文件通信，请求和结果
 - `exec_many` 和批量任务使用受限并发。
 - 输出被截断时，可通过 `output_truncated` 判断。
 - 远程命令不会因为网络错误自动重新执行。
+- 取消 Codex 调用会关闭通道并返回 `CANCELLED`；已经开始的远程命令可能继续运行。
+- 超过几分钟的工作应放进远端主机的 `tmux` / `screen`，见 [`long-running.md`](../../skill/codex-hosts/references/long-running.md)。
 
 不自动重试是因为远程命令可能不是幂等操作，例如：
 

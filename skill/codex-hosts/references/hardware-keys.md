@@ -19,7 +19,8 @@ Read this when a host authenticates with a `*_sk` FIDO handle or through an Agen
 ## Prompts and concurrency
 
 - Direct FIDO signing and Agent signing each expect a touch or PIN prompt. Only one authentication prompt runs at a time across processes; once a session is authenticated its channels run concurrently.
-- Every tool invocation is a new process that authenticates again. Group short commands with `exec_many` so one prompt serves them, and give `connect_timeout_ms` room for the prompt.
+- Unless the host's profile keeps the session (`auth_persistence` other than `per_call`), every call authenticates again. Group short commands with `exec_many` so one prompt serves them, and give `connect_timeout_ms` room for the prompt. On a host that keeps its session, `probe` it once at the start so the touch happens when the user expects it; never propose changing that setting to reduce prompts, it is the user's decision in the app.
+- A user who wants no touch at all can create the FIDO credential with OpenSSH's `no-touch-required` option and mark the key the same way in the server's `authorized_keys`; that is a key-level choice outside this app.
 - The hardware private key never leaves the device, and Agent forwarding stays disabled.
 
 ## Failures

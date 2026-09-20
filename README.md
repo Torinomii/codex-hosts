@@ -10,7 +10,7 @@
 
 [English](README.md) | [简体中文](docs/readme/README_zh-CN.md) | [繁體中文](docs/readme/README_zh-TW.md) | [日本語](docs/readme/README_ja.md)
 
-`codex-hosts` is a Windows SSH / Telnet host manager for Codex. It lets Codex connect to and operate remote hosts without directly handling sensitive credentials such as passwords, private-key passphrases, or FIDO PINs in chat, command arguments, or request files.
+`codex-hosts` is a Windows SSH / Telnet host manager for Codex. It runs as an MCP server, so Codex connects to and operates remote hosts through structured tools without ever handling sensitive credentials such as passwords, private-key passphrases, or FIDO PINs in chat, command arguments, or files.
 
 ![Codex Hosts main window](Main.png)
 
@@ -26,16 +26,16 @@
 - Concurrent commands over one SSH connection.
 - Multi-host SSH / Telnet probing and execution.
 - Memory-only temporary secrets for API keys, tokens, and other values that should not be exposed to Codex.
-- A complete Codex Skill for host lookup, connection, authentication, and command execution.
+- An MCP server with risk-annotated tools, plus a Codex Skill for host lookup, connection, authentication, and command execution.
+- Per-host authentication persistence: re-authenticate on every operation (default), keep the session while Codex runs, or drop it after idle time.
 
-## What's new in 0.3.0
+## What's new in 0.3.1
 
-- Host descriptions and tags: search and filter the list by notes or tags, and let Codex prefill them (`--description`, `--tag`). `list_hosts` returns both fields and accepts a `tags` filter, and `exec` accepts `stdin` for command input.
-- Redesigned window: a resizable host list with a compact header, host details grouped into Basic information / Connection / Authentication / SSH host key cards, and a fixed action bar for Test connection and Save.
-- Status bar and notifications: every outcome is shown in the bottom status bar, and warnings or errors also appear as a dismissible notice in the top-right corner.
-- Batch management: a selection bar with the selected count, Select all, Export and Delete appears below the toolbar; rows get checkboxes and `Esc` leaves the mode.
-- Import and export now open as dialogs that must be closed before continuing; all confirmation dialogs share one layout, with destructive actions highlighted.
-- Layout adapts to the window size: the form uses two columns from 1040 px wide and stacks labels above fields at the minimum window size; light and dark Windows themes are both supported.
+- MCP server: `codex-hosts.exe --mcp` serves Codex over stdio. Hosts, probes, commands, batches, the host editor and temporary secrets are MCP tools with risk annotations; no shell, PowerShell wrapper or temporary request files are involved any more. The previous file-based tool mode keeps working unchanged for Skills that have not been updated.
+- Authentication persistence: every host now chooses whether Codex re-authenticates on every operation (the default and the previous behaviour), keeps the session for the Codex session, or drops it after a chosen idle time. Hosts that keep sessions are marked in the list and carry a warning in the editor.
+- Editor: required fields are marked with `*` and highlighted when a save is attempted with one empty; a new **Advanced** card holds per-host tuning (concurrent channels, default timeouts, keepalive interval, a remote-environment hint for Codex, hiding a host from Codex, and Telnet prompt overrides).
+- Cancelling a Codex call now stops the wait and closes the channel; long-running work is documented around the remote host's own `tmux` / `screen` instead of long waits.
+- `codex-hosts.exe --version` prints the version, and argument errors are reported on stderr.
 
 ## Installation
 
@@ -70,13 +70,25 @@ For a manual installation:
 %USERPROFILE%\.codex\skills\codex-hosts
 ```
 
+3. Register the MCP server in `%USERPROFILE%\.codex\config.toml` (or a workspace `.codex\config.toml`):
+
+```toml
+[mcp_servers.codex-hosts]
+command = "C:\\Users\\<user>\\.codex\\skills\\codex-hosts\\bin\\codex-hosts.exe"
+args = ["--mcp"]
+startup_timeout_sec = 20
+tool_timeout_sec = 86400
+```
+
+`tool_timeout_sec` is only a ceiling; each call carries its own timeout. If you never use blocking waits for long jobs you can leave Codex's default.
+
 Do not install only `SKILL.md` or the executable; keep the complete Skill directory.
 
 You can also ask Codex to install it:
 
 ```text
 Download and install the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest.
-Automatically find the Skill installation directory for the current environment, install the complete Skill and executable, and confirm that all required files are in place.
+Automatically find the Skill installation directory for the current environment, install the complete Skill and executable, register the codex-hosts MCP server in config.toml as described in SKILL.md, and confirm that all required files are in place.
 ```
 
 ### Build from source
@@ -169,7 +181,7 @@ The Codex Skill handles:
 - Command execution
 - Structured results
 
-Normal use does not require writing Tool JSON manually.
+Normal use does not require calling the tools manually.
 
 ## Security boundaries
 
@@ -180,7 +192,7 @@ Passwords and private-key passphrases are persistently stored in Windows Credent
 These sensitive values are not:
 
 - Written into host profiles
-- Placed in Tool JSON
+- Placed in MCP tool parameters or results
 - Passed as command-line arguments
 - Returned to Codex
 
@@ -194,6 +206,18 @@ On a first connection to an unknown host, `codex-hosts` displays the detected ho
 
 If the server host key later changes, the saved fingerprint is not replaced automatically and must be confirmed again.
 
+### Authentication persistence
+
+By default every Codex call authenticates again, so a hardware key is touched once per action and Codex never holds an open session between calls. Each host can relax this in its **Authentication** card:
+
+| Option | Behaviour |
+| --- | --- |
+| Re-authenticate on every operation | Default. The connection closes when the call ends. |
+| Keep for the Codex session | The authenticated session stays open, with keepalives, until Codex exits, the link drops, or `disconnect` is called. |
+| Disconnect after idle time | The session stays open until it has been idle for the chosen number of minutes. |
+
+While a session is kept, later Codex commands on that host run without re-authenticating or touching the security key, which removes the one-confirmation-per-action protection. The editor shows this warning, hosts that keep sessions carry a marker in the list, and Codex is told never to suggest changing the setting. Telnet hosts always re-authenticate. Credentials, PINs and host-key checks are unaffected; only the live session is reused.
+
 ### Temporary secrets
 
 `codex-hosts` can also hold temporary API keys, tokens, and other sensitive values unrelated to host login.
@@ -202,7 +226,7 @@ These values live only in the current `codex-hosts` process memory. They are not
 
 After user approval, they can be injected directly into the environment of a selected program.
 
-They expire when `codex-hosts` exits, the user signs out, or the system restarts.
+They expire when the `codex-hosts` tray application exits, the user signs out, or the system restarts. Codex starting or stopping does not affect them.
 
 See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md) for the complete behavior.
 
@@ -302,7 +326,6 @@ Use Telnet only on trusted networks where you explicitly accept that risk. SSH i
 
 ```json
 {
-  "action": "exec_many",
   "alias": "example",
   "commands": [
     "hostname",
@@ -325,7 +348,6 @@ Specify the hosts explicitly:
 
 ```json
 {
-  "action": "batch_exec",
   "aliases": [
     "web-1",
     "web-2",
@@ -341,7 +363,6 @@ Hosts can also be probed in a batch:
 
 ```json
 {
-  "action": "batch_probe",
   "aliases": [
     "web-1",
     "web-2"
@@ -354,54 +375,23 @@ Hosts can also be probed in a batch:
 Batch mode requires an explicit host list. An empty list is never interpreted as all hosts.
 
 <details>
-<summary>Codex / Tool interface</summary>
+<summary>MCP tools</summary>
 
-### GUI edit mode
+Codex talks to `codex-hosts.exe --mcp` over stdio. Every tool returns the same JSON as `structuredContent` and as text, and carries MCP annotations so a policy layer can tell read-only tools from ones that execute code.
 
-Codex or a script can open the host editor with non-secret connection details prefilled:
+| Tool | Purpose |
+| --- | --- |
+| `list_hosts` | Saved hosts with non-secret details, trust state, `auth_persistence`, `max_channels`, `remote_env` |
+| `agent_identities`, `fido_identities` | Public identity details of loaded Agent keys and FIDO handles |
+| `probe`, `batch_probe` | Authenticate and run `hostname`; surface unknown or changed host keys |
+| `exec`, `exec_stdin`, `exec_many`, `batch_exec` | Run commands; `exec_stdin` is separate because program text on stdin is opaque to review |
+| `disconnect` | Drop sessions kept for hosts that opted in |
+| `open_host_editor` | Open the editor window prefilled with non-secret details, or to confirm a reported host key |
+| `temporary_secrets_open`, `_status`, `_run`, `_clear` | Memory-only secrets held by the tray application |
 
-```powershell
-.\bin\codex-hosts.exe --codex-edit `
-  --alias example `
-  --host server.example.com `
-  --port 22 `
-  --user operator `
-  --protocol ssh `
-  --auth password `
-  --result-file result.json
-```
+Parameters never contain a password, passphrase, or PIN; the editor collects those in masked fields. Timeouts (`connect_timeout_ms`, `command_timeout_ms`, `batch_timeout_ms`) are per call and default to 120 s to connect and 10 minutes per command, or to the host's own defaults from its Advanced card.
 
-Do not pass passwords, private-key passphrases, or FIDO PINs as arguments.
-
-Authentication arguments use stable names:
-
-- `password`: password authentication.
-- `private-key` / `private_key`: ordinary private-key file or FIDO handle; `fido-handle` is also accepted.
-- `ssh-agent` / `ssh_agent`: Windows OpenSSH Agent or Pageant.
-
-`private-key` covers both ordinary OpenSSH private keys and FIDO handles.
-
-`ssh-agent` refers specifically to Agent / Pageant mode and not to every hardware-key authentication path.
-
-### Tool mode
-
-Tool mode uses UTF-8 JSON request and result files. Neither file may contain credentials.
-
-Common requests:
-
-```json
-{"action":"capabilities"}
-{"action":"list_hosts"}
-{"action":"agent_identities"}
-{"action":"fido_identities"}
-{"action":"probe","alias":"example"}
-{"action":"exec","alias":"example","command":"hostname"}
-{"action":"exec_many","alias":"example","commands":["hostname","uptime"],"max_concurrency":8}
-{"action":"batch_probe","aliases":["web-1","web-2"],"max_concurrency":8,"batch_timeout_ms":30000}
-{"action":"batch_exec","aliases":["web-1","web-2"],"command":"uptime","max_concurrency":8,"batch_timeout_ms":30000}
-```
-
-`agent_identities` and `fido_identities` return only public identity details and public keys.
+Authentication arguments to `open_host_editor` use stable names: `password`; `private-key` / `private_key` for an ordinary private-key file or a FIDO handle (`fido-handle` is also accepted); `ssh-agent` / `ssh_agent` for Windows OpenSSH Agent or Pageant.
 
 When running remote commands, check `output_truncated` to see whether output was shortened by the size limit.
 
@@ -413,16 +403,14 @@ See [`SKILL.md`](skill/codex-hosts/SKILL.md) for the full Codex behavior, workfl
 
 Hosts can store a multiline `description` and multiple `tags`. Add/remove tags in the editor; surrounding whitespace, empty tags and case-insensitive duplicates are removed, preserving the first spelling. Saving only metadata preserves connection verification and host-key trust. Search matches alias, address, username, notes and tags; selecting multiple tag filters requires all of them. Batch select-all applies only to visible hosts, and changing filters drops hidden selections.
 
-`list_hosts` includes both fields and accepts an optional `tags` array. Missing/empty filters return all hosts; unknown tags return no matches. Editor prefill supports `--description "notes"` and repeated `--tag prod --tag web`. Omitted fields preserve saved metadata; an empty description or a sole empty tag clears that field. CSV templates/import/export include optional `description` and `tags` columns; the tags cell is a JSON array such as `["prod","web"]` (CSV quoting applies). Legacy stores and CSV files remain supported.
+`list_hosts` includes both fields and accepts an optional `tags` array. Missing/empty filters return all hosts; unknown tags return no matches. `open_host_editor` prefills `description` and `tags`. Omitted fields preserve saved metadata; an empty description or a sole empty tag clears that field. CSV templates/import/export include optional `description` and `tags` columns; the tags cell is a JSON array such as `["prod","web"]` (CSV quoting applies). Legacy stores and CSV files remain supported.
 
 ```json
-{"action":"list_hosts","tags":["prod","web"]}
-{"action":"exec","alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
+{"tags":["prod","web"]}
+{"alias":"example","command":"python3 -","stdin":"print('hello')\n","command_timeout_ms":10000}
 ```
 
-Single-host SSH `exec` accepts optional UTF-8 `stdin`, up to 1 MiB. The client sends exact bytes without adding a newline, then EOF. Missing or `null` input keeps previous behavior; `""` sends EOF immediately. Input and output progress concurrently under the existing deadlines and output limits. A remote program can still exit before consuming all input; its exit status remains authoritative.
-
-`capabilities` advertises `exec_stdin`, `exec_stdin_protocols`, `max_stdin_bytes`, `host_metadata_fields` and `list_hosts_tag_filter`. Oversized input returns `STDIN_TOO_LARGE`; provided stdin for Telnet, `exec_many` or `batch_exec` returns `STDIN_UNSUPPORTED`. No command is automatically replayed.
+`exec_stdin` sends exact UTF-8 text, up to 1 MiB, to a single SSH host's command without adding a newline, then EOF; `""` sends EOF immediately. Input and output progress concurrently under the existing deadlines and output limits. A remote program can still exit before consuming all input; its exit status remains authoritative. Oversized input returns `STDIN_TOO_LARGE`; Telnet hosts return `STDIN_UNSUPPORTED`. No command is automatically replayed.
 
 ## Execution limits
 
@@ -433,6 +421,8 @@ Command execution is deliberately bounded to prevent excessive output or memory 
 - `exec_many` and batch operations use bounded concurrency.
 - Check `output_truncated` when output may have been shortened.
 - Remote commands are not automatically retried after network failures.
+- Cancelling a Codex call closes the channel and returns `CANCELLED`; a remote command that already started may keep running.
+- Work that takes more than a few minutes belongs in the remote host's `tmux` / `screen`; see [`long-running.md`](skill/codex-hosts/references/long-running.md).
 
 Automatic retries are avoided because remote commands may not be idempotent, for example:
 
