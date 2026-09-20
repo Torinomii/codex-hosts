@@ -484,6 +484,21 @@ impl SessionPool {
             .collect()
     }
 
+    fn take_unused(&self) -> Vec<Arc<PooledSession>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let keys = state
+            .entries
+            .iter()
+            .filter(|(_, entry)| Arc::strong_count(&entry.session) == 1)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| state.entries.remove(&key).map(|entry| entry.session))
+            .collect()
+    }
+
     fn idle_sessions(&self) -> Vec<Arc<PooledSession>> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
@@ -502,6 +517,12 @@ impl SessionPool {
             .filter_map(|key| state.entries.remove(&key).map(|entry| entry.session))
             .collect()
     }
+}
+
+/// The shared runtime that owns the connection pool; MCP mode serves on it so a
+/// single runtime hosts both the transport and every pooled session.
+pub(crate) fn runtime() -> &'static Runtime {
+    ssh_runtime()
 }
 
 fn ssh_runtime() -> &'static Runtime {
@@ -658,13 +679,26 @@ pub fn execute_with_input(
     stdin: Option<&str>,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
+    ssh_runtime().block_on(execute_with_input_async(
+        profile, hosts, command, stdin, limits,
+    ))
+}
+
+pub(crate) async fn execute_with_input_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    command: &str,
+    stdin: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
     validate_stdin(stdin)?;
-    ssh_runtime().block_on(run_with_optional_timeout(
+    run_with_optional_timeout(
         limits.total_timeout,
         TOTAL_TIMEOUT_CODE,
         "The complete SSH operation exceeded its time limit.",
         execute_async(profile, hosts, command, stdin, limits),
-    ))
+    )
+    .await
 }
 
 pub fn execute_many(
@@ -674,16 +708,54 @@ pub fn execute_many(
     max_concurrency: usize,
     limits: OperationLimits,
 ) -> Result<RemoteManyResult, RemoteFailure> {
-    ssh_runtime().block_on(run_with_optional_timeout(
+    ssh_runtime().block_on(execute_many_bounded(
+        profile,
+        hosts,
+        commands,
+        max_concurrency,
+        limits,
+    ))
+}
+
+pub(crate) async fn execute_many_bounded(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    commands: &[String],
+    max_concurrency: usize,
+    limits: OperationLimits,
+) -> Result<RemoteManyResult, RemoteFailure> {
+    run_with_optional_timeout(
         limits.total_timeout,
         TOTAL_TIMEOUT_CODE,
         "The complete SSH multi-command operation exceeded its time limit.",
         execute_many_async(profile, hosts, commands, max_concurrency, limits),
-    ))
+    )
+    .await
+}
+
+/// Disconnect every pooled session that no operation is using. MCP mode calls
+/// this after each tool call so a long-lived process still authenticates once
+/// per call unless a host opts into retention.
+pub(crate) fn release_unused_connections() -> usize {
+    let sessions = session_pool().take_unused();
+    let count = sessions.len();
+    for session in sessions {
+        ssh_runtime().spawn(async move {
+            let _ = session
+                .handle
+                .disconnect(Disconnect::ByApplication, "call finished", "")
+                .await;
+        });
+    }
+    count
 }
 
 pub fn agent_identities() -> Result<Vec<AgentKeyInfo>, RemoteFailure> {
-    ssh_runtime().block_on(async {
+    ssh_runtime().block_on(agent_identities_async())
+}
+
+pub(crate) async fn agent_identities_async() -> Result<Vec<AgentKeyInfo>, RemoteFailure> {
+    {
         let agents = tokio::time::timeout(AGENT_DISCOVERY_TIMEOUT, connect_local_agents())
             .await
             .map_err(|_| {
@@ -719,7 +791,7 @@ pub fn agent_identities() -> Result<Vec<AgentKeyInfo>, RemoteFailure> {
                 }
             })
             .collect())
-    })
+    }
 }
 
 async fn execute_async(

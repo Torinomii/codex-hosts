@@ -56,6 +56,34 @@ pub fn execute_many(
     }
 }
 
+pub async fn probe_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    execute_with_input_async(profile, hosts, "hostname", None, limits).await
+}
+
+pub async fn execute_with_input_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    command: &str,
+    stdin: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    ssh::validate_stdin(stdin)?;
+    match profile.protocol {
+        Protocol::Ssh => {
+            ssh::execute_with_input_async(profile, hosts, command, stdin, limits).await
+        }
+        Protocol::Telnet if stdin.is_some() => Err(RemoteFailure::new(
+            "STDIN_UNSUPPORTED",
+            "Optional stdin requires an SSH host; Telnet has no separate command input channel.",
+        )),
+        Protocol::Telnet => telnet::execute_bounded(profile, command, limits).await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

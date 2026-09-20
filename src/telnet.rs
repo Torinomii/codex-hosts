@@ -49,6 +49,20 @@ pub fn execute(
     result
 }
 
+pub(crate) async fn execute_bounded(
+    profile: &HostProfile,
+    command: &str,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    bounded(
+        limits.total_timeout,
+        TOTAL_TIMEOUT_CODE,
+        "The complete Telnet operation exceeded its time limit.",
+        execute_async(profile, command, limits),
+    )
+    .await
+}
+
 async fn execute_async(
     profile: &HostProfile,
     command: &str,

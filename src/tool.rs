@@ -18,15 +18,15 @@ use crate::model::{HostFilter, HostProfile, Protocol, SshAuth, normalize_tags};
 use crate::ssh::{self, AgentKeyInfo, OperationLimits, RemoteFailure, VerifiedHostKey};
 use crate::storage::HostStore;
 
-const SCHEMA_VERSION: u32 = 1;
-const DEFAULT_BATCH_CONCURRENCY: usize = 8;
-const MAX_BATCH_CONCURRENCY: usize = 16;
-const MAX_BATCH_HOSTS: usize = 256;
-const MAX_BATCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const DEFAULT_BATCH_CONCURRENCY: usize = 8;
+pub(crate) const MAX_BATCH_CONCURRENCY: usize = 16;
+pub(crate) const MAX_BATCH_HOSTS: usize = 256;
+pub(crate) const MAX_BATCH_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SINGLE_RESULT_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_EXEC_MANY_COMMANDS: usize = 64;
+pub(crate) const MAX_EXEC_MANY_COMMANDS: usize = 64;
 const MAX_ALIAS_BYTES: usize = 256;
-const MAX_TOOL_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
+pub(crate) const MAX_TOOL_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -110,47 +110,47 @@ fn default_continue_on_error() -> bool {
 }
 
 #[derive(Debug, Serialize)]
-struct HostSummary {
-    alias: String,
-    description: String,
-    tags: Vec<String>,
-    address: String,
-    port: u16,
-    username: String,
-    protocol: &'static str,
+pub(crate) struct HostSummary {
+    pub(crate) alias: String,
+    pub(crate) description: String,
+    pub(crate) tags: Vec<String>,
+    pub(crate) address: String,
+    pub(crate) port: u16,
+    pub(crate) username: String,
+    pub(crate) protocol: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    ssh_auth: Option<&'static str>,
+    pub(crate) ssh_auth: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    agent_key_fingerprint: Option<String>,
+    pub(crate) agent_key_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    jump_host: Option<String>,
-    verified: bool,
-    has_required_secret: bool,
-    has_host_fingerprint: bool,
+    pub(crate) jump_host: Option<String>,
+    pub(crate) verified: bool,
+    pub(crate) has_required_secret: bool,
+    pub(crate) has_host_fingerprint: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    host_key_algorithm: Option<String>,
+    pub(crate) host_key_algorithm: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-struct ListResult {
-    schema_version: u32,
-    status: &'static str,
-    hosts: Vec<HostSummary>,
+pub(crate) struct ListResult {
+    pub(crate) schema_version: u32,
+    pub(crate) status: &'static str,
+    pub(crate) hosts: Vec<HostSummary>,
 }
 
 #[derive(Debug, Serialize)]
-struct AgentIdentitiesResult {
-    schema_version: u32,
-    status: &'static str,
-    identities: Vec<AgentKeyInfo>,
+pub(crate) struct AgentIdentitiesResult {
+    pub(crate) schema_version: u32,
+    pub(crate) status: &'static str,
+    pub(crate) identities: Vec<AgentKeyInfo>,
 }
 
 #[derive(Debug, Serialize)]
-struct FidoIdentitiesResult {
-    schema_version: u32,
-    status: &'static str,
-    helper_available: bool,
-    identities: Vec<FidoKeyInfo>,
+pub(crate) struct FidoIdentitiesResult {
+    pub(crate) schema_version: u32,
+    pub(crate) status: &'static str,
+    pub(crate) helper_available: bool,
+    pub(crate) identities: Vec<FidoKeyInfo>,
 }
 
 #[derive(Debug, Serialize)]
@@ -362,7 +362,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         | ToolRequest::TemporarySecrets { .. } => unreachable!(),
         ToolRequest::AgentIdentities => unreachable!(),
         ToolRequest::FidoIdentities => unreachable!(),
-        ToolRequest::ListHosts { tags } => list_hosts(&store, tags),
+        ToolRequest::ListHosts { tags } => list_hosts(&store, tags).map(ToolResponse::List),
         ToolRequest::Probe {
             alias,
             connect_timeout_ms,
@@ -474,7 +474,10 @@ fn validate_request_input(request: &ToolRequest) -> Result<(), RemoteFailure> {
     }
 }
 
-fn list_hosts(store: &HostStore, tags: Vec<String>) -> Result<ToolResponse, RemoteFailure> {
+pub(crate) fn list_hosts(
+    store: &HostStore,
+    tags: Vec<String>,
+) -> Result<ListResult, RemoteFailure> {
     let filter = HostFilter {
         search: String::new(),
         tags: normalize_tags(tags),
@@ -509,11 +512,11 @@ fn list_hosts(store: &HostStore, tags: Vec<String>) -> Result<ToolResponse, Remo
             host_key_algorithm: host.host_key_algorithm.clone(),
         });
     }
-    Ok(ToolResponse::List(ListResult {
+    Ok(ListResult {
         schema_version: SCHEMA_VERSION,
         status: "ok",
         hosts,
-    }))
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -761,7 +764,7 @@ fn trim_largest_batch_output(result: &mut BatchResult, requested: usize) -> bool
     true
 }
 
-fn fit_many_result_budget(
+pub(crate) fn fit_many_result_budget(
     result: &mut crate::ssh::RemoteManyResult,
     limit: usize,
 ) -> Result<(), RemoteFailure> {
@@ -850,7 +853,7 @@ fn resolve_batch_hosts(
     Ok(hosts)
 }
 
-fn merge_verified_host_keys(
+pub(crate) fn merge_verified_host_keys(
     snapshot: &[HostProfile],
     verified_host_keys: &[VerifiedHostKey],
 ) -> Result<(), RemoteFailure> {
@@ -897,7 +900,7 @@ fn merge_verified_host_keys(
     Ok(())
 }
 
-fn limits(
+pub(crate) fn limits(
     connect_timeout_ms: Option<u64>,
     command_timeout_ms: Option<u64>,
     total_timeout: Option<Duration>,
@@ -915,7 +918,10 @@ fn timeout_duration(milliseconds: u64) -> Duration {
     Duration::from_millis(milliseconds.min(MAX_TOOL_TIMEOUT_MS))
 }
 
-fn find_host<'a>(store: &'a HostStore, alias: &str) -> Result<&'a HostProfile, RemoteFailure> {
+pub(crate) fn find_host<'a>(
+    store: &'a HostStore,
+    alias: &str,
+) -> Result<&'a HostProfile, RemoteFailure> {
     validate_alias(alias)?;
     store.find_alias(alias).ok_or_else(|| {
         RemoteFailure::new(
@@ -935,7 +941,7 @@ fn validate_alias(alias: &str) -> Result<(), RemoteFailure> {
     Ok(())
 }
 
-fn validate_commands(commands: &[String]) -> Result<(), RemoteFailure> {
+pub(crate) fn validate_commands(commands: &[String]) -> Result<(), RemoteFailure> {
     if commands.is_empty() {
         return Err(RemoteFailure::new(
             "COMMANDS_REQUIRED",
@@ -957,7 +963,7 @@ fn validate_commands(commands: &[String]) -> Result<(), RemoteFailure> {
     Ok(())
 }
 
-fn validate_profile(profile: &HostProfile) -> Result<(), RemoteFailure> {
+pub(crate) fn validate_profile(profile: &HostProfile) -> Result<(), RemoteFailure> {
     if let Some(issue) = profile.validation_issue() {
         return Err(RemoteFailure::new(
             "PROFILE_INVALID",
@@ -992,9 +998,6 @@ mod tests {
             ..Default::default()
         });
         let result = list_hosts(&store, vec![" prod ".into(), "WEB".into()]).unwrap();
-        let ToolResponse::List(result) = result else {
-            panic!("expected host list")
-        };
         assert_eq!(result.hosts.len(), 1);
         assert_eq!(result.hosts[0].description, "notes");
         assert_eq!(result.hosts[0].tags, ["Prod", "web"]);

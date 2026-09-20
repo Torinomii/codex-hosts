@@ -5,6 +5,7 @@ mod credentials;
 mod fido;
 mod i18n;
 mod import;
+mod mcp;
 mod model;
 mod ssh;
 mod storage;
@@ -35,7 +36,14 @@ fn main() {
             request_path,
             result_path,
         }) => std::process::exit(tool::run(&request_path, &result_path)),
-        Err(_) => std::process::exit(2),
+        Ok(LaunchMode::Mcp) => std::process::exit(mcp::run()),
+        Ok(LaunchMode::Version) => {
+            println!("codex-hosts {}", env!("CARGO_PKG_VERSION"));
+        }
+        Err(error) => {
+            eprintln!("codex-hosts: {error}");
+            std::process::exit(2)
+        }
     }
 }
 
@@ -72,6 +80,8 @@ enum LaunchMode {
         request_path: PathBuf,
         result_path: PathBuf,
     },
+    Mcp,
+    Version,
 }
 
 fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
@@ -82,6 +92,18 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
         return uuid::Uuid::parse_str(&args[1])
             .map(LaunchMode::TemporarySecrets)
             .map_err(|_| "invalid session UUID".into());
+    }
+    if args.first().is_some_and(|arg| arg == "--mcp") {
+        if args.len() != 1 {
+            return Err("--mcp accepts no other arguments".into());
+        }
+        return Ok(LaunchMode::Mcp);
+    }
+    if args.first().is_some_and(|arg| arg == "--version") {
+        if args.len() != 1 {
+            return Err("--version accepts no other arguments".into());
+        }
+        return Ok(LaunchMode::Version);
     }
     let mut options = ui::LaunchOptions::default();
     let mut request_path = None;
@@ -229,6 +251,20 @@ mod tests {
         assert!(error.contains("fido-handle"));
         assert!(error.contains("SSH Agent/Pageant"));
     }
+    #[test]
+    fn mcp_and_version_modes_take_no_other_arguments() {
+        assert!(matches!(
+            parse_args(vec!["--mcp".into()]).unwrap(),
+            LaunchMode::Mcp
+        ));
+        assert!(matches!(
+            parse_args(vec!["--version".into()]).unwrap(),
+            LaunchMode::Version
+        ));
+        assert!(parse_args(vec!["--mcp".into(), "--alias".into(), "x".into()]).is_err());
+        assert!(parse_args(vec!["--alias".into(), "x".into(), "--mcp".into()]).is_err());
+    }
+
     #[test]
     fn temporary_mode_accepts_only_an_opaque_uuid() {
         let id = uuid::Uuid::new_v4();
