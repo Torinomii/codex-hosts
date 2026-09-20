@@ -18,7 +18,7 @@ use crate::fido;
 use crate::ssh::{self, OperationLimits, RemoteFailure};
 use crate::storage::HostStore;
 use crate::tool::{
-    self, AgentIdentitiesResult, DEFAULT_BATCH_CONCURRENCY, FidoIdentitiesResult,
+    self, AgentIdentitiesResult, BatchAction, DEFAULT_BATCH_CONCURRENCY, FidoIdentitiesResult,
     MAX_BATCH_CONCURRENCY, MAX_BATCH_OUTPUT_BYTES, SCHEMA_VERSION,
 };
 
@@ -116,6 +116,54 @@ struct ExecManyParams {
     /// Bounds each command; defaults to 10 minutes.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BatchProbeParams {
+    /// Explicit list of 1 to 256 saved host aliases; an empty list is rejected, never "all hosts".
+    aliases: Vec<String>,
+    /// Hosts worked on at the same time (1-16, default 8).
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+    /// Bounds each host's connection and authentication.
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    /// Bounds each host's remote `hostname`.
+    #[serde(default)]
+    command_timeout_ms: Option<u64>,
+    /// Deadline for the whole batch; hosts that have not started by then are reported as BATCH_TIMEOUT.
+    #[serde(default)]
+    batch_timeout_ms: Option<u64>,
+    /// Keep going after a host fails (default true); false stops starting new hosts after the first failure.
+    #[serde(default = "default_true")]
+    continue_on_error: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BatchExecParams {
+    /// Explicit list of 1 to 256 saved host aliases; an empty list is rejected, never "all hosts".
+    aliases: Vec<String>,
+    /// The same command line, sent exactly as given to every listed host.
+    command: String,
+    /// Hosts worked on at the same time (1-16, default 8).
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+    /// Bounds each host's connection and authentication.
+    #[serde(default)]
+    connect_timeout_ms: Option<u64>,
+    /// Bounds each host's command.
+    #[serde(default)]
+    command_timeout_ms: Option<u64>,
+    /// Deadline for the whole batch; hosts that have not started by then are reported as BATCH_TIMEOUT.
+    #[serde(default)]
+    batch_timeout_ms: Option<u64>,
+    /// Keep going after a host fails (default true); false stops starting new hosts after the first failure.
+    #[serde(default = "default_true")]
+    continue_on_error: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[tool_router]
@@ -242,6 +290,68 @@ impl Server {
     ) -> CallToolResult {
         finish(cancellable(ct, exec_many_host(params)).await)
     }
+
+    #[tool(
+        name = "batch_probe",
+        description = "Connect to and authenticate against an explicit list of saved hosts, running `hostname` on each, with results in input order. Host keys are never trusted automatically; failures carry the observed fingerprint for the editor. Success updates local trust metadata.",
+        annotations(read_only_hint = true, open_world_hint = true)
+    )]
+    async fn batch_probe(
+        &self,
+        Parameters(params): Parameters<BatchProbeParams>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(
+            cancellable(ct, async move {
+                let hosts = load_store()?.hosts;
+                tool::execute_batch(
+                    &hosts,
+                    params.aliases,
+                    BatchAction::Probe,
+                    params.max_concurrency,
+                    Some(connect_timeout_or_default(params.connect_timeout_ms)),
+                    Some(command_timeout_or_default(params.command_timeout_ms)),
+                    params.batch_timeout_ms,
+                    params.continue_on_error,
+                )
+                .await
+            })
+            .await,
+        )
+    }
+
+    #[tool(
+        name = "batch_exec",
+        description = "Run the same command on an explicit list of saved hosts (fan-out), with results in input order and a per-batch output budget. Partition heterogeneous hosts by shell before using it. Cancelling stops the batch; commands already started may finish on their hosts.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn batch_exec(
+        &self,
+        Parameters(params): Parameters<BatchExecParams>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(
+            cancellable(ct, async move {
+                let hosts = load_store()?.hosts;
+                tool::execute_batch(
+                    &hosts,
+                    params.aliases,
+                    BatchAction::Exec(params.command),
+                    params.max_concurrency,
+                    Some(connect_timeout_or_default(params.connect_timeout_ms)),
+                    Some(command_timeout_or_default(params.command_timeout_ms)),
+                    params.batch_timeout_ms,
+                    params.continue_on_error,
+                )
+                .await
+            })
+            .await,
+        )
+    }
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -327,10 +437,19 @@ fn load_store() -> Result<HostStore, RemoteFailure> {
 }
 
 fn mcp_limits(connect_timeout_ms: Option<u64>, command_timeout_ms: Option<u64>) -> OperationLimits {
-    let mut limits = tool::limits(connect_timeout_ms, command_timeout_ms, None);
-    limits.connect_timeout = limits.connect_timeout.or(Some(DEFAULT_CONNECT_TIMEOUT));
-    limits.command_timeout = limits.command_timeout.or(Some(DEFAULT_COMMAND_TIMEOUT));
-    limits
+    tool::limits(
+        Some(connect_timeout_or_default(connect_timeout_ms)),
+        Some(command_timeout_or_default(command_timeout_ms)),
+        None,
+    )
+}
+
+fn connect_timeout_or_default(connect_timeout_ms: Option<u64>) -> u64 {
+    connect_timeout_ms.unwrap_or(DEFAULT_CONNECT_TIMEOUT.as_millis() as u64)
+}
+
+fn command_timeout_or_default(command_timeout_ms: Option<u64>) -> u64 {
+    command_timeout_ms.unwrap_or(DEFAULT_COMMAND_TIMEOUT.as_millis() as u64)
 }
 
 /// Convert a tool outcome into the MCP result and release every connection the
@@ -405,6 +524,8 @@ mod tests {
             names,
             [
                 "agent_identities",
+                "batch_exec",
+                "batch_probe",
                 "exec",
                 "exec_many",
                 "exec_stdin",
@@ -416,13 +537,10 @@ mod tests {
         for tool in &tools {
             let annotations = tool.annotations.as_ref().expect("annotations");
             let name = tool.name.as_ref();
-            let executes = name.starts_with("exec");
+            let executes = name.starts_with("exec") || name == "batch_exec";
+            let connects = executes || name == "probe" || name == "batch_probe";
             assert_eq!(annotations.read_only_hint, Some(!executes), "{name}");
-            assert_eq!(
-                annotations.open_world_hint,
-                Some(executes || name == "probe"),
-                "{name}"
-            );
+            assert_eq!(annotations.open_world_hint, Some(connects), "{name}");
             if executes {
                 assert_eq!(annotations.destructive_hint, Some(true), "{name}");
             }

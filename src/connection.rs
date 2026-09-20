@@ -13,15 +13,6 @@ pub fn probe(
     }
 }
 
-pub fn execute(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    command: &str,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    execute_with_input(profile, hosts, command, None, limits)
-}
-
 pub fn execute_with_input(
     profile: &HostProfile,
     hosts: &[HostProfile],

@@ -6,10 +6,10 @@ use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
-use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
 
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
@@ -188,7 +188,7 @@ struct BatchSummary {
 }
 
 #[derive(Debug, Serialize)]
-struct BatchResult {
+pub(crate) struct BatchResult {
     schema_version: u32,
     status: &'static str,
     action: &'static str,
@@ -197,10 +197,10 @@ struct BatchResult {
     summary: BatchSummary,
 }
 
-#[derive(Clone, Copy)]
-enum BatchAction<'a> {
+#[derive(Debug, Clone)]
+pub(crate) enum BatchAction {
     Probe,
-    Exec(&'a str),
+    Exec(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -428,17 +428,18 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             command_timeout_ms,
             batch_timeout_ms,
             continue_on_error,
-        } => execute_batch(
-            &store,
-            aliases,
-            BatchAction::Probe,
-            max_concurrency,
-            connect_timeout_ms,
-            command_timeout_ms,
-            batch_timeout_ms,
-            continue_on_error,
-        )
-        .map(ToolResponse::Batch),
+        } => ssh::runtime()
+            .block_on(execute_batch(
+                &store.hosts,
+                aliases,
+                BatchAction::Probe,
+                max_concurrency,
+                connect_timeout_ms,
+                command_timeout_ms,
+                batch_timeout_ms,
+                continue_on_error,
+            ))
+            .map(ToolResponse::Batch),
         ToolRequest::BatchExec {
             aliases,
             command,
@@ -448,17 +449,18 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             command_timeout_ms,
             batch_timeout_ms,
             continue_on_error,
-        } => execute_batch(
-            &store,
-            aliases,
-            BatchAction::Exec(&command),
-            max_concurrency,
-            connect_timeout_ms,
-            command_timeout_ms,
-            batch_timeout_ms,
-            continue_on_error,
-        )
-        .map(ToolResponse::Batch),
+        } => ssh::runtime()
+            .block_on(execute_batch(
+                &store.hosts,
+                aliases,
+                BatchAction::Exec(command),
+                max_concurrency,
+                connect_timeout_ms,
+                command_timeout_ms,
+                batch_timeout_ms,
+                continue_on_error,
+            ))
+            .map(ToolResponse::Batch),
     }
 }
 
@@ -519,18 +521,21 @@ pub(crate) fn list_hosts(
     })
 }
 
+/// Runs every host as a task on the caller's runtime. Dropping the returned
+/// future (MCP cancellation) aborts the tasks, which closes their channels.
 #[allow(clippy::too_many_arguments)]
-fn execute_batch(
-    store: &HostStore,
+pub(crate) async fn execute_batch(
+    hosts: &[HostProfile],
     aliases: Vec<String>,
-    action: BatchAction<'_>,
+    action: BatchAction,
     max_concurrency: Option<usize>,
     connect_timeout_ms: Option<u64>,
     command_timeout_ms: Option<u64>,
     batch_timeout_ms: Option<u64>,
     continue_on_error: bool,
 ) -> Result<BatchResult, RemoteFailure> {
-    let hosts = resolve_batch_hosts(store, &aliases)?;
+    let snapshot = Arc::new(hosts.to_vec());
+    let hosts = resolve_batch_hosts(&snapshot, &aliases)?;
     let concurrency = max_concurrency
         .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
         .clamp(1, MAX_BATCH_CONCURRENCY)
@@ -552,77 +557,90 @@ fn execute_batch(
             .collect::<Vec<Option<BatchWorkResult>>>(),
     ));
     let stop = Arc::new(AtomicBool::new(false));
-    let snapshot = Arc::new(store.hosts.clone());
+    let action = Arc::new(action);
 
-    thread::scope(|scope| {
-        for _ in 0..concurrency {
-            let queue = Arc::clone(&queue);
-            let results = Arc::clone(&results);
-            let stop = Arc::clone(&stop);
-            let snapshot = Arc::clone(&snapshot);
-            scope.spawn(move || {
-                loop {
-                    if stop.load(Ordering::Acquire) {
-                        break;
-                    }
-                    let Some((index, host)) =
-                        queue.lock().ok().and_then(|mut queue| queue.pop_front())
-                    else {
-                        break;
-                    };
-                    let total_timeout =
-                        deadline.map(|value| value.saturating_duration_since(Instant::now()));
-                    let outcome = if total_timeout == Some(Duration::ZERO) {
-                        Err(failure_for_alias(
-                            &host.alias,
-                            "BATCH_TIMEOUT",
-                            "The whole-batch deadline expired before this host started.",
-                        ))
-                    } else {
-                        let mut operation_limits =
-                            limits(connect_timeout_ms, command_timeout_ms, total_timeout);
-                        operation_limits.output_bytes = Some(per_host_output_bytes);
-                        operation_limits.batch_scope = Some(batch_scope);
-                        match action {
-                            BatchAction::Probe => {
-                                connection::probe(&host, snapshot.as_slice(), operation_limits)
-                            }
-                            BatchAction::Exec(command) => connection::execute(
+    let mut workers = JoinSet::new();
+    for _ in 0..concurrency {
+        let queue = Arc::clone(&queue);
+        let results = Arc::clone(&results);
+        let stop = Arc::clone(&stop);
+        let snapshot = Arc::clone(&snapshot);
+        let action = Arc::clone(&action);
+        workers.spawn(async move {
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let Some((index, host)) = queue.lock().ok().and_then(|mut queue| queue.pop_front())
+                else {
+                    break;
+                };
+                let total_timeout =
+                    deadline.map(|value| value.saturating_duration_since(Instant::now()));
+                let outcome = if total_timeout == Some(Duration::ZERO) {
+                    Err(failure_for_alias(
+                        &host.alias,
+                        "BATCH_TIMEOUT",
+                        "The whole-batch deadline expired before this host started.",
+                    ))
+                } else {
+                    let mut operation_limits =
+                        limits(connect_timeout_ms, command_timeout_ms, total_timeout);
+                    operation_limits.output_bytes = Some(per_host_output_bytes);
+                    operation_limits.batch_scope = Some(batch_scope);
+                    match action.as_ref() {
+                        BatchAction::Probe => {
+                            connection::probe_async(&host, snapshot.as_slice(), operation_limits)
+                                .await
+                        }
+                        BatchAction::Exec(command) => {
+                            connection::execute_with_input_async(
                                 &host,
                                 snapshot.as_slice(),
                                 command,
+                                None,
                                 operation_limits,
-                            ),
+                            )
+                            .await
                         }
-                    };
-                    let work_result = match outcome {
-                        Ok(mut result) => {
-                            limit_result_output(&mut result, per_host_output_bytes);
-                            BatchWorkResult {
-                                verified_host_keys: result.verified_host_keys.clone(),
-                                item: BatchItem::Success(result),
-                            }
-                        }
-                        Err(mut error) => {
-                            if error.host_alias.is_none() {
-                                error.host_alias = Some(host.alias.clone().into_boxed_str());
-                            }
-                            if !continue_on_error {
-                                stop.store(true, Ordering::Release);
-                            }
-                            BatchWorkResult {
-                                item: BatchItem::Failure(error),
-                                verified_host_keys: Vec::new(),
-                            }
-                        }
-                    };
-                    if let Ok(mut slots) = results.lock() {
-                        slots[index] = Some(work_result);
                     }
+                };
+                let work_result = match outcome {
+                    Ok(mut result) => {
+                        limit_result_output(&mut result, per_host_output_bytes);
+                        BatchWorkResult {
+                            verified_host_keys: result.verified_host_keys.clone(),
+                            item: BatchItem::Success(result),
+                        }
+                    }
+                    Err(mut error) => {
+                        if error.host_alias.is_none() {
+                            error.host_alias = Some(host.alias.clone().into_boxed_str());
+                        }
+                        if !continue_on_error {
+                            stop.store(true, Ordering::Release);
+                        }
+                        BatchWorkResult {
+                            item: BatchItem::Failure(error),
+                            verified_host_keys: Vec::new(),
+                        }
+                    }
+                };
+                if let Ok(mut slots) = results.lock() {
+                    slots[index] = Some(work_result);
                 }
-            });
+            }
+        });
+    }
+    while let Some(joined) = workers.join_next().await {
+        if let Err(error) = joined {
+            ssh::finish_batch_scope(batch_scope);
+            return Err(RemoteFailure::new(
+                "BATCH_INTERNAL_FAILED",
+                error.to_string(),
+            ));
         }
-    });
+    }
     ssh::finish_batch_scope(batch_scope);
 
     let mut verified_host_keys = Vec::new();
@@ -658,7 +676,7 @@ fn execute_batch(
         verified_host_keys.extend(work_result.verified_host_keys);
         values.push(work_result.item);
     }
-    if matches!(action, BatchAction::Probe) && !verified_host_keys.is_empty() {
+    if matches!(action.as_ref(), BatchAction::Probe) && !verified_host_keys.is_empty() {
         merge_verified_host_keys(snapshot.as_slice(), &verified_host_keys)?;
     }
     let status = if summary.failed == 0 && summary.cancelled == 0 {
@@ -673,7 +691,7 @@ fn execute_batch(
     let mut result = BatchResult {
         schema_version: SCHEMA_VERSION,
         status,
-        action: match action {
+        action: match action.as_ref() {
             BatchAction::Probe => "batch_probe",
             BatchAction::Exec(_) => "batch_exec",
         },
@@ -820,7 +838,7 @@ fn truncate_utf8(value: &mut String, limit: usize) {
 }
 
 fn resolve_batch_hosts(
-    store: &HostStore,
+    hosts: &[HostProfile],
     aliases: &[String],
 ) -> Result<Vec<HostProfile>, RemoteFailure> {
     if aliases.is_empty() {
@@ -836,7 +854,7 @@ fn resolve_batch_hosts(
         ));
     }
     let mut seen = HashSet::new();
-    let mut hosts = Vec::with_capacity(aliases.len());
+    let mut resolved = Vec::with_capacity(aliases.len());
     for alias in aliases {
         validate_alias(alias)?;
         let normalized = alias.trim().to_ascii_lowercase();
@@ -846,11 +864,11 @@ fn resolve_batch_hosts(
                 format!("The batch contains an empty or duplicate alias: {alias}."),
             ));
         }
-        let host = find_host(store, alias)?.clone();
+        let host = find_host_in(hosts, alias)?.clone();
         validate_profile(&host)?;
-        hosts.push(host);
+        resolved.push(host);
     }
-    Ok(hosts)
+    Ok(resolved)
 }
 
 pub(crate) fn merge_verified_host_keys(
@@ -922,13 +940,24 @@ pub(crate) fn find_host<'a>(
     store: &'a HostStore,
     alias: &str,
 ) -> Result<&'a HostProfile, RemoteFailure> {
+    find_host_in(&store.hosts, alias)
+}
+
+pub(crate) fn find_host_in<'a>(
+    hosts: &'a [HostProfile],
+    alias: &str,
+) -> Result<&'a HostProfile, RemoteFailure> {
     validate_alias(alias)?;
-    store.find_alias(alias).ok_or_else(|| {
-        RemoteFailure::new(
-            "ALIAS_NOT_FOUND",
-            format!("No saved host is named {alias}."),
-        )
-    })
+    let alias_trimmed = alias.trim();
+    hosts
+        .iter()
+        .find(|host| host.alias.eq_ignore_ascii_case(alias_trimmed))
+        .ok_or_else(|| {
+            RemoteFailure::new(
+                "ALIAS_NOT_FOUND",
+                format!("No saved host is named {alias}."),
+            )
+        })
 }
 
 fn validate_alias(alias: &str) -> Result<(), RemoteFailure> {
@@ -1041,7 +1070,7 @@ mod tests {
     #[test]
     fn rejects_implicit_all_host_batch() {
         let store = HostStore::default();
-        let error = resolve_batch_hosts(&store, &[]).unwrap_err();
+        let error = resolve_batch_hosts(&store.hosts, &[]).unwrap_err();
         assert_eq!(error.code, "BATCH_ALIASES_REQUIRED");
     }
 
@@ -1053,7 +1082,7 @@ mod tests {
         host.username = "tester".to_owned();
         store.hosts.push(host);
         let aliases = vec!["web-1".to_owned(), "WEB-1".to_owned()];
-        let error = resolve_batch_hosts(&store, &aliases).unwrap_err();
+        let error = resolve_batch_hosts(&store.hosts, &aliases).unwrap_err();
         assert_eq!(error.code, "BATCH_ALIAS_INVALID");
     }
 
