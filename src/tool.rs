@@ -14,7 +14,9 @@ use tokio::task::JoinSet;
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
-use crate::model::{AuthPersistence, HostFilter, HostProfile, Protocol, SshAuth, normalize_tags};
+use crate::model::{
+    AuthPersistence, HostFilter, HostProfile, Protocol, RemoteEnv, SshAuth, normalize_tags,
+};
 use crate::ssh::{self, AgentKeyInfo, OperationLimits, RemoteFailure, VerifiedHostKey};
 use crate::storage::HostStore;
 
@@ -126,6 +128,8 @@ pub(crate) struct HostSummary {
     pub(crate) jump_host: Option<String>,
     pub(crate) verified: bool,
     pub(crate) auth_persistence: AuthPersistence,
+    pub(crate) max_channels: usize,
+    pub(crate) remote_env: RemoteEnv,
     pub(crate) has_required_secret: bool,
     pub(crate) has_host_fingerprint: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -486,7 +490,11 @@ pub(crate) fn list_hosts(
         tags: normalize_tags(tags),
     };
     let mut hosts = Vec::with_capacity(store.hosts.len());
-    for host in store.hosts.iter().filter(|host| filter.matches(host)) {
+    for host in store
+        .hosts
+        .iter()
+        .filter(|host| !host.advanced.codex_hidden && filter.matches(host))
+    {
         let has_required_secret = match (host.protocol, host.ssh_auth) {
             (Protocol::Ssh, SshAuth::PrivateKey | SshAuth::SshAgent) => true,
             _ => credentials::has(host.id, CredentialKind::Password)
@@ -511,6 +519,8 @@ pub(crate) fn list_hosts(
                 .map(|item| item.alias.clone()),
             verified: host.verified,
             auth_persistence: host.effective_auth_persistence(),
+            max_channels: host.advanced.max_channels(),
+            remote_env: host.advanced.remote_env,
             has_required_secret,
             has_host_fingerprint: host.host_fingerprint.is_some(),
             host_key_algorithm: host.host_key_algorithm.clone(),
@@ -951,7 +961,7 @@ pub(crate) fn find_host_in<'a>(
 ) -> Result<&'a HostProfile, RemoteFailure> {
     validate_alias(alias)?;
     let alias_trimmed = alias.trim();
-    hosts
+    let host = hosts
         .iter()
         .find(|host| host.alias.eq_ignore_ascii_case(alias_trimmed))
         .ok_or_else(|| {
@@ -959,7 +969,14 @@ pub(crate) fn find_host_in<'a>(
                 "ALIAS_NOT_FOUND",
                 format!("No saved host is named {alias}."),
             )
-        })
+        })?;
+    if host.advanced.codex_hidden {
+        return Err(RemoteFailure::new(
+            "HOST_HIDDEN",
+            format!("The host {alias} is hidden from Codex in its profile."),
+        ));
+    }
+    Ok(host)
 }
 
 fn validate_alias(alias: &str) -> Result<(), RemoteFailure> {
@@ -1013,6 +1030,36 @@ fn failure_for_alias(alias: &str, code: &'static str, message: impl Into<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_hosts_are_invisible_and_unusable_for_codex() {
+        let mut store = HostStore::default();
+        let mut hidden = HostProfile {
+            alias: "secret".into(),
+            address: "10.0.0.1".into(),
+            username: "u".into(),
+            ..Default::default()
+        };
+        hidden.advanced.codex_hidden = true;
+        store.hosts.push(hidden);
+        store.hosts.push(HostProfile {
+            alias: "open".into(),
+            address: "10.0.0.2".into(),
+            username: "u".into(),
+            ..Default::default()
+        });
+        let listed = list_hosts(&store, vec![]).unwrap();
+        assert_eq!(listed.hosts.len(), 1);
+        assert_eq!(listed.hosts[0].alias, "open");
+        assert_eq!(listed.hosts[0].max_channels, 8);
+        assert_eq!(find_host(&store, "secret").unwrap_err().code, "HOST_HIDDEN");
+        assert_eq!(
+            resolve_batch_hosts(&store.hosts, &["open".into(), "SECRET".into()])
+                .unwrap_err()
+                .code,
+            "HOST_HIDDEN"
+        );
+    }
 
     #[test]
     fn discovery_filters_metadata_without_touching_excluded_credentials() {

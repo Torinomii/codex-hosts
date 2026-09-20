@@ -128,6 +128,7 @@ pub fn parse_template(
             jump_host: None,
             verified: false,
             auth_persistence: AuthPersistence::PerCall,
+            advanced: Default::default(),
         };
         if profile.validation_issue().is_some() {
             return Err(ImportError::InvalidHost { alias });

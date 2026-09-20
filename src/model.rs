@@ -98,6 +98,84 @@ pub fn chain_retention<'a>(chain: impl IntoIterator<Item = &'a HostProfile>) -> 
     retention
 }
 
+pub const MAX_CHANNELS_PER_HOST: u8 = 16;
+pub const DEFAULT_CHANNELS_PER_HOST: u8 = 8;
+pub const MIN_KEEPALIVE_SECONDS: u16 = 10;
+pub const MAX_KEEPALIVE_SECONDS: u16 = 300;
+pub const DEFAULT_KEEPALIVE_SECONDS: u16 = 30;
+
+/// A hint for Codex about the remote shell family; codex-hosts itself never
+/// acts on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteEnv {
+    #[default]
+    Auto,
+    Posix,
+    Windows,
+}
+
+/// Login-flow prompts for Telnet devices whose banners differ from the defaults.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct TelnetPrompts {
+    pub login: String,
+    pub password: String,
+}
+
+/// Optional per-host tuning; every field left at its default means "use the
+/// global value", and profiles saved before these existed read back unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct AdvancedSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_channels: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_s: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command_timeout_s: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keepalive_s: Option<u16>,
+    #[serde(skip_serializing_if = "is_auto")]
+    pub remote_env: RemoteEnv,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub codex_hidden: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telnet_prompts: Option<TelnetPrompts>,
+}
+
+fn is_auto(value: &RemoteEnv) -> bool {
+    *value == RemoteEnv::Auto
+}
+
+impl AdvancedSettings {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    pub fn max_channels(&self) -> usize {
+        usize::from(self.max_channels.unwrap_or(DEFAULT_CHANNELS_PER_HOST))
+    }
+
+    pub fn keepalive(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(u64::from(
+            self.keepalive_s.unwrap_or(DEFAULT_KEEPALIVE_SECONDS),
+        ))
+    }
+
+    fn validation_issue(&self) -> Option<ValidationIssue> {
+        let channels_ok = self
+            .max_channels
+            .is_none_or(|value| (1..=MAX_CHANNELS_PER_HOST).contains(&value));
+        let keepalive_ok = self
+            .keepalive_s
+            .is_none_or(|value| (MIN_KEEPALIVE_SECONDS..=MAX_KEEPALIVE_SECONDS).contains(&value));
+        let timeouts_ok = self.connect_timeout_s.is_none_or(|value| value >= 1)
+            && self.command_timeout_s.is_none_or(|value| value >= 1);
+        (!(channels_ok && keepalive_ok && timeouts_ok)).then_some(ValidationIssue::Advanced)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostProfile {
@@ -119,6 +197,7 @@ pub struct HostProfile {
     pub jump_host: Option<Uuid>,
     pub verified: bool,
     pub auth_persistence: AuthPersistence,
+    pub advanced: AdvancedSettings,
 }
 
 impl Default for HostProfile {
@@ -142,6 +221,7 @@ impl Default for HostProfile {
             jump_host: None,
             verified: false,
             auth_persistence: AuthPersistence::PerCall,
+            advanced: AdvancedSettings::default(),
         }
     }
 }
@@ -176,7 +256,12 @@ impl HostProfile {
         if self.protocol == Protocol::Telnet && self.jump_host.is_some() {
             return Some(ValidationIssue::TelnetChain);
         }
-        None
+        if let AuthPersistence::Idle { minutes } = self.auth_persistence
+            && !(1..=MAX_IDLE_PERSISTENCE_MINUTES).contains(&minutes)
+        {
+            return Some(ValidationIssue::AuthPersistence);
+        }
+        self.advanced.validation_issue()
     }
 
     /// Telnet has no session layer yet, so its profiles always authenticate per call.
@@ -244,6 +329,8 @@ pub enum ValidationIssue {
     PrivateKey,
     Chain,
     TelnetChain,
+    AuthPersistence,
+    Advanced,
 }
 
 impl ValidationIssue {
@@ -256,6 +343,8 @@ impl ValidationIssue {
             Self::PrivateKey => "validation_private_key",
             Self::Chain => "validation_chain",
             Self::TelnetChain => "validation_telnet_chain",
+            Self::AuthPersistence => "validation_auth_persistence",
+            Self::Advanced => "validation_advanced",
         }
     }
 }

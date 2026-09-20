@@ -69,12 +69,16 @@ struct CallGates {
     calls: Arc<Semaphore>,
     batch: Arc<RwLock<()>>,
     hosts: Mutex<HashMap<uuid::Uuid, Weak<AsyncMutex<()>>>>,
+    /// Channels open on a retained host across concurrent calls, sized by the
+    /// profile's `max_channels`.
+    channels: Mutex<HashMap<uuid::Uuid, Weak<Semaphore>>>,
 }
 
 struct CallGuard {
     _permit: OwnedSemaphorePermit,
     _batch: BatchGuard,
     _hosts: Vec<OwnedMutexGuard<()>>,
+    _channels: Option<OwnedSemaphorePermit>,
 }
 
 #[allow(dead_code)] // held only for its drop
@@ -89,7 +93,21 @@ impl CallGates {
             calls: Arc::new(Semaphore::new(MAX_CONCURRENT_CALLS)),
             batch: Arc::new(RwLock::new(())),
             hosts: Mutex::new(HashMap::new()),
+            channels: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn channel_budget(&self, host: &HostProfile) -> Arc<Semaphore> {
+        let mut budgets = self
+            .channels
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(budget) = budgets.get(&host.id).and_then(Weak::upgrade) {
+            return budget;
+        }
+        let budget = Arc::new(Semaphore::new(host.advanced.max_channels()));
+        budgets.insert(host.id, Arc::downgrade(&budget));
+        budget
     }
 
     fn host_lock(&self, host_id: uuid::Uuid) -> Arc<AsyncMutex<()>> {
@@ -105,7 +123,12 @@ impl CallGates {
         lock
     }
 
-    async fn single_host(&self, target: &HostProfile, hosts: &[HostProfile]) -> CallGuard {
+    async fn single_host(
+        &self,
+        target: &HostProfile,
+        hosts: &[HostProfile],
+        channels: u32,
+    ) -> CallGuard {
         let permit = self.permit().await;
         let batch = BatchGuard::Shared(Arc::clone(&self.batch).read_owned().await);
         let mut per_call = resolve_ssh_chain(target, hosts)
@@ -121,10 +144,17 @@ impl CallGates {
         for host_id in per_call {
             guards.push(self.host_lock(host_id).lock_owned().await);
         }
+        let channels = channels.min(target.advanced.max_channels() as u32).max(1);
+        let channel_permit = self
+            .channel_budget(target)
+            .acquire_many_owned(channels)
+            .await
+            .expect("channel budget is never closed");
         CallGuard {
             _permit: permit,
             _batch: batch,
             _hosts: guards,
+            _channels: Some(channel_permit),
         }
     }
 
@@ -135,6 +165,7 @@ impl CallGates {
             _permit: permit,
             _batch: batch,
             _hosts: Vec::new(),
+            _channels: None,
         }
     }
 
@@ -498,11 +529,11 @@ async fn probe_host(
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
-    let _guard = gates.single_host(&host, &store.hosts).await;
+    let _guard = gates.single_host(&host, &store.hosts, 1).await;
     let result = connection::probe_async(
         &host,
         &store.hosts,
-        mcp_limits(params.connect_timeout_ms, params.command_timeout_ms),
+        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
     )
     .await?;
     tool::merge_verified_host_keys(&store.hosts, &result.verified_host_keys)?;
@@ -517,13 +548,13 @@ async fn exec_host(
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
-    let _guard = gates.single_host(&host, &store.hosts).await;
+    let _guard = gates.single_host(&host, &store.hosts, 1).await;
     connection::execute_with_input_async(
         &host,
         &store.hosts,
         &params.command,
         stdin.as_deref(),
-        mcp_limits(params.connect_timeout_ms, params.command_timeout_ms),
+        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
     )
     .await
 }
@@ -536,12 +567,15 @@ async fn exec_many_host(
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
-    let _guard = gates.single_host(&host, &store.hosts).await;
     let concurrency = params
         .max_concurrency
         .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
-        .clamp(1, MAX_BATCH_CONCURRENCY);
-    let mut limits = mcp_limits(params.connect_timeout_ms, params.command_timeout_ms);
+        .clamp(1, MAX_BATCH_CONCURRENCY)
+        .min(host.advanced.max_channels());
+    let _guard = gates
+        .single_host(&host, &store.hosts, concurrency as u32)
+        .await;
+    let mut limits = host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms);
     limits.output_bytes = Some(MAX_BATCH_OUTPUT_BYTES);
     let mut result =
         connection::execute_many_async(&host, &store.hosts, &params.commands, concurrency, limits)
@@ -587,10 +621,21 @@ fn load_store() -> Result<HostStore, RemoteFailure> {
     HostStore::load().map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))
 }
 
-fn mcp_limits(connect_timeout_ms: Option<u64>, command_timeout_ms: Option<u64>) -> OperationLimits {
+/// Explicit per-call timeouts win; otherwise the host profile's defaults, then
+/// the MCP-wide defaults.
+fn host_limits(
+    host: &HostProfile,
+    connect_timeout_ms: Option<u64>,
+    command_timeout_ms: Option<u64>,
+) -> OperationLimits {
+    let seconds = |value: u32| u64::from(value) * 1000;
     tool::limits(
-        Some(connect_timeout_or_default(connect_timeout_ms)),
-        Some(command_timeout_or_default(command_timeout_ms)),
+        Some(connect_timeout_or_default(
+            connect_timeout_ms.or(host.advanced.connect_timeout_s.map(seconds)),
+        )),
+        Some(command_timeout_or_default(
+            command_timeout_ms.or(host.advanced.command_timeout_s.map(seconds)),
+        )),
         None,
     )
 }
@@ -719,13 +764,57 @@ mod tests {
     }
 
     #[test]
-    fn omitted_timeouts_receive_bounded_defaults_and_explicit_values_win() {
-        let defaults = mcp_limits(None, None);
+    fn omitted_timeouts_fall_back_to_host_then_global_defaults() {
+        let plain = HostProfile::default();
+        let defaults = host_limits(&plain, None, None);
         assert_eq!(defaults.connect_timeout, Some(DEFAULT_CONNECT_TIMEOUT));
         assert_eq!(defaults.command_timeout, Some(DEFAULT_COMMAND_TIMEOUT));
-        let explicit = mcp_limits(Some(5000), Some(1000));
+        let explicit = host_limits(&plain, Some(5000), Some(1000));
         assert_eq!(explicit.connect_timeout, Some(Duration::from_secs(5)));
         assert_eq!(explicit.command_timeout, Some(Duration::from_secs(1)));
+        let mut tuned = HostProfile::default();
+        tuned.advanced.connect_timeout_s = Some(30);
+        tuned.advanced.command_timeout_s = Some(1800);
+        let from_host = host_limits(&tuned, None, None);
+        assert_eq!(from_host.connect_timeout, Some(Duration::from_secs(30)));
+        assert_eq!(from_host.command_timeout, Some(Duration::from_secs(1800)));
+        let overridden = host_limits(&tuned, Some(2000), None);
+        assert_eq!(overridden.connect_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(overridden.command_timeout, Some(Duration::from_secs(1800)));
+    }
+
+    #[test]
+    fn retained_host_channel_budget_caps_concurrent_calls() {
+        use crate::model::Protocol;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut host = HostProfile {
+            alias: "gpu".into(),
+            protocol: Protocol::Ssh,
+            auth_persistence: AuthPersistence::Session,
+            ..Default::default()
+        };
+        host.advanced.max_channels = Some(2);
+        let hosts = vec![host.clone()];
+        runtime.block_on(async {
+            let gates = CallGates::new();
+            let first = gates.single_host(&host, &hosts, 2).await;
+            let blocked = tokio::time::timeout(
+                Duration::from_millis(50),
+                gates.single_host(&host, &hosts, 1),
+            )
+            .await;
+            assert!(blocked.is_err(), "channel budget exhausted");
+            drop(first);
+            let allowed = tokio::time::timeout(
+                Duration::from_millis(50),
+                gates.single_host(&host, &hosts, 1),
+            )
+            .await;
+            assert!(allowed.is_ok());
+        });
     }
 
     #[test]
@@ -764,16 +853,16 @@ mod tests {
         let hosts = vec![per_call.clone(), retained.clone()];
         runtime.block_on(async {
             let gates = CallGates::new();
-            let first = gates.single_host(&per_call, &hosts).await;
+            let first = gates.single_host(&per_call, &hosts, 1).await;
             let second = tokio::time::timeout(
                 Duration::from_millis(50),
-                gates.single_host(&per_call, &hosts),
+                gates.single_host(&per_call, &hosts, 1),
             )
             .await;
             assert!(second.is_err(), "same per-call host must wait");
             let shared = tokio::time::timeout(
                 Duration::from_millis(50),
-                gates.single_host(&retained, &hosts),
+                gates.single_host(&retained, &hosts, 1),
             )
             .await;
             assert!(shared.is_ok(), "retained host runs alongside");

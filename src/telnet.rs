@@ -93,7 +93,13 @@ async fn execute_async(
         limits.command_timeout,
         "COMMAND_TIMEOUT",
         "Telnet authentication or remote command execution timed out.",
-        run_session(&mut stream, &profile.username, password.as_str(), command),
+        run_session(
+            &mut stream,
+            &profile.username,
+            password.as_str(),
+            command,
+            &login_prompts(profile),
+        ),
     )
     .await?;
     let output_truncated = output.len() >= MAX_CAPTURE_BYTES;
@@ -111,27 +117,55 @@ async fn execute_async(
     })
 }
 
+const DEFAULT_LOGIN_PROMPTS: &[&str] = &["login:", "username:", "user:"];
+const DEFAULT_PASSWORD_PROMPTS: &[&str] = &["password:"];
+
+struct LoginPrompts {
+    login: Vec<String>,
+    password: Vec<String>,
+}
+
+/// Profile overrides replace the default prompt list; an empty override keeps
+/// the defaults so a half-filled form never makes a login impossible.
+fn login_prompts(profile: &HostProfile) -> LoginPrompts {
+    let custom = profile.advanced.telnet_prompts.as_ref();
+    let pick = |value: Option<&str>, defaults: &[&str]| -> Vec<String> {
+        match value.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => vec![value.to_owned()],
+            None => defaults.iter().map(|value| (*value).to_owned()).collect(),
+        }
+    };
+    LoginPrompts {
+        login: pick(custom.map(|c| c.login.as_str()), DEFAULT_LOGIN_PROMPTS),
+        password: pick(
+            custom.map(|c| c.password.as_str()),
+            DEFAULT_PASSWORD_PROMPTS,
+        ),
+    }
+}
+
 async fn run_session(
     stream: &mut TcpStream,
     username: &str,
     password: &str,
     command: &str,
+    prompts: &LoginPrompts,
 ) -> Result<String, RemoteFailure> {
     let mut parser = TelnetParser::default();
     let mut transcript = Vec::new();
-    read_until(
-        stream,
-        &mut parser,
-        &mut transcript,
-        &["login:", "username:", "user:"],
-    )
-    .await?;
+    let login = prompts.login.iter().map(String::as_str).collect::<Vec<_>>();
+    read_until(stream, &mut parser, &mut transcript, &login).await?;
     stream
         .write_all(format!("{username}\r\n").as_bytes())
         .await
         .map_err(|error| RemoteFailure::new("TELNET_WRITE_FAILED", error.to_string()))?;
     transcript.clear();
-    read_until(stream, &mut parser, &mut transcript, &["password:"]).await?;
+    let password_prompts = prompts
+        .password
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    read_until(stream, &mut parser, &mut transcript, &password_prompts).await?;
     stream
         .write_all(format!("{password}\r\n").as_bytes())
         .await
@@ -279,6 +313,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_prompts_override_defaults_only_when_filled() {
+        let mut profile = HostProfile::default();
+        let defaults = login_prompts(&profile);
+        assert_eq!(defaults.login, ["login:", "username:", "user:"]);
+        assert_eq!(defaults.password, ["password:"]);
+        profile.advanced.telnet_prompts = Some(crate::model::TelnetPrompts {
+            login: " Username: ".into(),
+            password: String::new(),
+        });
+        let custom = login_prompts(&profile);
+        assert_eq!(custom.login, ["Username:"]);
+        assert_eq!(custom.password, ["password:"]);
+    }
 
     #[test]
     fn strips_telnet_negotiation_and_refuses_options() {

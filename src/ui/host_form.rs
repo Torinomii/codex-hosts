@@ -3,7 +3,12 @@ use eframe::egui::{self, RichText};
 use super::theme::{self, control_height, input_margin};
 use super::{EditorAction, HostEditor, HostsApp, PasswordMode};
 use crate::i18n::Catalog;
-use crate::model::{HostProfile, Protocol, SshAuth, can_use_as_jump, normalize_tags};
+use crate::model::{
+    AuthPersistence, DEFAULT_CHANNELS_PER_HOST, DEFAULT_KEEPALIVE_SECONDS, HostProfile,
+    MAX_CHANNELS_PER_HOST, MAX_IDLE_PERSISTENCE_MINUTES, MAX_KEEPALIVE_SECONDS,
+    MIN_KEEPALIVE_SECONDS, Protocol, RemoteEnv, SshAuth, TelnetPrompts, can_use_as_jump,
+    normalize_tags,
+};
 
 const STACKED_BREAKPOINT: f32 = 520.0;
 const LABEL_WIDTH: f32 = 150.0;
@@ -38,6 +43,23 @@ struct Form<'a> {
     row_index: usize,
 }
 
+/// How a row announces itself: optional, required, or required and currently empty.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Requirement {
+    Optional,
+    Required,
+    Missing,
+}
+
+pub(super) fn required_color(visuals: &egui::Visuals) -> egui::Color32 {
+    visuals.warn_fg_color
+}
+
+/// Stable id for a required text field so a failed save can move focus to it.
+fn required_field_id(label_key: &str) -> egui::Id {
+    egui::Id::new(("required_field", label_key))
+}
+
 impl<'a> Form<'a> {
     fn new(ui: &egui::Ui, catalog: &'a Catalog) -> Self {
         Self {
@@ -54,6 +76,33 @@ impl<'a> Form<'a> {
         hint: Option<String>,
         add_field: impl FnOnce(&mut egui::Ui, f32),
     ) {
+        self.row_with(ui, label_key, Requirement::Optional, hint, add_field);
+    }
+
+    fn required_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        label_key: &str,
+        missing: bool,
+        hint: Option<String>,
+        add_field: impl FnOnce(&mut egui::Ui, f32),
+    ) {
+        let requirement = if missing {
+            Requirement::Missing
+        } else {
+            Requirement::Required
+        };
+        self.row_with(ui, label_key, requirement, hint, add_field);
+    }
+
+    fn row_with(
+        &mut self,
+        ui: &mut egui::Ui,
+        label_key: &str,
+        requirement: Requirement,
+        hint: Option<String>,
+        add_field: impl FnOnce(&mut egui::Ui, f32),
+    ) {
         let striped = self.row_index % 2 == 1;
         self.row_index += 1;
         let fill = if striped {
@@ -61,9 +110,36 @@ impl<'a> Form<'a> {
         } else {
             egui::Color32::TRANSPARENT
         };
+        let accent = required_color(ui.visuals());
+        let stroke = if requirement == Requirement::Missing {
+            egui::Stroke::new(1.0, accent)
+        } else {
+            egui::Stroke::NONE
+        };
         let label = RichText::new(self.catalog.text(label_key)).strong();
+        let star = (requirement != Requirement::Optional)
+            .then(|| RichText::new("*").strong().color(accent));
+        let missing_hint = (requirement == Requirement::Missing)
+            .then(|| self.catalog.text("required_hint").to_owned());
+        let label_cell = |ui: &mut egui::Ui, truncate: bool| {
+            ui.spacing_mut().item_spacing.x = 3.0;
+            let label = egui::Label::new(label);
+            ui.add(if truncate { label.truncate() } else { label });
+            if let Some(star) = star {
+                ui.label(star);
+            }
+        };
+        let hints = |ui: &mut egui::Ui| {
+            if let Some(missing_hint) = missing_hint {
+                ui.label(RichText::new(missing_hint).small().color(accent));
+            }
+            if let Some(hint) = hint {
+                ui.label(RichText::new(hint).small().weak());
+            }
+        };
         egui::Frame::new()
             .fill(fill)
+            .stroke(stroke)
             .corner_radius(4.0)
             .inner_margin(ROW_MARGIN)
             .show(ui, |ui| {
@@ -79,23 +155,19 @@ impl<'a> Form<'a> {
                                 egui::Layout::left_to_right(egui::Align::Center),
                                 |ui| {
                                     ui.set_width(label_width);
-                                    ui.add(egui::Label::new(label).truncate());
+                                    label_cell(ui, true);
                                 },
                             );
                             ui.vertical(|ui| {
                                 add_field(ui, field_width);
-                                if let Some(hint) = hint {
-                                    ui.label(RichText::new(hint).small().weak());
-                                }
+                                hints(ui);
                             });
                         });
                     }
                     FormLayout::Stacked { field_width } => {
-                        ui.label(label);
+                        ui.horizontal(|ui| label_cell(ui, false));
                         add_field(ui, field_width);
-                        if let Some(hint) = hint {
-                            ui.label(RichText::new(hint).small().weak());
-                        }
+                        hints(ui);
                     }
                 }
             });
@@ -131,11 +203,51 @@ fn text_field(ui: &mut egui::Ui, value: &mut String, width: f32) -> egui::Respon
     ui.add(edit)
 }
 
+/// A required text field keeps a stable id so a failed save can focus it.
+fn required_text_field(
+    ui: &mut egui::Ui,
+    label_key: &str,
+    value: &mut String,
+    width: f32,
+) -> egui::Response {
+    let edit = single_line(ui, value, width).id(required_field_id(label_key));
+    ui.add(edit)
+}
+
+/// Checkbox plus number: unchecked means "use the default", which the field then shows greyed.
+fn optional_number<T: egui::emath::Numeric>(
+    ui: &mut egui::Ui,
+    catalog: &Catalog,
+    value: &mut Option<T>,
+    default: T,
+    range: std::ops::RangeInclusive<T>,
+    suffix: &str,
+) {
+    ui.horizontal(|ui| {
+        let mut custom = value.is_some();
+        if ui
+            .checkbox(&mut custom, catalog.text("custom_value"))
+            .changed()
+        {
+            *value = custom.then_some(value.unwrap_or(default));
+        }
+        let mut shown = value.unwrap_or(default);
+        let response = ui.add_enabled(
+            custom,
+            egui::DragValue::new(&mut shown).range(range).suffix(suffix),
+        );
+        if custom && response.changed() {
+            *value = Some(shown);
+        }
+    });
+}
+
 fn basic_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) {
     section(ui, catalog.text("section_basic"), |ui| {
         let mut form = Form::new(ui, catalog);
-        form.row(ui, "alias", None, |ui, width| {
-            text_field(ui, &mut editor.profile.alias, width);
+        let missing = editor.show_required && editor.profile.alias.trim().is_empty();
+        form.required_row(ui, "alias", missing, None, |ui, width| {
+            required_text_field(ui, "alias", &mut editor.profile.alias, width);
         });
         form.row(ui, "description", None, |ui, width| {
             let margin = input_margin(ui);
@@ -201,7 +313,7 @@ fn connection_section(
 ) {
     section(ui, catalog.text("section_connection"), |ui| {
         let mut form = Form::new(ui, catalog);
-        form.row(ui, "protocol", None, |ui, _| {
+        form.required_row(ui, "protocol", false, None, |ui, _| {
             let previous_protocol = editor.profile.protocol;
             ui.horizontal(|ui| {
                 ui.selectable_value(
@@ -224,7 +336,9 @@ fn connection_section(
                 }
             }
         });
-        form.row(ui, "address", None, |ui, width| {
+        let address_missing = editor.show_required
+            && (editor.profile.address.trim().is_empty() || editor.profile.port == 0);
+        form.required_row(ui, "address", address_missing, None, |ui, width| {
             ui.horizontal(|ui| {
                 let port_width = 72.0;
                 let port_label_width = ui
@@ -239,17 +353,23 @@ fn connection_section(
                 let spacing = ui.spacing().item_spacing.x;
                 let address_width =
                     (width - port_width - port_label_width - spacing * 3.0).max(120.0);
-                text_field(ui, &mut editor.profile.address, address_width);
+                required_text_field(ui, "address", &mut editor.profile.address, address_width);
                 ui.add_space(spacing);
                 ui.label(RichText::new(catalog.text("port")).strong());
+                ui.label(
+                    RichText::new("*")
+                        .strong()
+                        .color(required_color(ui.visuals())),
+                );
                 ui.add_sized(
                     [port_width, control_height(ui)],
                     egui::DragValue::new(&mut editor.profile.port).range(1..=65535),
                 );
             });
         });
-        form.row(ui, "username", None, |ui, width| {
-            text_field(ui, &mut editor.profile.username, width);
+        let username_missing = editor.show_required && editor.profile.username.trim().is_empty();
+        form.required_row(ui, "username", username_missing, None, |ui, width| {
+            required_text_field(ui, "username", &mut editor.profile.username, width);
         });
         if editor.profile.protocol == Protocol::Ssh {
             form.row(
@@ -305,7 +425,7 @@ fn auth_section(
     section(ui, catalog.text("section_auth"), |ui| {
         let mut form = Form::new(ui, catalog);
         if editor.profile.protocol == Protocol::Ssh {
-            form.row(ui, "auth_method", None, |ui, width| {
+            form.required_row(ui, "auth_method", false, None, |ui, width| {
                 egui::ComboBox::from_id_salt("ssh_auth")
                     .selected_text(match editor.profile.ssh_auth {
                         SshAuth::Password => catalog.text("password_auth"),
@@ -364,16 +484,24 @@ fn auth_section(
                 ui.add_enabled(editor.password_mode == PasswordMode::Password, edit);
             });
         } else if editor.profile.ssh_auth == SshAuth::PrivateKey {
-            form.row(
+            let key_missing =
+                editor.show_required && editor.profile.private_key_path.trim().is_empty();
+            form.required_row(
                 ui,
                 "private_key",
+                key_missing,
                 Some(format!(
                     "{}\n{}",
                     catalog.text("private_key_hint"),
                     catalog.text("fido_direct_hint")
                 )),
                 |ui, width| {
-                    text_field(ui, &mut editor.profile.private_key_path, width);
+                    required_text_field(
+                        ui,
+                        "private_key",
+                        &mut editor.profile.private_key_path,
+                        width,
+                    );
                     ui.horizontal_wrapped(|ui| {
                         if ui.button(catalog.text("browse_private_key")).clicked() {
                             *action = Some(EditorAction::BrowsePrivateKey);
@@ -408,7 +536,274 @@ fn auth_section(
                 },
             );
         }
+        persistence_rows(ui, &mut form, editor, catalog);
     });
+}
+
+/// The mandatory three-way choice. Telnet has no session layer yet, so its
+/// profiles show the choice greyed out at "every operation".
+fn persistence_rows(
+    ui: &mut egui::Ui,
+    form: &mut Form<'_>,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+) {
+    let telnet = editor.profile.protocol == Protocol::Telnet;
+    let missing = editor.show_required && !editor.persistence_chosen && !telnet;
+    let hint = telnet.then(|| catalog.text("persistence_telnet_note").to_owned());
+    form.required_row(ui, "auth_persistence", missing, hint, |ui, width| {
+        ui.set_max_width(width);
+        let current = if telnet {
+            AuthPersistence::PerCall
+        } else {
+            editor.profile.auth_persistence
+        };
+        let chosen = editor.persistence_chosen && !telnet;
+        let mut selection = chosen.then_some(current);
+        let idle_minutes = match current {
+            AuthPersistence::Idle { minutes } => minutes,
+            _ => 15,
+        };
+        ui.add_enabled_ui(!telnet, |ui| {
+            ui.vertical(|ui| {
+                let options = [
+                    (AuthPersistence::PerCall, "persistence_per_call"),
+                    (AuthPersistence::Session, "persistence_session"),
+                    (
+                        AuthPersistence::Idle {
+                            minutes: idle_minutes,
+                        },
+                        "persistence_idle",
+                    ),
+                ];
+                for (option, key) in options {
+                    let selected = selection.is_some_and(|value| {
+                        std::mem::discriminant(&value) == std::mem::discriminant(&option)
+                    });
+                    if ui.radio(selected, catalog.text(key)).clicked() {
+                        selection = Some(option);
+                    }
+                }
+            });
+        });
+        if let Some(choice) = selection {
+            editor.profile.auth_persistence = choice;
+            editor.persistence_chosen = true;
+        }
+        if let AuthPersistence::Idle { minutes } = &mut editor.profile.auth_persistence
+            && !telnet
+        {
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(minutes)
+                        .range(1..=MAX_IDLE_PERSISTENCE_MINUTES)
+                        .suffix(format!(" {}", catalog.text("persistence_minutes"))),
+                );
+            });
+        }
+    });
+    if !telnet
+        && editor.persistence_chosen
+        && editor.profile.auth_persistence != AuthPersistence::PerCall
+    {
+        warning_callout(ui, catalog.text("persistence_warning_ssh"));
+    }
+}
+
+/// Collapsed by default; the header summarises anything set away from its default so a
+/// tuned host is recognisable without expanding the card.
+fn advanced_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) {
+    let summary = advanced_summary(&editor.profile, catalog);
+    let customised = !editor.profile.advanced.is_default();
+    egui::Frame::new()
+        .fill(theme::section_fill(ui.visuals()))
+        .stroke(theme::section_stroke(ui.visuals()))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let title = RichText::new(catalog.text("section_advanced"))
+                .strong()
+                .size(15.0);
+            egui::CollapsingHeader::new(title)
+                .id_salt("advanced_section")
+                .default_open(false)
+                .show_unindented(ui, |ui| {
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    advanced_rows(ui, editor, catalog);
+                });
+            let summary_text = if customised {
+                RichText::new(summary).small().strong()
+            } else {
+                RichText::new(summary).small().weak()
+            };
+            ui.add(egui::Label::new(summary_text).wrap());
+        });
+    ui.add_space(12.0);
+}
+
+fn advanced_summary(profile: &HostProfile, catalog: &Catalog) -> String {
+    let advanced = &profile.advanced;
+    let mut parts = Vec::new();
+    if let Some(value) = advanced.max_channels {
+        parts.push(format!("{} {value}", catalog.text("max_channels")));
+    }
+    if let Some(value) = advanced.connect_timeout_s {
+        parts.push(format!(
+            "{} {value}s",
+            catalog.text("connect_timeout_default")
+        ));
+    }
+    if let Some(value) = advanced.command_timeout_s {
+        parts.push(format!(
+            "{} {value}s",
+            catalog.text("command_timeout_default")
+        ));
+    }
+    if let Some(value) = advanced.keepalive_s {
+        parts.push(format!("{} {value}s", catalog.text("keepalive_interval")));
+    }
+    if advanced.remote_env != RemoteEnv::Auto {
+        parts.push(catalog.text(remote_env_key(advanced.remote_env)).to_owned());
+    }
+    if advanced.codex_hidden {
+        parts.push(catalog.text("codex_hidden").to_owned());
+    }
+    if advanced.telnet_prompts.is_some() {
+        parts.push(catalog.text("telnet_prompts").to_owned());
+    }
+    if parts.is_empty() {
+        catalog.text("advanced_default_summary").to_owned()
+    } else {
+        parts.join(" · ")
+    }
+}
+
+fn remote_env_key(value: RemoteEnv) -> &'static str {
+    match value {
+        RemoteEnv::Auto => "remote_env_auto",
+        RemoteEnv::Posix => "remote_env_posix",
+        RemoteEnv::Windows => "remote_env_windows",
+    }
+}
+
+fn advanced_rows(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) {
+    let mut form = Form::new(ui, catalog);
+    let telnet = editor.profile.protocol == Protocol::Telnet;
+    let retained = !telnet && editor.profile.auth_persistence != AuthPersistence::PerCall;
+    let advanced = &mut editor.profile.advanced;
+    form.row(
+        ui,
+        "max_channels",
+        Some(catalog.text("max_channels_hint").to_owned()),
+        |ui, _| {
+            optional_number(
+                ui,
+                catalog,
+                &mut advanced.max_channels,
+                DEFAULT_CHANNELS_PER_HOST,
+                1..=MAX_CHANNELS_PER_HOST,
+                "",
+            );
+        },
+    );
+    form.row(
+        ui,
+        "connect_timeout_default",
+        Some(catalog.text("timeout_default_hint").to_owned()),
+        |ui, _| {
+            optional_number(
+                ui,
+                catalog,
+                &mut advanced.connect_timeout_s,
+                120,
+                1..=86_400,
+                " s",
+            );
+        },
+    );
+    form.row(ui, "command_timeout_default", None, |ui, _| {
+        optional_number(
+            ui,
+            catalog,
+            &mut advanced.command_timeout_s,
+            600,
+            1..=86_400,
+            " s",
+        );
+    });
+    form.row(
+        ui,
+        "keepalive_interval",
+        Some(catalog.text("keepalive_hint").to_owned()),
+        |ui, _| {
+            ui.add_enabled_ui(retained, |ui| {
+                optional_number(
+                    ui,
+                    catalog,
+                    &mut advanced.keepalive_s,
+                    DEFAULT_KEEPALIVE_SECONDS,
+                    MIN_KEEPALIVE_SECONDS..=MAX_KEEPALIVE_SECONDS,
+                    " s",
+                );
+            });
+        },
+    );
+    form.row(
+        ui,
+        "remote_env",
+        Some(catalog.text("remote_env_hint").to_owned()),
+        |ui, width| {
+            egui::ComboBox::from_id_salt("remote_env")
+                .selected_text(catalog.text(remote_env_key(advanced.remote_env)))
+                .width(width.min(240.0))
+                .show_ui(ui, |ui| {
+                    for option in [RemoteEnv::Auto, RemoteEnv::Posix, RemoteEnv::Windows] {
+                        ui.selectable_value(
+                            &mut advanced.remote_env,
+                            option,
+                            catalog.text(remote_env_key(option)),
+                        );
+                    }
+                });
+        },
+    );
+    form.row(
+        ui,
+        "codex_hidden",
+        Some(catalog.text("codex_hidden_hint").to_owned()),
+        |ui, _| {
+            ui.checkbox(&mut advanced.codex_hidden, "");
+        },
+    );
+    if telnet {
+        form.row(
+            ui,
+            "telnet_prompts",
+            Some(catalog.text("telnet_prompts_hint").to_owned()),
+            |ui, width| {
+                let mut custom = advanced.telnet_prompts.is_some();
+                if ui
+                    .checkbox(&mut custom, catalog.text("custom_value"))
+                    .changed()
+                {
+                    advanced.telnet_prompts = custom.then(TelnetPrompts::default);
+                }
+                if let Some(prompts) = &mut advanced.telnet_prompts {
+                    ui.horizontal(|ui| {
+                        ui.label(catalog.text("telnet_login_prompt"));
+                        text_field(ui, &mut prompts.login, (width / 2.0 - 80.0).max(80.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(catalog.text("telnet_password_prompt"));
+                        text_field(ui, &mut prompts.password, (width / 2.0 - 80.0).max(80.0));
+                    });
+                }
+            },
+        );
+    }
 }
 
 fn host_key_section(ui: &mut egui::Ui, editor: &HostEditor, catalog: &Catalog) {
@@ -597,8 +992,28 @@ impl HostsApp {
                 });
             }
         });
-        ui.label(RichText::new(catalog.text("editor_subtitle")).weak());
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new(catalog.text("editor_subtitle")).weak());
+        });
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("*")
+                    .strong()
+                    .color(required_color(ui.visuals())),
+            );
+            ui.label(
+                RichText::new(catalog.text("required_legend"))
+                    .small()
+                    .weak(),
+            );
+        });
         ui.add_space(12.0);
+        if editor.focus_first_missing {
+            editor.focus_first_missing = false;
+            if let Some(key) = editor.first_missing_field() {
+                ui.memory_mut(|memory| memory.request_focus(required_field_id(key)));
+            }
+        }
         if codex_edit {
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.label(RichText::new(catalog.text("codex_draft")).strong());
@@ -614,6 +1029,7 @@ impl HostsApp {
         } else {
             warning_callout(ui, catalog.text("telnet_warning"));
         }
+        advanced_section(ui, editor, catalog);
     }
 }
 
@@ -701,6 +1117,7 @@ mod tests {
                 "section_connection",
                 "section_auth",
                 "section_host_key",
+                "section_advanced",
             ] {
                 let rect = find_text_rect(&output.shapes, app.catalog.text(key))
                     .unwrap_or_else(|| panic!("missing {locale} section {key}"));
@@ -711,6 +1128,58 @@ mod tests {
                 last_top = rect.top();
             }
         }
+    }
+
+    #[test]
+    fn required_markers_and_persistence_choice_render_in_all_locales() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            theme::configure_fonts(&context, locale);
+            let mut app = metadata_test_app(&context, locale, metadata_profile());
+            let output = run_form(&mut app, &context, 760.0);
+            let rect = |text: &str| {
+                find_text_rect(&output.shapes, text)
+                    .unwrap_or_else(|| panic!("missing {locale} text {text}"))
+            };
+            let alias = rect(app.catalog.text("alias"));
+            let legend = rect(app.catalog.text("required_legend"));
+            assert!(legend.bottom() <= alias.top(), "legend sits above the form");
+            rect(app.catalog.text("auth_persistence"));
+            rect(app.catalog.text("persistence_per_call"));
+            rect(app.catalog.text("persistence_session"));
+            rect(app.catalog.text("persistence_idle"));
+            rect(app.catalog.text("section_advanced"));
+            rect(app.catalog.text("advanced_default_summary"));
+        }
+    }
+
+    #[test]
+    fn missing_required_fields_show_hints_after_a_failed_save() {
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut profile = metadata_profile();
+        profile.alias.clear();
+        profile.username.clear();
+        let mut app = metadata_test_app(&context, "en", profile);
+        if let Some(editor) = app.editor.as_mut() {
+            editor.show_required = true;
+            editor.persistence_chosen = false;
+        }
+        let output = run_form(&mut app, &context, 760.0);
+        let hint = app.catalog.text("required_hint");
+        let hints = output
+            .shapes
+            .iter()
+            .filter(|shape| find_text_rect(std::slice::from_ref(shape), hint).is_some())
+            .count();
+        assert!(
+            hints >= 3,
+            "alias, username and persistence are flagged, got {hints}"
+        );
+        assert_eq!(
+            app.editor.as_ref().unwrap().first_missing_field(),
+            Some("alias")
+        );
     }
 
     #[test]

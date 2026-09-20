@@ -39,7 +39,6 @@ pub const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const CONNECTION_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 /// Retained sessions send keepalives so NAT and idle-cutting middleboxes keep the
 /// path open between calls; three misses count as a dead link.
-const RETAINED_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const RETAINED_KEEPALIVE_MAX: usize = 3;
 #[cfg(windows)]
 const WINDOWS_OPENSSH_AGENT_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
@@ -1084,7 +1083,7 @@ async fn connect_one(
     let config = Arc::new(if retention.is_some() {
         client::Config {
             inactivity_timeout: None,
-            keepalive_interval: Some(RETAINED_KEEPALIVE_INTERVAL),
+            keepalive_interval: Some(host.advanced.keepalive()),
             keepalive_max: RETAINED_KEEPALIVE_MAX,
             nodelay: true,
             ..Default::default()

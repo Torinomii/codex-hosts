@@ -64,6 +64,13 @@ struct HostEditor {
     password_read_error: Option<String>,
     has_key_passphrase: bool,
     key_passphrase_read_error: Option<String>,
+    /// False for a host created in this session until the user picks an
+    /// authentication-persistence option; saved profiles always carry one.
+    persistence_chosen: bool,
+    /// Set by a failed save so empty required fields are highlighted.
+    show_required: bool,
+    /// Set by a failed save; the next frame moves focus to the first empty required field.
+    focus_first_missing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,7 +110,46 @@ impl HostEditor {
             password_read_error,
             has_key_passphrase,
             key_passphrase_read_error,
+            persistence_chosen: true,
+            show_required: false,
+            focus_first_missing: false,
         }
+    }
+
+    fn fresh(profile: HostProfile) -> Self {
+        Self {
+            persistence_chosen: false,
+            ..Self::load(profile)
+        }
+    }
+
+    /// Required fields that are still empty, as form label keys in form order.
+    fn missing_required_fields(&self) -> Vec<&'static str> {
+        let profile = &self.profile;
+        let mut missing = Vec::new();
+        if profile.alias.trim().is_empty() {
+            missing.push("alias");
+        }
+        if profile.address.trim().is_empty() || profile.port == 0 {
+            missing.push("address");
+        }
+        if profile.username.trim().is_empty() {
+            missing.push("username");
+        }
+        if profile.protocol == Protocol::Ssh
+            && profile.ssh_auth == SshAuth::PrivateKey
+            && profile.private_key_path.trim().is_empty()
+        {
+            missing.push("private_key");
+        }
+        if profile.protocol == Protocol::Ssh && !self.persistence_chosen {
+            missing.push("auth_persistence");
+        }
+        missing
+    }
+
+    fn first_missing_field(&self) -> Option<&'static str> {
+        self.missing_required_fields().into_iter().next()
     }
 
     fn connection_changed(&self) -> bool {
@@ -268,6 +314,7 @@ impl HostsApp {
         let catalog = Catalog::for_locale(store.preferred_locale.as_deref());
         configure_fonts(&context.egui_ctx, catalog.locale());
         let mut selected = store.hosts.first().map(|host| host.id);
+        let mut created_now = None;
 
         if launch.codex_edit && startup_error.is_none() {
             let alias = launch
@@ -290,7 +337,10 @@ impl HostsApp {
                 let id = draft.id;
                 store.hosts.push(draft);
                 match store.save() {
-                    Ok(()) => selected = Some(id),
+                    Ok(()) => {
+                        selected = Some(id);
+                        created_now = Some(id);
+                    }
                     Err(error) => {
                         store.hosts.retain(|host| host.id != id);
                         selected = None;
@@ -303,7 +353,13 @@ impl HostsApp {
         let mut editor = selected
             .and_then(|id| store.hosts.iter().find(|host| host.id == id))
             .cloned()
-            .map(HostEditor::load);
+            .map(|profile| {
+                if created_now == Some(profile.id) {
+                    HostEditor::fresh(profile)
+                } else {
+                    HostEditor::load(profile)
+                }
+            });
         if launch.codex_edit
             && launch.observed_fingerprint.is_none()
             && let Some(editor) = &mut editor
@@ -428,7 +484,7 @@ impl HostsApp {
             return;
         }
         self.selected = Some(id);
-        self.editor = Some(HostEditor::load(profile));
+        self.editor = Some(HostEditor::fresh(profile));
         self.scroll_to_selected = true;
     }
 
@@ -441,6 +497,17 @@ impl HostsApp {
         {
             return Err(self.catalog.text("host_changed").to_owned());
         }
+        let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
+        let missing = editor.missing_required_fields();
+        if !missing.is_empty() {
+            editor.show_required = true;
+            editor.focus_first_missing = true;
+            return Err(self.catalog.format(
+                "validation_required_count",
+                &[("count", &missing.len().to_string())],
+            ));
+        }
+        editor.show_required = false;
         let editor = self.editor.as_ref().ok_or_else(|| "NO_EDITOR".to_owned())?;
         if let Some(issue) = editor.profile.validation_issue() {
             return Err(self.catalog.text(issue.translation_key()).to_owned());
@@ -1784,6 +1851,9 @@ mod tests {
             password_read_error: None,
             has_key_passphrase: false,
             key_passphrase_read_error: None,
+            persistence_chosen: true,
+            show_required: false,
+            focus_first_missing: false,
         };
         let mut store = HostStore::default();
         store.hosts.push(profile.clone());
@@ -2172,6 +2242,9 @@ mod tests {
             password_read_error: None,
             has_key_passphrase: false,
             key_passphrase_read_error: None,
+            persistence_chosen: true,
+            show_required: false,
+            focus_first_missing: false,
         };
         assert!(!editor.test_result_is_stale());
         editor.password.push_str("replacement");

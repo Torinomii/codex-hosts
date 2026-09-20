@@ -50,10 +50,15 @@ pub(super) enum RowMarker {
     Testing,
 }
 
+/// Shown after the endpoint for hosts that keep their authenticated session
+/// between Codex calls, so the relaxed hosts stand out in the list.
+pub(super) const RETAINED_GLYPH: &str = "∞";
+
 pub(super) struct HostRowModel<'a> {
     pub alias: &'a str,
     pub detail: String,
     pub marker: Option<RowMarker>,
+    pub retained: bool,
     /// Tags when present, otherwise the first line of the description.
     pub secondary: String,
     pub test_state: Option<HostTestState>,
@@ -91,6 +96,7 @@ impl<'a> HostRowModel<'a> {
                 host.port
             ),
             marker,
+            retained: host.effective_auth_persistence() != crate::model::AuthPersistence::PerCall,
             secondary,
             test_state,
             selected,
@@ -166,20 +172,29 @@ pub(super) fn host_row(
                     egui::Layout::left_to_right(egui::Align::Center),
                     |ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
-                        let marker = model.marker.map(|marker| match marker {
-                            RowMarker::Verified => ("✓", super::theme::success_color(&visuals)),
-                            RowMarker::Testing => ("…", visuals.weak_text_color()),
-                        });
-                        // Reserve the marker's width first so a long endpoint truncates instead
-                        // of pushing the marker out of the row.
-                        let reserved = marker.map_or(0.0, |(glyph, _)| {
-                            let font = egui::FontId::proportional(DETAIL_SIZE);
-                            ui.painter()
-                                .layout_no_wrap(glyph.to_owned(), font, Color32::PLACEHOLDER)
-                                .size()
-                                .x
-                                + ui.spacing().item_spacing.x
-                        });
+                        let mut markers = Vec::with_capacity(2);
+                        if let Some(marker) = model.marker {
+                            markers.push(match marker {
+                                RowMarker::Verified => ("✓", super::theme::success_color(&visuals)),
+                                RowMarker::Testing => ("…", visuals.weak_text_color()),
+                            });
+                        }
+                        if model.retained {
+                            markers.push((RETAINED_GLYPH, visuals.warn_fg_color));
+                        }
+                        // Reserve the markers' width first so a long endpoint truncates instead
+                        // of pushing them out of the row.
+                        let reserved = markers
+                            .iter()
+                            .map(|(glyph, _)| {
+                                let font = egui::FontId::proportional(DETAIL_SIZE);
+                                ui.painter()
+                                    .layout_no_wrap((*glyph).to_owned(), font, Color32::PLACEHOLDER)
+                                    .size()
+                                    .x
+                                    + ui.spacing().item_spacing.x
+                            })
+                            .sum::<f32>();
                         // Between the alias (full strength) and the tags (weak) in emphasis.
                         let detail_color = visuals.text_color().gamma_multiply(0.85);
                         ui.scope(|ui| {
@@ -190,7 +205,7 @@ pub(super) fn host_row(
                                     .color(detail_color),
                             ));
                         });
-                        if let Some((glyph, color)) = marker {
+                        for (glyph, color) in markers {
                             ui.add(row_label(
                                 RichText::new(glyph).size(DETAIL_SIZE).color(color),
                             ));
