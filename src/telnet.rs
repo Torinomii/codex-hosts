@@ -23,6 +23,11 @@ const END_MARKER: &str = "__CODEX_HOSTS_END__";
 /// output contains it.
 const BEGIN_MARKER_SOURCE: &str = "__CODEX_HOSTS_BEG''IN__";
 const END_MARKER_SOURCE: &str = "__CODEX_HOSTS_E''ND__";
+/// Text a login program prints when it rejects the credentials; `login`
+/// delays it by a few seconds, so it can arrive after the command was sent.
+const LOGIN_FAILURE_TEXTS: [&str; 3] =
+    ["login incorrect", "authentication failed", "access denied"];
+
 /// After the password, `login` discards typed-ahead input, so the command is
 /// sent only once the server has gone quiet (or stayed silent) for this long.
 const SHELL_SETTLE: Duration = Duration::from_millis(500);
@@ -192,6 +197,20 @@ async fn run_session(
     Ok(extract_output(&String::from_utf8_lossy(&transcript)))
 }
 
+fn check_login_failure(transcript: &[u8]) -> Result<(), RemoteFailure> {
+    let lowercase = String::from_utf8_lossy(transcript).to_ascii_lowercase();
+    if LOGIN_FAILURE_TEXTS
+        .iter()
+        .any(|text| lowercase.contains(text))
+    {
+        return Err(RemoteFailure::new(
+            "AUTH_FAILED",
+            "The Telnet server rejected the user name or password.",
+        ));
+    }
+    Ok(())
+}
+
 /// One line when possible, so an interactive shell prints no prompt between
 /// the markers and the command's output; a multi-line command (or one ending
 /// in `&`, which `;` would break) falls back to one line per statement.
@@ -255,16 +274,7 @@ async fn wait_for_shell(
                 }
                 let remaining = MAX_CAPTURE_BYTES.saturating_sub(transcript.len());
                 transcript.extend_from_slice(&parsed.data[..parsed.data.len().min(remaining)]);
-                let lowercase = String::from_utf8_lossy(transcript).to_ascii_lowercase();
-                if lowercase.contains("login incorrect")
-                    || lowercase.contains("authentication failed")
-                    || lowercase.contains("access denied")
-                {
-                    return Err(RemoteFailure::new(
-                        "AUTH_FAILED",
-                        "The Telnet server rejected the user name or password.",
-                    ));
-                }
+                check_login_failure(transcript)?;
             }
         }
     }
@@ -303,6 +313,9 @@ async fn read_until(
             .any(|needle| lowercase.contains(&needle.to_ascii_lowercase()))
         {
             return Ok(());
+        }
+        if needles == [END_MARKER] {
+            check_login_failure(transcript)?;
         }
         if transcript.len() >= MAX_CAPTURE_BYTES {
             return Err(RemoteFailure::new(
