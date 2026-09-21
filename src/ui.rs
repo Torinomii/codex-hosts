@@ -1684,6 +1684,7 @@ fn gui_test_limits(timeout: Duration) -> OperationLimits {
         command_timeout: Some(timeout),
         output_bytes: None,
         batch_scope: None,
+        retain_sessions: false,
     }
 }
 

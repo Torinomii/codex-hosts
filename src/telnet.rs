@@ -193,8 +193,57 @@ async fn run_session(
         .await
         .map_err(|error| RemoteFailure::new("TELNET_WRITE_FAILED", error.to_string()))?;
     transcript.clear();
-    read_until(stream, &mut parser, &mut transcript, &[END_MARKER]).await?;
+    read_until_output(stream, &mut parser, &mut transcript, request.trim_end()).await?;
     Ok(extract_output(&String::from_utf8_lossy(&transcript)))
+}
+
+/// Reads until the end marker is printed. Anything the server says before the
+/// begin marker is printed, other than the echo of our own request line, came
+/// from the login program, so a login-failure message there ends the call.
+async fn read_until_output(
+    stream: &mut TcpStream,
+    parser: &mut TelnetParser,
+    transcript: &mut Vec<u8>,
+    request: &str,
+) -> Result<(), RemoteFailure> {
+    let request = request.to_ascii_lowercase();
+    let begin = BEGIN_MARKER.to_ascii_lowercase();
+    let end = END_MARKER.to_ascii_lowercase();
+    let mut raw = [0_u8; 4096];
+    loop {
+        let count = stream
+            .read(&mut raw)
+            .await
+            .map_err(|error| RemoteFailure::new("TELNET_READ_FAILED", error.to_string()))?;
+        if count == 0 {
+            return Err(RemoteFailure::new(
+                "TELNET_CLOSED",
+                "The Telnet server closed the connection.",
+            ));
+        }
+        let parsed = parser.consume(&raw[..count]);
+        if !parsed.replies.is_empty() {
+            stream
+                .write_all(&parsed.replies)
+                .await
+                .map_err(|error| RemoteFailure::new("TELNET_WRITE_FAILED", error.to_string()))?;
+        }
+        let remaining = MAX_CAPTURE_BYTES.saturating_sub(transcript.len());
+        transcript.extend_from_slice(&parsed.data[..parsed.data.len().min(remaining)]);
+        let lowercase = String::from_utf8_lossy(transcript).to_ascii_lowercase();
+        if lowercase.contains(&end) {
+            return Ok(());
+        }
+        let server_said = lowercase.replacen(&request, "", 1);
+        let before_output = server_said.find(&begin).unwrap_or(server_said.len());
+        check_login_failure(&server_said.as_bytes()[..before_output])?;
+        if transcript.len() >= MAX_CAPTURE_BYTES {
+            return Err(RemoteFailure::new(
+                "OUTPUT_LIMIT",
+                "Telnet output exceeded the one-megabyte safety limit.",
+            ));
+        }
+    }
 }
 
 fn check_login_failure(transcript: &[u8]) -> Result<(), RemoteFailure> {
@@ -216,7 +265,7 @@ fn check_login_failure(transcript: &[u8]) -> Result<(), RemoteFailure> {
 /// in `&`, which `;` would break) falls back to one line per statement.
 fn request_line(command: &str) -> String {
     let trimmed = command.trim_end();
-    if trimmed.contains(['\r', '\n']) || trimmed.ends_with('&') {
+    if trimmed.contains(['\r', '\n', '#']) || trimmed.ends_with('&') {
         format!("echo {BEGIN_MARKER_SOURCE}\r\n{command}\r\necho {END_MARKER_SOURCE}\r\n")
     } else {
         format!("echo {BEGIN_MARKER_SOURCE}; {trimmed}; echo {END_MARKER_SOURCE}\r\n")
@@ -314,9 +363,6 @@ async fn read_until(
         {
             return Ok(());
         }
-        if needles == [END_MARKER] {
-            check_login_failure(transcript)?;
-        }
         if transcript.len() >= MAX_CAPTURE_BYTES {
             return Err(RemoteFailure::new(
                 "OUTPUT_LIMIT",
@@ -408,6 +454,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn login_failure_is_only_recognised_before_the_request_echo() {
+        let request = request_line("echo 'Access denied'");
+        let echoed = format!("$ {request}");
+        let server_said =
+            echoed
+                .to_ascii_lowercase()
+                .replacen(&request.trim_end().to_ascii_lowercase(), "", 1);
+        assert!(check_login_failure(server_said.as_bytes()).is_ok());
+        let late = format!("{request}\r\nLogin incorrect\r\nlogin: ");
+        let server_said =
+            late.to_ascii_lowercase()
+                .replacen(&request.trim_end().to_ascii_lowercase(), "", 1);
+        assert!(check_login_failure(server_said.as_bytes()).is_err());
+        assert_eq!(
+            check_login_failure(b"\r\nLogin incorrect\r\nlogin: ")
+                .unwrap_err()
+                .code,
+            "AUTH_FAILED"
+        );
+    }
+
+    #[test]
     fn output_is_taken_between_the_printed_markers_even_when_input_is_echoed() {
         let echoed = format!(
             "$ echo {BEGIN_MARKER_SOURCE}\r\nuname\r\necho {END_MARKER_SOURCE}\r\n{BEGIN_MARKER}\r\nLinux\r\n{END_MARKER}\r\n$ "
@@ -422,6 +490,7 @@ mod tests {
         );
         assert!(request_line("sleep 1 &").starts_with(&format!("echo {BEGIN_MARKER_SOURCE}\r\n")));
         assert!(request_line("a\nb").contains("\r\na\nb\r\n"));
+        assert!(request_line("uptime # note").contains("\r\nuptime # note\r\n"));
     }
 
     #[test]

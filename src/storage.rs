@@ -95,9 +95,7 @@ impl HostStore {
     }
 
     pub fn find_alias(&self, alias: &str) -> Option<&HostProfile> {
-        self.hosts
-            .iter()
-            .find(|host| host.alias.eq_ignore_ascii_case(alias.trim()))
+        crate::model::find_alias(&self.hosts, alias)
     }
 
     pub fn next_neutral_alias(&self) -> String {

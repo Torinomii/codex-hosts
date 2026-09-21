@@ -443,6 +443,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
                 command_timeout_ms,
                 batch_timeout_ms,
                 continue_on_error,
+                false,
             ))
             .map(ToolResponse::Batch),
         ToolRequest::BatchExec {
@@ -464,6 +465,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
                 command_timeout_ms,
                 batch_timeout_ms,
                 continue_on_error,
+                false,
             ))
             .map(ToolResponse::Batch),
     }
@@ -545,6 +547,7 @@ pub(crate) async fn execute_batch(
     command_timeout_ms: Option<u64>,
     batch_timeout_ms: Option<u64>,
     continue_on_error: bool,
+    retain_sessions: bool,
 ) -> Result<BatchResult, RemoteFailure> {
     let snapshot = Arc::new(hosts.to_vec());
     let hosts = resolve_batch_hosts(&snapshot, &aliases)?;
@@ -555,6 +558,14 @@ pub(crate) async fn execute_batch(
     let per_host_output_bytes =
         (MAX_BATCH_OUTPUT_BYTES / hosts.len()).min(MAX_SINGLE_RESULT_OUTPUT_BYTES);
     let batch_scope = uuid::Uuid::new_v4();
+    // Clears the scope's pool bookkeeping even when the batch is cancelled.
+    struct ScopeGuard(uuid::Uuid);
+    impl Drop for ScopeGuard {
+        fn drop(&mut self) {
+            ssh::finish_batch_scope(self.0);
+        }
+    }
+    let _scope_guard = ScopeGuard(batch_scope);
     let started_at = Instant::now();
     let deadline = batch_timeout_ms.map(|millis| started_at + timeout_duration(millis));
     let queue = Arc::new(Mutex::new(
@@ -600,6 +611,7 @@ pub(crate) async fn execute_batch(
                         limits(connect_timeout_ms, command_timeout_ms, total_timeout);
                     operation_limits.output_bytes = Some(per_host_output_bytes);
                     operation_limits.batch_scope = Some(batch_scope);
+                    operation_limits.retain_sessions = retain_sessions;
                     match action.as_ref() {
                         BatchAction::Probe => {
                             connection::probe_async(&host, snapshot.as_slice(), operation_limits)
@@ -646,14 +658,12 @@ pub(crate) async fn execute_batch(
     }
     while let Some(joined) = workers.join_next().await {
         if let Err(error) = joined {
-            ssh::finish_batch_scope(batch_scope);
             return Err(RemoteFailure::new(
                 "BATCH_INTERNAL_FAILED",
                 error.to_string(),
             ));
         }
     }
-    ssh::finish_batch_scope(batch_scope);
 
     let mut verified_host_keys = Vec::new();
     let mut values = Vec::with_capacity(aliases.len());
@@ -941,6 +951,7 @@ pub(crate) fn limits(
         command_timeout: command_timeout_ms.map(timeout_duration),
         output_bytes: None,
         batch_scope: None,
+        retain_sessions: false,
     }
 }
 
@@ -960,16 +971,12 @@ pub(crate) fn find_host_in<'a>(
     alias: &str,
 ) -> Result<&'a HostProfile, RemoteFailure> {
     validate_alias(alias)?;
-    let alias_trimmed = alias.trim();
-    let host = hosts
-        .iter()
-        .find(|host| host.alias.eq_ignore_ascii_case(alias_trimmed))
-        .ok_or_else(|| {
-            RemoteFailure::new(
-                "ALIAS_NOT_FOUND",
-                format!("No saved host is named {alias}."),
-            )
-        })?;
+    let host = crate::model::find_alias(hosts, alias).ok_or_else(|| {
+        RemoteFailure::new(
+            "ALIAS_NOT_FOUND",
+            format!("No saved host is named {alias}."),
+        )
+    })?;
     if host.advanced.codex_hidden {
         return Err(RemoteFailure::new(
             "HOST_HIDDEN",

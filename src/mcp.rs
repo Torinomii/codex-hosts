@@ -562,6 +562,7 @@ impl Server {
                     Some(command_timeout_or_default(params.command_timeout_ms)),
                     params.batch_timeout_ms,
                     params.continue_on_error,
+                    true,
                 )
                 .await
             })
@@ -596,6 +597,7 @@ impl Server {
                     Some(command_timeout_or_default(params.command_timeout_ms)),
                     params.batch_timeout_ms,
                     params.continue_on_error,
+                    true,
                 )
                 .await
             })
@@ -723,7 +725,7 @@ fn host_limits(
     command_timeout_ms: Option<u64>,
 ) -> OperationLimits {
     let seconds = |value: u32| u64::from(value) * 1000;
-    tool::limits(
+    let mut limits = tool::limits(
         Some(connect_timeout_or_default(
             connect_timeout_ms.or(host.advanced.connect_timeout_s.map(seconds)),
         )),
@@ -731,7 +733,9 @@ fn host_limits(
             command_timeout_ms.or(host.advanced.command_timeout_s.map(seconds)),
         )),
         None,
-    )
+    );
+    limits.retain_sessions = true;
+    limits
 }
 
 fn connect_timeout_or_default(connect_timeout_ms: Option<u64>) -> u64 {

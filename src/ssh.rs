@@ -50,6 +50,9 @@ pub struct OperationLimits {
     pub command_timeout: Option<Duration>,
     pub output_bytes: Option<usize>,
     pub batch_scope: Option<uuid::Uuid>,
+    /// Only the MCP server keeps sessions between calls; the GUI and the
+    /// file protocol never retain, whatever the profile says.
+    pub retain_sessions: bool,
 }
 
 pub const TOTAL_TIMEOUT_CODE: &str = "OPERATION_TIMEOUT";
@@ -335,6 +338,7 @@ impl SessionPool {
         &self,
         key: &SessionKey,
         batch_scope: Option<uuid::Uuid>,
+        retention: Option<Retention>,
     ) -> Result<Option<Arc<PooledSession>>, RemoteFailure> {
         let mut state = self.state.lock().map_err(|_| {
             RemoteFailure::new("SSH_POOL_FAILED", "The SSH connection pool lock failed.")
@@ -367,6 +371,9 @@ impl SessionPool {
             return Ok(None);
         };
         entry.last_used = Instant::now();
+        // The profile may have changed since the session was opened; the
+        // current call's policy decides whether it stays after this call.
+        entry.retention = retention;
         let session = Arc::clone(&entry.session);
         if let Some(scope) = batch_scope {
             state.batch_connections.insert((scope, key.clone()));
@@ -485,6 +492,29 @@ impl SessionPool {
                 .batch_connections
                 .retain(|(batch_scope, _)| *batch_scope != scope);
         }
+    }
+
+    fn release_host(&self, host_id: uuid::Uuid) -> (Vec<Arc<PooledSession>>, usize) {
+        let Ok(mut state) = self.state.lock() else {
+            return (Vec::new(), 0);
+        };
+        let mut idle_keys = Vec::new();
+        let mut in_use = 0;
+        for (key, entry) in state.entries.iter_mut() {
+            if !entry.session.chain_ids.contains(&host_id) {
+                continue;
+            }
+            if entry.unused() {
+                idle_keys.push(key.clone());
+            } else if entry.retention.take().is_some() {
+                in_use += 1;
+            }
+        }
+        let idle = idle_keys
+            .into_iter()
+            .filter_map(|key| state.entries.remove(&key).map(|entry| entry.session))
+            .collect();
+        (idle, in_use)
     }
 
     fn invalidate_host(&self, host_id: uuid::Uuid) -> Vec<Arc<PooledSession>> {
@@ -785,9 +815,12 @@ pub(crate) fn disconnect_all() -> usize {
     disconnect_sessions(session_pool().take_unused(true))
 }
 
-/// Disconnect every session whose chain includes the host, retained or not.
+/// Disconnect every idle session whose chain includes the host; a session a
+/// call is still using loses its retention instead and closes when that call
+/// ends, so an explicit disconnect never cuts a running command.
 pub(crate) fn disconnect_host(host_id: uuid::Uuid) -> usize {
-    disconnect_sessions(session_pool().invalidate_host(host_id))
+    let (idle, in_use) = session_pool().release_host(host_id);
+    disconnect_sessions(idle) + in_use
 }
 
 fn disconnect_sessions(sessions: Vec<Arc<PooledSession>>) -> usize {
@@ -808,43 +841,41 @@ pub fn agent_identities() -> Result<Vec<AgentKeyInfo>, RemoteFailure> {
 }
 
 pub(crate) async fn agent_identities_async() -> Result<Vec<AgentKeyInfo>, RemoteFailure> {
-    {
-        let agents = tokio::time::timeout(AGENT_DISCOVERY_TIMEOUT, connect_local_agents())
-            .await
-            .map_err(|_| {
-                RemoteFailure::new(
-                    "SSH_AGENT_TIMEOUT",
-                    "SSH Agent/Pageant identity discovery exceeded five seconds.",
-                )
-            })??;
-        let mut seen = std::collections::HashSet::new();
-        Ok(agents
-            .into_iter()
-            .flat_map(|agent| agent.identities)
-            .filter(|identity| {
-                seen.insert(
-                    identity
-                        .public_key()
-                        .fingerprint(HashAlg::Sha256)
-                        .to_string(),
-                )
-            })
-            .take(MAX_AGENT_IDENTITIES)
-            .map(|identity| {
-                let key = identity.public_key();
-                let comment = identity.comment().to_owned();
-                let public_key = matches!(&identity, AgentIdentity::PublicKey { .. })
-                    .then(|| format!("{} {}", key.algorithm(), key.public_key_base64()));
-                AgentKeyInfo {
-                    fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
-                    algorithm: key.algorithm().to_string(),
-                    comment,
-                    certificate: matches!(&identity, AgentIdentity::Certificate { .. }),
-                    public_key,
-                }
-            })
-            .collect())
-    }
+    let agents = tokio::time::timeout(AGENT_DISCOVERY_TIMEOUT, connect_local_agents())
+        .await
+        .map_err(|_| {
+            RemoteFailure::new(
+                "SSH_AGENT_TIMEOUT",
+                "SSH Agent/Pageant identity discovery exceeded five seconds.",
+            )
+        })??;
+    let mut seen = std::collections::HashSet::new();
+    Ok(agents
+        .into_iter()
+        .flat_map(|agent| agent.identities)
+        .filter(|identity| {
+            seen.insert(
+                identity
+                    .public_key()
+                    .fingerprint(HashAlg::Sha256)
+                    .to_string(),
+            )
+        })
+        .take(MAX_AGENT_IDENTITIES)
+        .map(|identity| {
+            let key = identity.public_key();
+            let comment = identity.comment().to_owned();
+            let public_key = matches!(&identity, AgentIdentity::PublicKey { .. })
+                .then(|| format!("{} {}", key.algorithm(), key.public_key_base64()));
+            AgentKeyInfo {
+                fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
+                algorithm: key.algorithm().to_string(),
+                comment,
+                certificate: matches!(&identity, AgentIdentity::Certificate { .. }),
+                public_key,
+            }
+        })
+        .collect())
 }
 
 async fn execute_async(
@@ -1017,7 +1048,11 @@ async fn connect_chain(
     let mut sessions = Vec::with_capacity(chain.len());
     let mut verified_host_keys = Vec::with_capacity(chain.len());
     let mut auth_key_fingerprints = Vec::with_capacity(chain.len());
-    let retention = chain_retention(chain.iter().copied());
+    let retention = if limits.retain_sessions {
+        chain_retention(chain.iter().copied())
+    } else {
+        None
+    };
 
     for host in chain {
         let parent = sessions.last().cloned();
@@ -1036,12 +1071,12 @@ async fn pooled_connection(
     retention: Option<Retention>,
 ) -> Result<Arc<PooledSession>, RemoteFailure> {
     let key = SessionKey::new(host, parent.map(|session| &session.key));
-    if let Some(session) = session_pool().ready(&key, limits.batch_scope)? {
+    if let Some(session) = session_pool().ready(&key, limits.batch_scope, retention)? {
         return Ok(session);
     }
     let connection_lock = session_pool().connection_lock(&key);
     let _guard = connection_lock.lock().await;
-    if let Some(session) = session_pool().ready(&key, limits.batch_scope)? {
+    if let Some(session) = session_pool().ready(&key, limits.batch_scope, retention)? {
         return Ok(session);
     }
 
@@ -1760,12 +1795,12 @@ mod tests {
         let key = SessionKey::new(&host, None);
         let scope = uuid::Uuid::new_v4();
         pool.block_reconnect(Some(scope), &key);
-        let Err(error) = pool.ready(&key, Some(scope)) else {
+        let Err(error) = pool.ready(&key, Some(scope), None) else {
             panic!("the blocked batch connection unexpectedly became available");
         };
         assert_eq!(error.code, "SSH_BATCH_RECONNECT_BLOCKED");
         pool.finish_batch_scope(scope);
-        assert!(pool.ready(&key, Some(scope)).unwrap().is_none());
+        assert!(pool.ready(&key, Some(scope), None).unwrap().is_none());
     }
 
     #[test]

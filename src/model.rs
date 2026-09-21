@@ -364,6 +364,15 @@ pub struct Prefill {
     pub jump_alias: Option<String>,
 }
 
+/// Alias lookup shared by the GUI store and the tools: ASCII case and
+/// surrounding whitespace are ignored.
+pub fn find_alias<'a>(hosts: &'a [HostProfile], alias: &str) -> Option<&'a HostProfile> {
+    let alias = alias.trim();
+    hosts
+        .iter()
+        .find(|host| host.alias.eq_ignore_ascii_case(alias))
+}
+
 pub fn normalize_tags(tags: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<String> {
     let mut seen = HashSet::new();
     tags.into_iter()
