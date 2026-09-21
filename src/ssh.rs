@@ -467,6 +467,22 @@ impl SessionPool {
         }
     }
 
+    /// Marks the sessions as used now; an idle limit therefore counts from
+    /// the moment the call let go of them, not from when it picked them up.
+    fn touch<'a>(&self, sessions: impl IntoIterator<Item = &'a Arc<PooledSession>>) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        for session in sessions {
+            if let Some(entry) = state.entries.get_mut(&session.key)
+                && Arc::ptr_eq(&entry.session, session)
+            {
+                entry.last_used = now;
+            }
+        }
+    }
+
     fn block_reconnect(&self, scope: Option<uuid::Uuid>, key: &SessionKey) {
         if let Some(scope) = scope
             && let Ok(mut state) = self.state.lock()
@@ -1034,17 +1050,29 @@ async fn execute_many_async(
     })
 }
 
+/// The chain a call is using. Dropping it refreshes the sessions' idle clock,
+/// so a command that ran longer than the host's idle limit does not leave a
+/// retained session already expired.
+struct ChainLease(Vec<Arc<PooledSession>>);
+
+impl std::ops::Deref for ChainLease {
+    type Target = [Arc<PooledSession>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ChainLease {
+    fn drop(&mut self) {
+        session_pool().touch(self.0.iter());
+    }
+}
+
 async fn connect_chain(
     chain: &[&HostProfile],
     limits: OperationLimits,
-) -> Result<
-    (
-        Vec<Arc<PooledSession>>,
-        Vec<VerifiedHostKey>,
-        Vec<Option<String>>,
-    ),
-    RemoteFailure,
-> {
+) -> Result<(ChainLease, Vec<VerifiedHostKey>, Vec<Option<String>>), RemoteFailure> {
     let mut sessions = Vec::with_capacity(chain.len());
     let mut verified_host_keys = Vec::with_capacity(chain.len());
     let mut auth_key_fingerprints = Vec::with_capacity(chain.len());
@@ -1061,7 +1089,11 @@ async fn connect_chain(
         auth_key_fingerprints.push(session.auth_key_fingerprint.clone());
         sessions.push(session);
     }
-    Ok((sessions, verified_host_keys, auth_key_fingerprints))
+    Ok((
+        ChainLease(sessions),
+        verified_host_keys,
+        auth_key_fingerprints,
+    ))
 }
 
 async fn pooled_connection(
