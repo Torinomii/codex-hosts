@@ -18,6 +18,15 @@ const SE: u8 = 240;
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 const BEGIN_MARKER: &str = "__CODEX_HOSTS_BEGIN__";
 const END_MARKER: &str = "__CODEX_HOSTS_END__";
+/// The markers are sent split by an empty shell quote so a terminal that echoes
+/// typed input never reproduces the contiguous marker; only the command's own
+/// output contains it.
+const BEGIN_MARKER_SOURCE: &str = "__CODEX_HOSTS_BEG''IN__";
+const END_MARKER_SOURCE: &str = "__CODEX_HOSTS_E''ND__";
+/// After the password, `login` discards typed-ahead input, so the command is
+/// sent only once the server has gone quiet (or stayed silent) for this long.
+const SHELL_SETTLE: Duration = Duration::from_millis(500);
+const SHELL_SILENT_LIMIT: Duration = Duration::from_secs(3);
 
 pub fn probe(
     profile: &HostProfile,
@@ -170,24 +179,95 @@ async fn run_session(
         .write_all(format!("{password}\r\n").as_bytes())
         .await
         .map_err(|error| RemoteFailure::new("TELNET_WRITE_FAILED", error.to_string()))?;
+    transcript.clear();
+    wait_for_shell(stream, &mut parser, &mut transcript).await?;
 
-    let request = format!("echo {BEGIN_MARKER}\r\n{command}\r\necho {END_MARKER}\r\n");
+    let request = request_line(command);
     stream
         .write_all(request.as_bytes())
         .await
         .map_err(|error| RemoteFailure::new("TELNET_WRITE_FAILED", error.to_string()))?;
     transcript.clear();
     read_until(stream, &mut parser, &mut transcript, &[END_MARKER]).await?;
-    let text = String::from_utf8_lossy(&transcript);
-    let after_begin = text
-        .split_once(BEGIN_MARKER)
+    Ok(extract_output(&String::from_utf8_lossy(&transcript)))
+}
+
+/// One line when possible, so an interactive shell prints no prompt between
+/// the markers and the command's output; a multi-line command (or one ending
+/// in `&`, which `;` would break) falls back to one line per statement.
+fn request_line(command: &str) -> String {
+    let trimmed = command.trim_end();
+    if trimmed.contains(['\r', '\n']) || trimmed.ends_with('&') {
+        format!("echo {BEGIN_MARKER_SOURCE}\r\n{command}\r\necho {END_MARKER_SOURCE}\r\n")
+    } else {
+        format!("echo {BEGIN_MARKER_SOURCE}; {trimmed}; echo {END_MARKER_SOURCE}\r\n")
+    }
+}
+
+/// Everything the command printed between the two markers, ignoring echoed
+/// input and prompts around them.
+fn extract_output(transcript: &str) -> String {
+    let after_begin = transcript
+        .rsplit_once(BEGIN_MARKER)
         .map(|(_, value)| value)
-        .unwrap_or(text.as_ref());
+        .unwrap_or(transcript);
     let before_end = after_begin
         .split_once(END_MARKER)
         .map(|(value, _)| value)
         .unwrap_or(after_begin);
-    Ok(before_end.trim_matches(['\r', '\n', ' ']).to_owned())
+    before_end.trim_matches(['\r', '\n', ' ']).to_owned()
+}
+
+/// Reads the post-login output (MOTD, prompt) until the server pauses, then
+/// returns so the command is not typed ahead into a queue `login` flushes. A
+/// rejected password is reported instead of waiting for the command timeout.
+async fn wait_for_shell(
+    stream: &mut TcpStream,
+    parser: &mut TelnetParser,
+    transcript: &mut Vec<u8>,
+) -> Result<(), RemoteFailure> {
+    let mut raw = [0_u8; 4096];
+    let mut received = false;
+    loop {
+        let wait = if received {
+            SHELL_SETTLE
+        } else {
+            SHELL_SILENT_LIMIT
+        };
+        match tokio::time::timeout(wait, stream.read(&mut raw)).await {
+            Err(_) => return Ok(()),
+            Ok(Err(error)) => {
+                return Err(RemoteFailure::new("TELNET_READ_FAILED", error.to_string()));
+            }
+            Ok(Ok(0)) => {
+                return Err(RemoteFailure::new(
+                    "TELNET_CLOSED",
+                    "The Telnet server closed the connection after the password.",
+                ));
+            }
+            Ok(Ok(count)) => {
+                received = true;
+                let parsed = parser.consume(&raw[..count]);
+                if !parsed.replies.is_empty() {
+                    stream.write_all(&parsed.replies).await.map_err(|error| {
+                        RemoteFailure::new("TELNET_WRITE_FAILED", error.to_string())
+                    })?;
+                }
+                let remaining = MAX_CAPTURE_BYTES.saturating_sub(transcript.len());
+                transcript.extend_from_slice(&parsed.data[..parsed.data.len().min(remaining)]);
+                let lowercase = String::from_utf8_lossy(transcript).to_ascii_lowercase();
+                if lowercase.contains("login incorrect")
+                    || lowercase.contains("authentication failed")
+                    || lowercase.contains("access denied")
+                {
+                    return Err(RemoteFailure::new(
+                        "AUTH_FAILED",
+                        "The Telnet server rejected the user name or password.",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 async fn read_until(
@@ -313,6 +393,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_is_taken_between_the_printed_markers_even_when_input_is_echoed() {
+        let echoed = format!(
+            "$ echo {BEGIN_MARKER_SOURCE}\r\nuname\r\necho {END_MARKER_SOURCE}\r\n{BEGIN_MARKER}\r\nLinux\r\n{END_MARKER}\r\n$ "
+        );
+        assert_eq!(extract_output(&echoed), "Linux");
+        assert!(!echoed.contains(&format!("echo {BEGIN_MARKER}")));
+        let silent = format!("device> {BEGIN_MARKER}\r\nhi\r\n{END_MARKER}\r\ndevice> ");
+        assert_eq!(extract_output(&silent), "hi");
+        assert_eq!(
+            request_line("uname -s  "),
+            format!("echo {BEGIN_MARKER_SOURCE}; uname -s; echo {END_MARKER_SOURCE}\r\n")
+        );
+        assert!(request_line("sleep 1 &").starts_with(&format!("echo {BEGIN_MARKER_SOURCE}\r\n")));
+        assert!(request_line("a\nb").contains("\r\na\nb\r\n"));
+    }
 
     #[test]
     fn profile_prompts_override_defaults_only_when_filled() {

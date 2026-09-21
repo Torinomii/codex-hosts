@@ -53,7 +53,7 @@ Read [references/tool-protocol.md](references/tool-protocol.md) for the complete
 
 - Do not infer the remote operating system or shell from SSH alone; rely on facts the user gave, the profile's `remote_env` hint, or earlier output verified. Do not assume Bash, GNU utilities, `sudo`, systemd, a UTF-8 locale, or a TTY. Prefer minimal non-interactive commands.
 - Partition heterogeneous hosts by shell before `batch_exec`; never send one POSIX command to a known Windows group or vice versa.
-- Telnet runs the command through a scripted login and returns the captured transcript with `exit_code` 0 even when the command failed, so judge success from the output.
+- Telnet runs the command through a scripted login on a POSIX-style shell (it needs `echo`) and returns the command's output with `exit_code` 0 even when the command failed, so judge success from the output. A rejected login reports `AUTH_FAILED`; a command that ends the shell (such as `exit`) reports `TELNET_CLOSED`.
 
 ## Failures
 
