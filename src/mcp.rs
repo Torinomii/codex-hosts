@@ -795,14 +795,19 @@ fn finish<T: Serialize, E: Serialize>(outcome: Result<T, E>) -> CallToolResult {
 /// `content` carries the same JSON as `structuredContent` so clients that read
 /// only text still see the complete result.
 fn tool_result<T: Serialize>(value: &T, is_error: bool) -> CallToolResult {
-    let json = serde_json::to_value(value).unwrap_or_else(|error| {
+    let mut json = serde_json::to_value(value).unwrap_or_else(|error| {
         serde_json::json!({
-            "schema_version": SCHEMA_VERSION,
             "status": "error",
             "code": "SERIALIZE_FAILED",
             "message": error.to_string(),
         })
     });
+    // Every result carries the protocol version, whichever struct produced it.
+    if let serde_json::Value::Object(fields) = &mut json {
+        fields
+            .entry("schema_version")
+            .or_insert_with(|| serde_json::json!(SCHEMA_VERSION));
+    }
     let text = json.to_string();
     let mut result = if is_error {
         CallToolResult::error(vec![ContentBlock::text(text)])
@@ -822,8 +827,11 @@ ok, remote_error (non-zero exit_code), or error with a code. \
 Defaults when omitted: connect_timeout_ms {connect} ms, command_timeout_ms {command} ms; the \
 maximum for any timeout is {max_timeout} ms. Limits: {max_hosts} hosts per batch, {max_many} \
 commands per exec_many, batch concurrency up to {max_conc}, batch output up to {max_out} bytes. \
-Every call authenticates again unless the host's profile keeps the session; a hardware key may \
-need a touch on each call. Never retry a command automatically.",
+SSH hosts authenticate with a password, a private key (including OpenSSH FIDO handles), or an \
+SSH agent; Telnet hosts with a password. Every call authenticates again unless the host's profile \
+keeps the session; a hardware key may need a touch on each call. When a call fails with \
+CREDENTIAL_MISSING, HOSTKEY_UNKNOWN, HOSTKEY_MISMATCH, or PROFILE_INVALID, call open_host_editor \
+for that alias instead of asking for details in chat. Never retry a command automatically.",
         schema = SCHEMA_VERSION,
         connect = DEFAULT_CONNECT_TIMEOUT.as_millis(),
         command = DEFAULT_COMMAND_TIMEOUT.as_millis(),

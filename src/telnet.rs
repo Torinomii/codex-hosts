@@ -87,7 +87,10 @@ async fn execute_async(
         .ok_or_else(|| {
             RemoteFailure::new(
                 "CREDENTIAL_MISSING",
-                format!("No password is saved for {}.", profile.alias),
+                format!(
+                    "No password is saved for {}; open_host_editor for this alias lets the user add one.",
+                    profile.alias
+                ),
             )
         })?;
     let mut stream = bounded(

@@ -1034,7 +1034,10 @@ pub(crate) fn validate_profile(profile: &HostProfile) -> Result<(), RemoteFailur
     if let Some(issue) = profile.validation_issue() {
         return Err(RemoteFailure::new(
             "PROFILE_INVALID",
-            format!("The saved host is invalid: {issue:?}"),
+            format!(
+                "The saved host is invalid ({}); open_host_editor for this alias lets the user fix it.",
+                issue.tool_label()
+            ),
         ));
     }
     Ok(())

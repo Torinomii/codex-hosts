@@ -334,6 +334,21 @@ pub enum ValidationIssue {
 }
 
 impl ValidationIssue {
+    /// A short English label for tool results, which are not localised.
+    pub fn tool_label(self) -> &'static str {
+        match self {
+            Self::Alias => "alias is empty",
+            Self::Address => "address is empty",
+            Self::Username => "username is empty",
+            Self::Port => "port is 0",
+            Self::PrivateKey => "private key path is empty",
+            Self::Chain => "jump-host chain is invalid",
+            Self::TelnetChain => "a Telnet host cannot use a jump host",
+            Self::AuthPersistence => "idle minutes are out of range",
+            Self::Advanced => "advanced settings are out of range",
+        }
+    }
+
     pub fn translation_key(self) -> &'static str {
         match self {
             Self::Alias => "validation_alias",

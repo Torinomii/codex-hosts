@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 use crate::ssh::RemoteFailure;
 use crate::tool::SCHEMA_VERSION;
 
-/// The editor waits for a person; this only bounds a window nobody ever closes.
+/// The editor waits for a person; this only bounds how long the tool call
+/// stays open. The window itself is left alone so nothing the user typed is
+/// lost, and it still closes with the server when Codex exits.
 const EDITOR_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -97,15 +99,20 @@ pub(super) async fn open_host_editor(
         .spawn()
         .map_err(|error| RemoteFailure::new("EDITOR_LAUNCH_FAILED", error.to_string()))?;
     bind_to_job(&child);
-    let status = tokio::time::timeout(EDITOR_TIMEOUT, child.wait())
-        .await
-        .map_err(|_| {
-            RemoteFailure::new(
+    let status = match tokio::time::timeout(EDITOR_TIMEOUT, child.wait()).await {
+        Ok(status) => status,
+        Err(_) => {
+            // Keep the child (and its kill-on-drop) alive until the window closes.
+            tokio::spawn(async move {
+                let _ = child.wait().await;
+            });
+            return Err(RemoteFailure::new(
                 "EDITOR_TIMEOUT",
-                "The host editor stayed open for an hour without a result.",
-            )
-        })?
-        .map_err(|error| RemoteFailure::new("EDITOR_WAIT_FAILED", error.to_string()))?;
+                "The host editor stayed open for an hour without a result; it is still open, and a later save is not reported to this call.",
+            ));
+        }
+    }
+    .map_err(|error| RemoteFailure::new("EDITOR_WAIT_FAILED", error.to_string()))?;
     let bytes = std::fs::read(&result_path).map_err(|_| {
         RemoteFailure::new(
             "EDITOR_NO_RESULT",
