@@ -31,7 +31,9 @@ use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
 use crate::i18n::Catalog;
 use crate::import;
-use crate::model::{HostFilter, HostProfile, Prefill, Protocol, SshAuth, normalize_tags};
+use crate::model::{
+    AuthPersistence, HostFilter, HostProfile, Prefill, Protocol, SshAuth, normalize_tags,
+};
 use crate::ssh::{
     OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE, VerifiedHostKey,
 };
@@ -71,6 +73,27 @@ struct HostEditor {
     show_required: bool,
     /// Set by a failed save; the next frame moves focus to the first empty required field.
     focus_first_missing: bool,
+    /// True until a host created in this session is saved once: its first
+    /// explicit persistence choice needs no further confirmation.
+    first_save: bool,
+    /// The persistence value the user confirmed in the change dialog; a
+    /// different value in the form asks again.
+    confirmed_persistence: Option<AuthPersistence>,
+}
+
+/// The action that was waiting on the persistence-change confirmation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PendingAction {
+    Save,
+    Test,
+    TestAll,
+}
+
+struct PersistencePrompt {
+    alias: String,
+    from: AuthPersistence,
+    to: AuthPersistence,
+    then: PendingAction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,14 +136,31 @@ impl HostEditor {
             persistence_chosen: true,
             show_required: false,
             focus_first_missing: false,
+            first_save: false,
+            confirmed_persistence: None,
         }
     }
 
     fn fresh(profile: HostProfile) -> Self {
         Self {
             persistence_chosen: false,
+            first_save: true,
             ..Self::load(profile)
         }
+    }
+
+    /// Authentication persistence is the one relaxation of the per-call
+    /// guarantee, so changing it on a saved SSH host is confirmed once, in
+    /// either direction, before anything is written.
+    fn persistence_change(&self) -> Option<(AuthPersistence, AuthPersistence)> {
+        if self.first_save || self.profile.protocol != Protocol::Ssh {
+            return None;
+        }
+        let (from, to) = (
+            self.original.auth_persistence,
+            self.profile.auth_persistence,
+        );
+        (from != to && self.confirmed_persistence != Some(to)).then_some((from, to))
     }
 
     /// Required fields that are still empty, as form label keys in form order.
@@ -280,6 +320,7 @@ pub struct HostsApp {
     repaint_context: egui::Context,
     fingerprint_prompt: Option<FingerprintPrompt>,
     delete_prompt: bool,
+    persistence_prompt: Option<PersistencePrompt>,
     import_window_open: bool,
     import_cleanup_prompt: Option<ImportCleanupPrompt>,
     fido_setup_prompt: Option<FidoSetupPrompt>,
@@ -442,6 +483,7 @@ impl HostsApp {
             repaint_context: context.egui_ctx.clone(),
             fingerprint_prompt,
             delete_prompt: false,
+            persistence_prompt: None,
             import_window_open: false,
             import_cleanup_prompt: None,
             fido_setup_prompt: None,
@@ -482,6 +524,7 @@ impl HostsApp {
         self.test_states.clear();
         self.fingerprint_prompt = None;
         self.delete_prompt = false;
+        self.persistence_prompt = None;
         self.batch_delete_prompt = false;
         self.set_status_key("hosts_refreshed");
         Ok(())
@@ -638,6 +681,8 @@ impl HostsApp {
         let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
         editor.profile = profile.clone();
         editor.original = profile;
+        editor.first_save = false;
+        editor.confirmed_persistence = None;
         editor.tag_input.clear();
         if store_password {
             editor.saved_password_mode = Some(editor.password_mode);
@@ -652,7 +697,48 @@ impl HostsApp {
         Ok(())
     }
 
+    /// Opens the confirmation for a changed persistence value and remembers
+    /// what to run once the user has answered; false means nothing to confirm.
+    fn ask_persistence_confirmation(&mut self, then: PendingAction) -> bool {
+        let Some(editor) = self.editor.as_ref() else {
+            return false;
+        };
+        let Some((from, to)) = editor.persistence_change() else {
+            return false;
+        };
+        self.persistence_prompt = Some(PersistencePrompt {
+            alias: editor.profile.alias.trim().to_owned(),
+            from,
+            to,
+            then,
+        });
+        true
+    }
+
+    pub(super) fn apply_persistence_choice(&mut self, confirm: bool, context: &egui::Context) {
+        let Some(prompt) = self.persistence_prompt.take() else {
+            return;
+        };
+        let Some(editor) = self.editor.as_mut() else {
+            return;
+        };
+        if !confirm {
+            editor.profile.auth_persistence = editor.original.auth_persistence;
+            self.set_status_key("status_cancelled");
+            return;
+        }
+        editor.confirmed_persistence = Some(prompt.to);
+        match prompt.then {
+            PendingAction::Save => self.save(context),
+            PendingAction::Test => self.start_test(),
+            PendingAction::TestAll => self.start_all_tests(),
+        }
+    }
+
     fn save(&mut self, context: &egui::Context) {
+        if self.ask_persistence_confirmation(PendingAction::Save) {
+            return;
+        }
         match self.persist_editor() {
             Ok(()) => {
                 self.set_status_key("status_saved");
@@ -675,6 +761,9 @@ impl HostsApp {
     }
 
     fn start_test(&mut self) {
+        if self.ask_persistence_confirmation(PendingAction::Test) {
+            return;
+        }
         if let Err(error) = self.persist_editor() {
             self.set_status(StatusKind::Error, error);
             return;
@@ -740,6 +829,9 @@ impl HostsApp {
 
     fn start_all_tests(&mut self) {
         if !self.tests_idle() {
+            return;
+        }
+        if self.ask_persistence_confirmation(PendingAction::TestAll) {
             return;
         }
         if self.editor.as_ref().is_some_and(|editor| {
@@ -1868,6 +1960,8 @@ mod tests {
             persistence_chosen: true,
             show_required: false,
             focus_first_missing: false,
+            first_save: false,
+            confirmed_persistence: None,
         };
         let mut store = HostStore::default();
         store.hosts.push(profile.clone());
@@ -1892,6 +1986,7 @@ mod tests {
             repaint_context: context.clone(),
             fingerprint_prompt: None,
             delete_prompt: false,
+            persistence_prompt: None,
             import_window_open: false,
             import_cleanup_prompt: None,
             fido_setup_prompt: None,
@@ -2259,6 +2354,8 @@ mod tests {
             persistence_chosen: true,
             show_required: false,
             focus_first_missing: false,
+            first_save: false,
+            confirmed_persistence: None,
         };
         assert!(!editor.test_result_is_stale());
         editor.password.push_str("replacement");
@@ -2441,5 +2538,91 @@ mod tests {
         assert!(!should_hide_to_tray(true, false, false, false, true));
         assert!(!should_hide_to_tray(true, false, true, false, false));
         assert!(!should_hide_to_tray(true, true, false, false, false));
+    }
+}
+
+/// `YYYY-MM-DD HH:MM UTC` for a Unix timestamp; the store keeps UTC seconds and
+/// the value only needs to be recognisable, so no time-zone crate is pulled in.
+pub(super) fn format_unix_utc(stamp: u64) -> String {
+    let days = stamp / 86_400;
+    let seconds = stamp % 86_400;
+    // Civil-from-days (Howard Hinnant), valid for any date after 1970.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        seconds / 3600,
+        (seconds % 3600) / 60
+    )
+}
+
+#[cfg(test)]
+mod persistence_confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_changed_value_on_a_saved_ssh_host_needs_confirmation() {
+        let mut saved = HostEditor::load(HostProfile::new("box".into()));
+        assert_eq!(saved.persistence_change(), None);
+        saved.profile.auth_persistence = AuthPersistence::Session;
+        assert_eq!(
+            saved.persistence_change(),
+            Some((AuthPersistence::PerCall, AuthPersistence::Session))
+        );
+        saved.confirmed_persistence = Some(AuthPersistence::Session);
+        assert_eq!(saved.persistence_change(), None);
+        saved.profile.auth_persistence = AuthPersistence::Idle { minutes: 5 };
+        assert!(
+            saved.persistence_change().is_some(),
+            "a different value asks again"
+        );
+        saved.profile.auth_persistence = AuthPersistence::PerCall;
+        assert_eq!(
+            saved.persistence_change(),
+            None,
+            "back to the original is no change"
+        );
+
+        let mut relaxed = HostProfile::new("kept".into());
+        relaxed.auth_persistence = AuthPersistence::Session;
+        let mut tightening = HostEditor::load(relaxed);
+        tightening.profile.auth_persistence = AuthPersistence::PerCall;
+        assert!(
+            tightening.persistence_change().is_some(),
+            "either direction is confirmed"
+        );
+
+        let mut fresh = HostEditor::fresh(HostProfile::new("new".into()));
+        fresh.profile.auth_persistence = AuthPersistence::Session;
+        assert_eq!(
+            fresh.persistence_change(),
+            None,
+            "the first explicit choice is the confirmation"
+        );
+
+        let mut telnet = HostProfile::new("tel".into());
+        telnet.protocol = Protocol::Telnet;
+        let mut telnet = HostEditor::load(telnet);
+        telnet.profile.auth_persistence = AuthPersistence::Session;
+        assert_eq!(telnet.persistence_change(), None);
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    #[test]
+    fn unix_timestamps_render_as_utc_dates() {
+        assert_eq!(super::format_unix_utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(
+            super::format_unix_utc(1_758_500_000),
+            "2025-09-22 00:13 UTC"
+        );
     }
 }

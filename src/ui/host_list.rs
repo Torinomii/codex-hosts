@@ -272,6 +272,7 @@ impl HostsApp {
         let batch_selected = &self.batch_selected;
         let test_states = &self.test_states;
         let delete_label = self.catalog.text("delete").to_owned();
+        let retained_hint = self.catalog.text("persistence_retained_hint").to_owned();
         let mut selection_request = None;
         let mut deletion_request = None;
         let mut batch_toggle_request = None;
@@ -309,11 +310,11 @@ impl HostsApp {
                     batch_mode.then(|| batch_selected.contains(&id)),
                 );
                 let (response, checkbox_change) = host_row(ui, &model, row_height);
-                let response = response.on_hover_text(format!(
-                    "{}\n{}",
-                    host.description,
-                    host.tags.join(", ")
-                ));
+                let mut hover = format!("{}\n{}", host.description, host.tags.join(", "));
+                if model.retained {
+                    hover = format!("{hover}\n{RETAINED_GLYPH} {retained_hint}");
+                }
+                let response = response.on_hover_text(hover);
                 if let Some(checked) = checkbox_change {
                     batch_toggle_request = Some((id, checked));
                 } else if response.clicked() || response.secondary_clicked() {

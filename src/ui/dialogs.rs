@@ -5,6 +5,8 @@ use std::sync::mpsc;
 use eframe::egui::{self, RichText};
 
 use super::{FidoSetupAction, FidoSetupPrompt, HostsApp};
+use crate::i18n::Catalog;
+use crate::model::AuthPersistence;
 use zeroize::Zeroizing;
 
 pub(super) enum DialogResult<T> {
@@ -121,6 +123,7 @@ impl HostsApp {
         self.import_cleanup_dialog(context);
         self.batch_export_dialog(context);
         self.delete_dialog(context);
+        self.persistence_dialog(context);
         self.batch_delete_dialog(context);
     }
 
@@ -131,6 +134,7 @@ impl HostsApp {
             || self.import_cleanup_prompt.is_some()
             || self.batch_export_window_open
             || self.delete_prompt
+            || self.persistence_prompt.is_some()
             || self.batch_delete_prompt
     }
 
@@ -310,6 +314,14 @@ impl HostsApp {
                 ui.add_space(10.0);
             }
             ui.label(RichText::new(catalog.text("fingerprint_detected")).strong());
+            if prompt.close_after_choice {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(catalog.text("fingerprint_reported_by_codex")).small(),
+                    )
+                    .wrap(),
+                );
+            }
             ui.add(egui::Label::new(RichText::new(&prompt.observed).monospace()).wrap());
             if let Some(algorithm) = &prompt.observed_algorithm {
                 ui.label(
@@ -454,6 +466,44 @@ impl HostsApp {
         }
     }
 
+    fn persistence_dialog(&mut self, context: &egui::Context) {
+        let Some(prompt) = self.persistence_prompt.as_ref() else {
+            return;
+        };
+        let catalog = &self.catalog;
+        let message = catalog.format(
+            "persistence_change_message",
+            &[
+                ("alias", &prompt.alias),
+                ("from", &persistence_label(catalog, prompt.from)),
+                ("to", &persistence_label(catalog, prompt.to)),
+            ],
+        );
+        let relaxing = prompt.to != AuthPersistence::PerCall;
+        let choice = dialog_shell(
+            context,
+            "persistence_confirmation",
+            520.0,
+            catalog.text("persistence_change_title"),
+            |ui| {
+                ui.add(egui::Label::new(message).wrap());
+                if relaxing {
+                    ui.add_space(10.0);
+                    ui.add(egui::Label::new(catalog.text("persistence_warning_ssh")).wrap());
+                }
+                dialog_button_row(
+                    ui,
+                    catalog.text("persistence_change_confirm"),
+                    relaxing,
+                    catalog.text("cancel"),
+                )
+            },
+        );
+        if let Some(confirm) = choice {
+            self.apply_persistence_choice(confirm, context);
+        }
+    }
+
     fn batch_delete_dialog(&mut self, context: &egui::Context) {
         if !self.batch_delete_prompt {
             return;
@@ -475,5 +525,19 @@ impl HostsApp {
                 self.remove_batch();
             }
         }
+    }
+}
+
+/// The persistence option's form label, with the idle minutes filled in.
+pub(super) fn persistence_label(catalog: &Catalog, value: AuthPersistence) -> String {
+    match value {
+        AuthPersistence::PerCall => catalog.text("persistence_per_call").to_owned(),
+        AuthPersistence::Session => catalog.text("persistence_session").to_owned(),
+        AuthPersistence::Idle { minutes } => format!(
+            "{} ({} {})",
+            catalog.text("persistence_idle"),
+            minutes,
+            catalog.text("persistence_minutes")
+        ),
     }
 }

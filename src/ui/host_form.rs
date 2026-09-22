@@ -558,8 +558,13 @@ fn persistence_rows(
         } else {
             editor.profile.auth_persistence
         };
-        let chosen = editor.persistence_chosen && !telnet;
-        let mut selection = chosen.then_some(current);
+        // Telnet always re-authenticates, so the fixed option shows as chosen
+        // instead of an empty, greyed group.
+        let mut selection = if telnet {
+            Some(AuthPersistence::PerCall)
+        } else {
+            editor.persistence_chosen.then_some(current)
+        };
         let idle_minutes = match current {
             AuthPersistence::Idle { minutes } => minutes,
             _ => 15,
@@ -823,6 +828,28 @@ fn host_key_section(ui: &mut egui::Ui, editor: &HostEditor, catalog: &Catalog) {
                         .small()
                         .weak(),
                     );
+                }
+                for (key, stamp) in [
+                    (
+                        "host_key_first_seen",
+                        editor.profile.host_key_first_seen_unix,
+                    ),
+                    (
+                        "host_key_last_verified",
+                        editor.profile.host_key_last_verified_unix,
+                    ),
+                ] {
+                    if let Some(stamp) = stamp {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}: {}",
+                                catalog.text(key),
+                                super::format_unix_utc(stamp)
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    }
                 }
             }
             None => {
