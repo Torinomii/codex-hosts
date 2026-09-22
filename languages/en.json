@@ -235,6 +235,7 @@
     "telnet_prompts_hint": "Override the login and password prompt text for devices whose banners differ from the defaults.",
     "telnet_login_prompt": "Login",
     "telnet_password_prompt": "Password",
+    "store_owner_unavailable": "The owner of the host list file could not be checked ({error}). Codex access may be refused.",
     "store_owner_warning": "The host list file is owned by another account ({owner}). Codex access will be refused until it is yours again: {command}"
   }
 }

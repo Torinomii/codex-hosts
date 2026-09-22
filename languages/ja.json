@@ -235,6 +235,7 @@
     "telnet_prompts_hint": "ログインバナーが既定と異なる機器向けに、ログインとパスワードのプロンプト文字列を上書きします。",
     "telnet_login_prompt": "ログイン",
     "telnet_password_prompt": "パスワード",
+    "store_owner_unavailable": "ホスト一覧ファイルの所有者を確認できませんでした（{error}）。Codex からのアクセスが拒否される可能性があります。",
     "store_owner_warning": "ホスト一覧ファイルの所有者が別のアカウント（{owner}）です。所有者を戻すまで Codex からのアクセスは拒否されます：{command}"
   }
 }

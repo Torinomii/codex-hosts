@@ -495,10 +495,11 @@ pub(crate) fn list_hosts(
         .iter()
         .filter(|host| !host.advanced.codex_hidden && filter.matches(host))
     {
+        // A Credential Manager read that fails for one host should not hide
+        // the whole list; that host simply reports no usable secret.
         let has_required_secret = match (host.protocol, host.ssh_auth) {
             (Protocol::Ssh, SshAuth::PrivateKey | SshAuth::SshAgent) => true,
-            _ => credentials::has(host.id, CredentialKind::Password)
-                .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?,
+            _ => credentials::has(host.id, CredentialKind::Password).unwrap_or(false),
         };
         hosts.push(HostSummary {
             alias: host.alias.clone(),

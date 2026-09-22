@@ -235,6 +235,7 @@
     "telnet_prompts_hint": "為登入橫幅與預設值不同的裝置覆寫登入和密碼提示文字。",
     "telnet_login_prompt": "登入",
     "telnet_password_prompt": "密碼",
+    "store_owner_unavailable": "無法檢查主機清單檔案的擁有者（{error}）。Codex 存取可能被拒絕。",
     "store_owner_warning": "主機清單檔案的擁有者是另一個帳戶（{owner}）。在它歸還給你之前，Codex 將被拒絕存取：{command}"
   }
 }

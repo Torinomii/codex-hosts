@@ -441,6 +441,12 @@ impl HostsApp {
                     ],
                 ),
             )
+        } else if let crate::storage::OwnerCheck::Unavailable(error) = crate::storage::owner_check()
+        {
+            StatusMessage::new(
+                StatusKind::Warning,
+                catalog.format("store_owner_unavailable", &[("error", &error)]),
+            )
         } else if launch.codex_edit {
             StatusMessage::info(catalog.text("draft_waiting"))
         } else {
