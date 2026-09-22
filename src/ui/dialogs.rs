@@ -471,32 +471,42 @@ impl HostsApp {
             return;
         };
         let catalog = &self.catalog;
-        let message = catalog.format(
-            "persistence_change_message",
-            &[
-                ("alias", &prompt.alias),
-                ("from", &persistence_label(catalog, prompt.from)),
-                ("to", &persistence_label(catalog, prompt.to)),
-            ],
-        );
+        let to = persistence_label(catalog, prompt.to);
+        let (title, message, confirm) = match prompt.from {
+            Some(from) => (
+                "persistence_change_title",
+                catalog.format(
+                    "persistence_change_message",
+                    &[
+                        ("alias", &prompt.alias),
+                        ("from", &persistence_label(catalog, from)),
+                        ("to", &to),
+                    ],
+                ),
+                "persistence_change_confirm",
+            ),
+            None => (
+                "persistence_first_title",
+                catalog.format(
+                    "persistence_first_message",
+                    &[("alias", &prompt.alias), ("to", &to)],
+                ),
+                "persistence_first_confirm",
+            ),
+        };
         let relaxing = prompt.to != AuthPersistence::PerCall;
         let choice = dialog_shell(
             context,
             "persistence_confirmation",
             520.0,
-            catalog.text("persistence_change_title"),
+            catalog.text(title),
             |ui| {
                 ui.add(egui::Label::new(message).wrap());
                 if relaxing {
                     ui.add_space(10.0);
                     ui.add(egui::Label::new(catalog.text("persistence_warning_ssh")).wrap());
                 }
-                dialog_button_row(
-                    ui,
-                    catalog.text("persistence_change_confirm"),
-                    relaxing,
-                    catalog.text("cancel"),
-                )
+                dialog_button_row(ui, catalog.text(confirm), relaxing, catalog.text("cancel"))
             },
         );
         if let Some(confirm) = choice {

@@ -27,12 +27,12 @@
 - Multi-host SSH / Telnet probing and execution.
 - Memory-only temporary secrets for API keys, tokens, and other values that should not be exposed to Codex.
 - An MCP server with risk-annotated tools, plus a Codex Skill for host lookup, connection, authentication, and command execution.
-- Per-host authentication persistence: re-authenticate on every operation (default), keep the session while Codex runs, or drop it after idle time.
+- Per-host authentication persistence: keep the session while Codex runs (proposed for new hosts and confirmed on the first save), re-authenticate on every operation, or drop it after idle time.
 
 ## What's new in 0.3.1
 
 - MCP server: `codex-hosts.exe --mcp` serves Codex over stdio. Hosts, probes, commands, batches, the host editor and temporary secrets are MCP tools with risk annotations; no shell, PowerShell wrapper or temporary request files are involved any more. The previous file-based tool mode keeps working unchanged for Skills that have not been updated.
-- Authentication persistence: every host now chooses whether Codex re-authenticates on every operation (the default and the previous behaviour), keeps the session for the Codex session, or drops it after a chosen idle time. Hosts that keep sessions are marked in the list and carry a warning in the editor.
+- Authentication persistence: every host now chooses whether Codex keeps the session for the Codex session (proposed for new hosts; the choice is confirmed on the first save and whenever it changes), re-authenticates on every operation (the previous behaviour, kept for hosts from earlier versions and for imports), or drops it after a chosen idle time. Hosts that keep sessions are marked in the list and carry a warning in the editor.
 - Editor: required fields are marked with `*` and highlighted when a save is attempted with one empty; a new **Advanced** card holds per-host tuning (concurrent channels, default timeouts, keepalive interval, a remote-environment hint for Codex, hiding a host from Codex, and Telnet prompt overrides).
 - Cancelling a Codex call now stops the wait and closes the channel; long-running work is documented around the remote host's own `tmux` / `screen` instead of long waits.
 - `codex-hosts.exe --version` prints the version, and argument errors are reported on stderr. The executable is a windowed program, so both are visible only when captured (`codex-hosts.exe --version | more`).
@@ -220,12 +220,12 @@ If the server host key later changes, the saved fingerprint is not replaced auto
 
 ### Authentication persistence
 
-By default every Codex call authenticates again, so a hardware key is touched once per action and Codex never holds an open session between calls. Each host can relax this in its **Authentication** card:
+Hosts from earlier versions and imported hosts re-authenticate on every Codex call, so a hardware key is touched once per action and Codex never holds an open session between calls. A new host is proposed with **Keep for the Codex session**; the editor asks you to confirm the choice on the first save and again whenever you change it, in either direction. Each host can pick any option in its **Authentication** card:
 
 | Option | Behaviour |
 | --- | --- |
-| Re-authenticate on every operation | Default. The connection closes when the call ends. |
-| Keep for the Codex session | The authenticated session stays open, with keepalives, until Codex exits, the link drops, or `disconnect` is called. |
+| Re-authenticate on every operation | The connection closes when the call ends. Hosts from earlier versions and imports start here. |
+| Keep for the Codex session | Proposed for new hosts. The authenticated session stays open, with keepalives, until Codex exits, the link drops, or `disconnect` is called. |
 | Disconnect after idle time | The session stays open until it has been idle for the chosen number of minutes. |
 
 While a session is kept, later Codex commands on that host run without re-authenticating or touching the security key, which removes the one-confirmation-per-action protection. The editor shows this warning, hosts that keep sessions carry a marker in the list, and Codex is told never to suggest changing the setting. Telnet hosts always re-authenticate. Credentials, PINs and host-key checks are unaffected; only the live session is reused.

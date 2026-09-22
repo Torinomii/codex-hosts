@@ -592,22 +592,20 @@ fn persistence_rows(
     catalog: &Catalog,
 ) {
     let telnet = editor.profile.protocol == Protocol::Telnet;
-    let missing = editor.show_required && !editor.persistence_chosen && !telnet;
     let hint = telnet.then(|| catalog.text("persistence_telnet_note").to_owned());
-    form.required_row(ui, "auth_persistence", missing, hint, |ui, width| {
+    form.required_row(ui, "auth_persistence", false, hint, |ui, width| {
         ui.set_max_width(width);
         let current = if telnet {
             AuthPersistence::PerCall
         } else {
             editor.profile.auth_persistence
         };
-        // Telnet always re-authenticates, so the fixed option shows as chosen
-        // instead of an empty, greyed group.
-        let mut selection = if telnet {
-            Some(AuthPersistence::PerCall)
+        // Telnet always re-authenticates, so the fixed option shows as chosen.
+        let mut selection = Some(if telnet {
+            AuthPersistence::PerCall
         } else {
-            editor.persistence_chosen.then_some(current)
-        };
+            current
+        });
         let idle_minutes = match current {
             AuthPersistence::Idle { minutes } => minutes,
             _ => 15,
@@ -636,7 +634,6 @@ fn persistence_rows(
         });
         if let Some(choice) = selection {
             editor.profile.auth_persistence = choice;
-            editor.persistence_chosen = true;
         }
         if let AuthPersistence::Idle { minutes } = &mut editor.profile.auth_persistence
             && !telnet
@@ -650,10 +647,7 @@ fn persistence_rows(
             });
         }
     });
-    if !telnet
-        && editor.persistence_chosen
-        && editor.profile.auth_persistence != AuthPersistence::PerCall
-    {
+    if !telnet && editor.profile.auth_persistence != AuthPersistence::PerCall {
         warning_callout(ui, catalog.text("persistence_warning_ssh"));
     }
 }
@@ -1268,7 +1262,6 @@ mod tests {
         let mut app = metadata_test_app(&context, "en", profile);
         if let Some(editor) = app.editor.as_mut() {
             editor.show_required = true;
-            editor.persistence_chosen = false;
         }
         let output = run_form(&mut app, &context, 760.0);
         let hint = app.catalog.text("required_hint");
@@ -1277,10 +1270,7 @@ mod tests {
             .iter()
             .filter(|shape| find_text_rect(std::slice::from_ref(shape), hint).is_some())
             .count();
-        assert!(
-            hints >= 3,
-            "alias, username and persistence are flagged, got {hints}"
-        );
+        assert!(hints >= 2, "alias and username are flagged, got {hints}");
         assert_eq!(
             app.editor.as_ref().unwrap().first_missing_field(),
             Some("alias")

@@ -66,15 +66,12 @@ struct HostEditor {
     password_read_error: Option<String>,
     has_key_passphrase: bool,
     key_passphrase_read_error: Option<String>,
-    /// False for a host created in this session until the user picks an
-    /// authentication-persistence option; saved profiles always carry one.
-    persistence_chosen: bool,
     /// Set by a failed save so empty required fields are highlighted.
     show_required: bool,
     /// Set by a failed save; the next frame moves focus to the first empty required field.
     focus_first_missing: bool,
-    /// True until a host created in this session is saved once: its first
-    /// explicit persistence choice needs no further confirmation.
+    /// True until a host created in this session is saved once; the first save
+    /// confirms the persistence choice whatever it is.
     first_save: bool,
     /// The persistence value the user confirmed in the change dialog; a
     /// different value in the form asks again.
@@ -91,7 +88,8 @@ enum PendingAction {
 
 struct PersistencePrompt {
     alias: String,
-    from: AuthPersistence,
+    /// `None` for a host's first save, which has no stored value to change from.
+    from: Option<AuthPersistence>,
     to: AuthPersistence,
     then: PendingAction,
 }
@@ -133,7 +131,6 @@ impl HostEditor {
             password_read_error,
             has_key_passphrase,
             key_passphrase_read_error,
-            persistence_chosen: true,
             show_required: false,
             focus_first_missing: false,
             first_save: false,
@@ -141,26 +138,38 @@ impl HostEditor {
         }
     }
 
+    /// A host created in this session. The form proposes keeping the session
+    /// for SSH hosts; the stored draft (and every profile the store loads or
+    /// imports) stays per-call until the user confirms the choice on save.
     fn fresh(profile: HostProfile) -> Self {
-        Self {
-            persistence_chosen: false,
+        let mut editor = Self {
             first_save: true,
             ..Self::load(profile)
+        };
+        if editor.profile.protocol == Protocol::Ssh {
+            editor.profile.auth_persistence = AuthPersistence::Session;
         }
+        editor
     }
 
     /// Authentication persistence is the one relaxation of the per-call
-    /// guarantee, so changing it on a saved SSH host is confirmed once, in
-    /// either direction, before anything is written.
-    fn persistence_change(&self) -> Option<(AuthPersistence, AuthPersistence)> {
-        if self.first_save || self.profile.protocol != Protocol::Ssh {
+    /// guarantee, so it is confirmed before anything is written: once on a
+    /// host's first save, and again whenever a saved host's value changes, in
+    /// either direction. Returns the stored value (none on a first save) and
+    /// the value to confirm.
+    fn persistence_change(&self) -> Option<(Option<AuthPersistence>, AuthPersistence)> {
+        if self.profile.protocol != Protocol::Ssh {
             return None;
         }
-        let (from, to) = (
-            self.original.auth_persistence,
-            self.profile.auth_persistence,
-        );
-        (from != to && self.confirmed_persistence != Some(to)).then_some((from, to))
+        let to = self.profile.auth_persistence;
+        if self.confirmed_persistence == Some(to) {
+            return None;
+        }
+        if self.first_save {
+            return Some((None, to));
+        }
+        let from = self.original.auth_persistence;
+        (from != to).then_some((Some(from), to))
     }
 
     /// Required fields that are still empty, as form label keys in form order.
@@ -181,9 +190,6 @@ impl HostEditor {
             && profile.private_key_path.trim().is_empty()
         {
             missing.push("private_key");
-        }
-        if profile.protocol == Protocol::Ssh && !self.persistence_chosen {
-            missing.push("auth_persistence");
         }
         missing
     }
@@ -621,6 +627,9 @@ impl HostsApp {
             profile.verified = false;
         }
         if profile.protocol == Protocol::Telnet {
+            // Telnet never keeps sessions; store the strict value so a later
+            // switch to SSH starts from per-call rather than a hidden default.
+            profile.auth_persistence = AuthPersistence::PerCall;
             profile.jump_host = None;
             profile.host_fingerprint = None;
             profile.host_key_algorithm = None;
@@ -729,7 +738,10 @@ impl HostsApp {
             return;
         };
         if !confirm {
-            editor.profile.auth_persistence = editor.original.auth_persistence;
+            // A change is undone; a first save keeps what the user picked.
+            if prompt.from.is_some() {
+                editor.profile.auth_persistence = editor.original.auth_persistence;
+            }
             self.set_status_key("status_cancelled");
             return;
         }
@@ -1963,7 +1975,6 @@ mod tests {
             password_read_error: None,
             has_key_passphrase: false,
             key_passphrase_read_error: None,
-            persistence_chosen: true,
             show_required: false,
             focus_first_missing: false,
             first_save: false,
@@ -2312,6 +2323,54 @@ mod tests {
     }
 
     #[test]
+    fn a_new_host_confirms_its_proposed_persistence_on_first_save() {
+        let context = egui::Context::default();
+        configure_fonts(&context, "en");
+        apply_style(&context);
+        let mut app = layout_test_app(&context, "en");
+        // Built in memory: new_host() would write the store to the real data directory.
+        let profile = HostProfile::new("fresh-box".into());
+        app.store.hosts.push(profile.clone());
+        app.selected = Some(profile.id);
+        app.editor = Some(HostEditor::fresh(profile));
+        {
+            let editor = app.editor.as_mut().unwrap();
+            assert_eq!(editor.profile.auth_persistence, AuthPersistence::Session);
+            editor.profile.address = "10.0.0.9".into();
+            editor.profile.username = "deploy".into();
+            editor.profile.ssh_auth = SshAuth::Password;
+            editor.password_mode = PasswordMode::NoPassword;
+        }
+        app.save(&context);
+        let prompt = app.persistence_prompt.as_ref().expect("first save asks");
+        assert_eq!(prompt.from, None);
+        assert_eq!(prompt.to, AuthPersistence::Session);
+        let output = run_full_window(&mut app, &context, [1280.0, 800.0]);
+        let texts = painted_texts(&output.shapes);
+        for key in ["persistence_first_title", "persistence_first_confirm"] {
+            let wanted = app.catalog.text(key);
+            assert!(
+                texts.iter().any(|(text, _, _)| text.starts_with(wanted)),
+                "missing {key}"
+            );
+        }
+        app.apply_persistence_choice(false, &context);
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(
+            editor.profile.auth_persistence,
+            AuthPersistence::Session,
+            "cancelling a first save keeps the proposed value in the form"
+        );
+        assert!(
+            app.store
+                .hosts
+                .iter()
+                .all(|host| host.auth_persistence == AuthPersistence::PerCall),
+            "nothing relaxed was written"
+        );
+    }
+
+    #[test]
     fn filtered_bulk_selection_never_keeps_hidden_hosts() {
         let visible = HostProfile {
             tags: vec!["prod".into()],
@@ -2414,7 +2473,6 @@ mod tests {
             password_read_error: None,
             has_key_passphrase: false,
             key_passphrase_read_error: None,
-            persistence_chosen: true,
             show_required: false,
             focus_first_missing: false,
             first_save: false,
@@ -2631,13 +2689,13 @@ mod persistence_confirmation_tests {
     use super::*;
 
     #[test]
-    fn only_a_changed_value_on_a_saved_ssh_host_needs_confirmation() {
+    fn persistence_is_confirmed_on_first_save_and_on_every_change() {
         let mut saved = HostEditor::load(HostProfile::new("box".into()));
         assert_eq!(saved.persistence_change(), None);
         saved.profile.auth_persistence = AuthPersistence::Session;
         assert_eq!(
             saved.persistence_change(),
-            Some((AuthPersistence::PerCall, AuthPersistence::Session))
+            Some((Some(AuthPersistence::PerCall), AuthPersistence::Session))
         );
         saved.confirmed_persistence = Some(AuthPersistence::Session);
         assert_eq!(saved.persistence_change(), None);
@@ -2663,15 +2721,37 @@ mod persistence_confirmation_tests {
         );
 
         let mut fresh = HostEditor::fresh(HostProfile::new("new".into()));
-        fresh.profile.auth_persistence = AuthPersistence::Session;
+        assert_eq!(
+            fresh.profile.auth_persistence,
+            AuthPersistence::Session,
+            "a new SSH host proposes keeping the session"
+        );
+        assert_eq!(
+            fresh.original.auth_persistence,
+            AuthPersistence::PerCall,
+            "the stored draft stays per-call until confirmed"
+        );
         assert_eq!(
             fresh.persistence_change(),
-            None,
-            "the first explicit choice is the confirmation"
+            Some((None, AuthPersistence::Session)),
+            "the first save confirms the proposed value"
         );
+        fresh.profile.auth_persistence = AuthPersistence::PerCall;
+        assert_eq!(
+            fresh.persistence_change(),
+            Some((None, AuthPersistence::PerCall)),
+            "the first save confirms even the strict value"
+        );
+        fresh.confirmed_persistence = Some(AuthPersistence::PerCall);
+        assert_eq!(fresh.persistence_change(), None);
 
         let mut telnet = HostProfile::new("tel".into());
         telnet.protocol = Protocol::Telnet;
+        let fresh_telnet = HostEditor::fresh(telnet.clone());
+        assert_eq!(
+            fresh_telnet.profile.auth_persistence,
+            AuthPersistence::PerCall
+        );
         let mut telnet = HostEditor::load(telnet);
         telnet.profile.auth_persistence = AuthPersistence::Session;
         assert_eq!(telnet.persistence_change(), None);
