@@ -900,6 +900,13 @@ pub(crate) fn merge_verified_host_keys(
     if verified_host_keys.is_empty() {
         return Ok(());
     }
+    // Concurrent calls in the MCP server each load, modify and save the store;
+    // without this the store's revision check fails one of them after its
+    // remote authentication already succeeded.
+    static STORE_MERGE: Mutex<()> = Mutex::new(());
+    let _merge = STORE_MERGE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut fresh = HostStore::load()
         .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
     let mut changed = false;
