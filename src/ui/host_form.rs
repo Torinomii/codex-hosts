@@ -11,7 +11,7 @@ use crate::model::{
 };
 
 const STACKED_BREAKPOINT: f32 = 520.0;
-const LABEL_WIDTH: f32 = 150.0;
+const LABEL_WIDTH: f32 = 168.0;
 const ROW_MARGIN: egui::Margin = egui::Margin::symmetric(10, 7);
 const MAX_FORM_WIDTH: f32 = 1100.0;
 
@@ -121,10 +121,22 @@ impl<'a> Form<'a> {
             .then(|| RichText::new("*").strong().color(accent));
         let missing_hint = (requirement == Requirement::Missing)
             .then(|| self.catalog.text("required_hint").to_owned());
-        let label_cell = |ui: &mut egui::Ui, truncate: bool| {
+        // The label wraps inside its column (the star takes the rest of the
+        // width) instead of being cut with an ellipsis.
+        let label_cell = |ui: &mut egui::Ui, wrap: bool| {
             ui.spacing_mut().item_spacing.x = 3.0;
-            let label = egui::Label::new(label);
-            ui.add(if truncate { label.truncate() } else { label });
+            let mut label = egui::Label::new(label);
+            if wrap {
+                let star_width = ui.spacing().interact_size.y * 0.5;
+                ui.set_max_width(ui.available_width());
+                label = label.wrap();
+                ui.scope(|ui| {
+                    ui.set_max_width((ui.available_width() - star_width).max(40.0));
+                    ui.add(label);
+                });
+            } else {
+                ui.add(label);
+            }
             if let Some(star) = star {
                 ui.label(star);
             }
