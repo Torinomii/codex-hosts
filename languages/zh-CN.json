@@ -207,6 +207,7 @@
     "persistence_minutes": "分钟",
     "persistence_telnet_note": "Telnet 始终每次操作重新认证；会话保持计划中。",
     "persistence_warning_ssh": "保持会话期间，Codex 对此主机的后续命令不再重新认证或触碰安全密钥，也就取消了“每个动作一次确认”的保护。请只对你愿意让 Codex 连续操作的主机开启。",
+    "temp_name_hint": "字段名，例如 myproject-staging-api-key",
     "persistence_change_title": "更改认证保持方式？",
     "persistence_change_message": "主机\"{alias}\"：\"{from}\" → \"{to}\"。这会改变 Codex 在此主机上需要认证（以及触碰硬件密钥）的频率。",
     "persistence_change_confirm": "更改并继续",

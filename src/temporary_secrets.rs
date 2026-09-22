@@ -610,7 +610,7 @@ impl SecretsApp {
             ui.add_sized(
                 [name_width, 34.0],
                 egui::TextEdit::singleline(&mut self.new_name)
-                    .hint_text("project-local-qwen-apikey")
+                    .hint_text(self.catalog.text("temp_name_hint"))
                     .desired_width(name_width)
                     .char_limit(256),
             );

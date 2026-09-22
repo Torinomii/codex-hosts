@@ -207,6 +207,7 @@
     "persistence_minutes": "分鐘",
     "persistence_telnet_note": "Telnet 一律每次操作重新認證；工作階段保持規劃中。",
     "persistence_warning_ssh": "保持工作階段期間，Codex 對此主機的後續命令不再重新認證或觸碰安全金鑰，也就取消了「每個動作一次確認」的保護。請只對你願意讓 Codex 連續操作的主機開啟。",
+    "temp_name_hint": "欄位名稱，例如 myproject-staging-api-key",
     "persistence_change_title": "變更驗證保持方式？",
     "persistence_change_message": "主機「{alias}」：「{from}」 → 「{to}」。這會改變 Codex 在此主機上需要驗證（以及觸碰硬體金鑰）的頻率。",
     "persistence_change_confirm": "變更並繼續",
