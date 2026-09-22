@@ -82,6 +82,16 @@ tool_timeout_sec = 86400
 
 `tool_timeout_sec` 只是上限；每次调用都带有自己的超时。如果从不使用阻塞等待处理长作业，可以保留 Codex 的默认值。
 
+`probe` 与 `batch_probe` 标注为只读，Codex 会不经确认（且可并行）直接运行它们：它们只执行 `hostname`，而无人值守地预先认证一台保持会话的主机正是这个设计的价值所在。它们仍会连接并认证，因此硬件密钥会要求触碰。若希望每次都确认，可在 Codex 中这样设置：
+
+```toml
+[mcp_servers.codex-hosts.tools.probe]
+approval_mode = "prompt"
+
+[mcp_servers.codex-hosts.tools.batch_probe]
+approval_mode = "prompt"
+```
+
 不要只复制 `SKILL.md` 或可执行文件，应保留完整 Skill 目录。
 
 也可以直接让 Codex 安装：

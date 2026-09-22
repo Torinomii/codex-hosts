@@ -82,6 +82,16 @@ tool_timeout_sec = 86400
 
 `tool_timeout_sec` is only a ceiling; each call carries its own timeout. If you never use blocking waits for long jobs you can leave Codex's default.
 
+Codex runs `probe` and `batch_probe` without asking, because they are marked read-only: they only run `hostname`, and letting them run unattended (and in parallel) is what makes pre-authenticating a host that keeps its session useful. They still connect and authenticate, so a hardware key will ask for a touch. If you would rather confirm each one, tell Codex so:
+
+```toml
+[mcp_servers.codex-hosts.tools.probe]
+approval_mode = "prompt"
+
+[mcp_servers.codex-hosts.tools.batch_probe]
+approval_mode = "prompt"
+```
+
 Do not install only `SKILL.md` or the executable; keep the complete Skill directory.
 
 You can also ask Codex to install it:

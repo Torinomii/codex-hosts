@@ -386,8 +386,13 @@ impl Server {
 
     #[tool(
         name = "probe",
-        description = "Connect to one saved host, authenticate, and run `hostname`. Use it to test a host, to surface an unknown or changed SSH host key (the failure carries observed_fingerprint and observed_algorithm for the editor), or to pre-authenticate a host. Success updates the local trust metadata (verified) for that host.",
-        annotations(read_only_hint = true, open_world_hint = true)
+        description = "Connect to one saved host, authenticate, and run `hostname`. Use it to test a host, to surface an unknown or changed SSH host key (the failure carries observed_fingerprint and observed_algorithm for the editor), or to pre-authenticate a host. Success updates the local trust metadata (verified) for that host and, when the host's profile keeps sessions, leaves the authenticated connection open for later calls.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn probe(
         &self,
@@ -541,8 +546,13 @@ impl Server {
 
     #[tool(
         name = "batch_probe",
-        description = "Connect to and authenticate against an explicit list of saved hosts, running `hostname` on each, with results in input order. Host keys are never trusted automatically; failures carry the observed fingerprint for the editor. Success updates local trust metadata.",
-        annotations(read_only_hint = true, open_world_hint = true)
+        description = "Connect to and authenticate against an explicit list of saved hosts, running `hostname` on each, with results in input order. Host keys are never trusted automatically; failures carry the observed fingerprint for the editor. Success updates local trust metadata and, for hosts whose profile keeps sessions, leaves the authenticated connections open for later calls.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        )
     )]
     async fn batch_probe(
         &self,
@@ -851,9 +861,9 @@ mod tests {
             );
             assert_eq!(annotations.read_only_hint, Some(read_only), "{name}");
             assert_eq!(annotations.open_world_hint, Some(connects), "{name}");
-            if name == "disconnect" {
-                assert_eq!(annotations.idempotent_hint, Some(true));
-                assert_eq!(annotations.destructive_hint, Some(false));
+            if matches!(name, "disconnect" | "probe" | "batch_probe") {
+                assert_eq!(annotations.idempotent_hint, Some(true), "{name}");
+                assert_eq!(annotations.destructive_hint, Some(false), "{name}");
             }
             if executes {
                 assert_eq!(annotations.destructive_hint, Some(true), "{name}");

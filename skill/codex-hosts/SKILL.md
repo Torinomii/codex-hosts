@@ -27,7 +27,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
-`tool_timeout_sec` is a static ceiling; the real wait for each call comes from the `*_timeout_ms` parameters, which must stay below it. An executable older than 0.3.1 does not know `--mcp`; `bin\codex-hosts.exe --version` prints the version, and the [project README](https://github.com/Torinomii/codex-hosts) describes upgrading.
+`tool_timeout_sec` is a static ceiling; the real wait for each call comes from the `*_timeout_ms` parameters, which must stay below it. `probe` and `batch_probe` are read-only for Codex (no approval card, may run in parallel) yet they connect, authenticate, and may leave a session open on hosts that keep sessions; call them only for a host the current task needs, and never to keep a hardware key "warm". Users who want to confirm each probe set `approval_mode = "prompt"` for those tools in `config.toml`. An executable older than 0.3.1 does not know `--mcp`; `bin\codex-hosts.exe --version` prints the version, and the [project README](https://github.com/Torinomii/codex-hosts) describes upgrading.
 
 ## Workflow
 

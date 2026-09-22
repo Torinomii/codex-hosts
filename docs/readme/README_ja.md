@@ -82,6 +82,16 @@ tool_timeout_sec = 86400
 
 `tool_timeout_sec` は上限にすぎず、各呼び出しは独自のタイムアウトを持ちます。長時間ジョブでブロッキング待機を使わないなら Codex の既定値のままで構いません。
 
+`probe` と `batch_probe` は読み取り専用として注釈されているため、Codex は確認なしに（並行して）実行します。これらは `hostname` を実行するだけで、セッションを保持するホストを無人で事前認証できることがこの設計の価値です。それでも接続と認証は行うので、ハードウェアキーはタッチを求めます。毎回確認したい場合は Codex 側で次のように設定します:
+
+```toml
+[mcp_servers.codex-hosts.tools.probe]
+approval_mode = "prompt"
+
+[mcp_servers.codex-hosts.tools.batch_probe]
+approval_mode = "prompt"
+```
+
 `SKILL.md` または実行ファイルだけをコピーせず、Skill ディレクトリ全体を保持してください。
 
 Codex にインストールを依頼することもできます：
