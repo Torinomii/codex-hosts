@@ -45,7 +45,7 @@ Every result is returned as `structuredContent` and as the same JSON in the text
 
 `agent_identities`: `identities` with `fingerprint`, `algorithm`, `comment`, `certificate`, `public_key`. `fido_identities`: `helper_available` (whether the Windows OpenSSH FIDO component exists) and `identities` with `path`, `fingerprint`, `algorithm`, `public_key`.
 
-`disconnect`: `disconnected` (sessions closed). `open_host_editor`: `status` (`saved`, `trusted`, `cancelled`) and `alias`.
+`disconnect`: `disconnected` (sessions closed now, plus sessions a running call still uses, which close when that call ends). `open_host_editor`: `status` (`saved`, `trusted`, `cancelled`) and `alias`.
 
 Failures are `{"status":"error","code":"...","message":"..."}` plus `host_alias` when a specific host or hop is known, and `expected_fingerprint`, `observed_fingerprint`, `expected_algorithm`, `observed_algorithm` for host-key failures.
 
@@ -55,7 +55,8 @@ Failures are `{"status":"error","code":"...","message":"..."}` plus `host_alias`
 - The SSH pool keeps up to 16 authenticated connections and may temporarily use 32 while all are busy. After each call the server closes every connection the call used unless the host's `auth_persistence` keeps it; kept sessions send keepalives and are closed by `disconnect`, by their idle limit, or when the server exits with Codex.
 - At most 4 calls run at once. Calls to the same per-call host run one after another (each authenticates again); calls to a host that keeps its session share it, up to its `max_channels`; a batch runs alone.
 - Hardware-key and Agent signing is serialized across processes: only one authentication prompt runs at a time, and authenticated channels then run concurrently.
-- A cancelled call returns `CANCELLED` and closes its channel; a remote command that already started may keep running. A batch that is cancelled stops starting hosts.
+- A cancelled call returns `CANCELLED` and closes its channel; a remote command that already started may keep running. A cancelled batch or `exec_many` stops every host or command that was running and returns only `CANCELLED`; results of hosts that had already finished are not returned, because the client has stopped listening.
+- Batches and `exec_many` on a jump chain: a hop keeps its session only when it and every hop before it keep sessions; a per-call hop makes everything behind it per-call, while a jump host that keeps sessions keeps its own even when the target is per-call.
 
 ## Error codes
 
@@ -67,6 +68,6 @@ Authentication: `AUTH_TIMEOUT`, `CREDENTIAL_MISSING`, `CREDENTIAL_READ_FAILED`, 
 
 Execution: `CHANNEL_OPEN_FAILED`, `REMOTE_EXEC_FAILED` (the server rejected the exec request), `STDIN_WRITE_FAILED` (the channel closed before all input was sent and no exit status arrived; the command may have partly run), `COMMAND_TIMEOUT`, `OPERATION_TIMEOUT`, `CANCELLED`, `COMMAND_CANCELLED`, `COMMAND_WORKER_FAILED`, `BATCH_TIMEOUT`, `BATCH_CANCELLED`, `BATCH_INTERNAL_FAILED`, `BATCH_RESULT_TOO_LARGE`, `EXEC_MANY_RESULT_TOO_LARGE`, `SERIALIZE_FAILED`.
 
-Editor and secrets: `EDITOR_ALIAS_REQUIRED`, `EDITOR_LAUNCH_FAILED`, `EDITOR_TIMEOUT` (open for an hour), `EDITOR_NO_RESULT` (closed without a result; not saved), `EDITOR_RESULT_INVALID`, `TEMPORARY_WINDOW_FAILED`, `TEMPORARY_WINDOW_TIMEOUT`, `TEMPORARY_SESSION_UNAVAILABLE`.
+Editor and secrets: `EDITOR_ALIAS_REQUIRED`, `EDITOR_LAUNCH_FAILED`, `EDITOR_TIMEOUT` (open for an hour; the window stays open but a later save is not reported), `EDITOR_WAIT_FAILED`, `EDITOR_NO_RESULT` (closed without a result; not saved), `EDITOR_RESULT_INVALID`, `TEMPORARY_WINDOW_FAILED`, `TEMPORARY_WINDOW_TIMEOUT`, `TEMPORARY_SESSION_UNAVAILABLE`, `PLATFORM_UNSUPPORTED`. Vault responses with `status:"error"` (returned with `isError`): `SECRET_MISSING`, `FIELD_NOT_FOUND`, `FIELD_LIMIT`, `FIELD_NAMES_INVALID`, `SECRET_VALUE_INVALID`, `OPERATION_LIMIT`, `EXECUTION_INVALID`, `ENVIRONMENT_INVALID`, `TEMPORARY_BUSY`, `TEMPORARY_REQUEST_INVALID`.
 
-Telnet: `AUTH_FAILED` (the server printed a login failure), `TELNET_CLOSED`, `TELNET_READ_FAILED`, `TELNET_WRITE_FAILED`, `OUTPUT_LIMIT`, `RUNTIME_CREATE_FAILED`, and `COMMAND_TIMEOUT` when a prompt never matches.
+Telnet: `AUTH_FAILED` (the server printed a login failure), `TELNET_CLOSED`, `TELNET_READ_FAILED`, `TELNET_WRITE_FAILED`, `OUTPUT_LIMIT` (Telnet output over 1 MiB fails instead of being truncated), `RUNTIME_CREATE_FAILED`, and `COMMAND_TIMEOUT` when a prompt never matches.

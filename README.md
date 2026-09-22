@@ -35,7 +35,7 @@
 - Authentication persistence: every host now chooses whether Codex re-authenticates on every operation (the default and the previous behaviour), keeps the session for the Codex session, or drops it after a chosen idle time. Hosts that keep sessions are marked in the list and carry a warning in the editor.
 - Editor: required fields are marked with `*` and highlighted when a save is attempted with one empty; a new **Advanced** card holds per-host tuning (concurrent channels, default timeouts, keepalive interval, a remote-environment hint for Codex, hiding a host from Codex, and Telnet prompt overrides).
 - Cancelling a Codex call now stops the wait and closes the channel; long-running work is documented around the remote host's own `tmux` / `screen` instead of long waits.
-- `codex-hosts.exe --version` prints the version, and argument errors are reported on stderr.
+- `codex-hosts.exe --version` prints the version, and argument errors are reported on stderr. The executable is a windowed program, so both are visible only when captured (`codex-hosts.exe --version | more`).
 
 ## Installation
 
@@ -208,6 +208,8 @@ These sensitive values are not:
 
 A FIDO PIN is used only for the current operation and is not saved.
 
+The host store (`hosts.json`) must be owned by the Windows account running `codex-hosts`. The MCP server refuses to start when another account owns it and prints the `icacls /setowner` command that repairs it to stderr (visible in Codex's MCP log); the GUI only warns. This catches a store copied from another account, not an attacker who already runs as you.
+
 ### SSH host keys
 
 SSH host fingerprints require explicit user confirmation.
@@ -239,6 +241,10 @@ After user approval, they can be injected directly into the environment of a sel
 They expire when the `codex-hosts` tray application exits, the user signs out, or the system restarts. Codex starting or stopping does not affect them.
 
 See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md) for the complete behavior.
+
+### Policy gates such as hol-guard
+
+Because every action is an MCP tool call with structured parameters, a policy layer that intercepts `mcp__*` calls sees the tool name and its arguments. With [hol-guard](https://github.com/hashgraph-online/hol-guard), add the executable as a custom extension (`codex-hosts.exe --mcp`) and treat `exec`, `exec_stdin`, `exec_many`, `batch_exec`, `temporary_secrets_run`, and `open_host_editor` as tools to review; the remaining tools are read-only or only tighten access.
 
 ## FIDO / security keys
 

@@ -260,7 +260,7 @@ struct ExecStdinParams {
 struct ExecManyParams {
     /// Saved SSH host alias.
     alias: String,
-    /// 2 to 64 independent short commands, run concurrently over one authenticated connection.
+    /// 1 to 64 independent short commands, run concurrently over one authenticated connection.
     commands: Vec<String>,
     /// Concurrent channels on the connection (1-16, default 8).
     #[serde(default)]
@@ -332,7 +332,7 @@ impl Server {
 
     #[tool(
         name = "disconnect",
-        description = "Drop authenticated connections this server is keeping for hosts whose profile retains sessions (optionally only those involving one alias). The next call to such a host authenticates again. Safe to repeat.",
+        description = "Drop authenticated connections this server is keeping for hosts whose profile retains sessions (optionally only those involving one alias). The next call to such a host authenticates again. A session a running call still uses is counted but closes when that call ends. Safe to repeat.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -404,7 +404,7 @@ impl Server {
 
     #[tool(
         name = "exec",
-        description = "Run one command on a saved SSH or Telnet host and return its exit code and captured output (up to 1 MiB). The command is sent exactly as given. Telnet returns the login transcript with exit_code 0 even when the command failed, so judge from the output. Never retry automatically: the command may not be idempotent.",
+        description = "Run one command on a saved SSH or Telnet host and return its exit code and captured output (up to 1 MiB). The command is sent exactly as given. Telnet has no exit status: it returns exit_code 0 with the text the command printed between the server's prompts, so judge from the output. Never retry automatically: the command may not be idempotent.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -451,7 +451,7 @@ impl Server {
 
     #[tool(
         name = "exec_many",
-        description = "Run 2 to 64 independent short commands concurrently on one saved SSH host over a single authenticated connection (one hardware touch for the whole set). Results keep input order. Use it to bundle status checks instead of separate calls.",
+        description = "Run 1 to 64 independent short commands concurrently on one saved SSH host over a single authenticated connection (one hardware touch for the whole set). Results keep input order. Use it to bundle status checks instead of separate calls.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
