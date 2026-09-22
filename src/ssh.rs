@@ -1052,7 +1052,8 @@ async fn execute_many_async(
 
 /// The chain a call is using. Dropping it refreshes the sessions' idle clock,
 /// so a command that ran longer than the host's idle limit does not leave a
-/// retained session already expired.
+/// retained session already expired. Hops are leased as they are acquired,
+/// so a later hop failing or being cancelled still refreshes the earlier ones.
 struct ChainLease(Vec<Arc<PooledSession>>);
 
 impl std::ops::Deref for ChainLease {
@@ -1073,7 +1074,7 @@ async fn connect_chain(
     chain: &[&HostProfile],
     limits: OperationLimits,
 ) -> Result<(ChainLease, Vec<VerifiedHostKey>, Vec<Option<String>>), RemoteFailure> {
-    let mut sessions = Vec::with_capacity(chain.len());
+    let mut sessions = ChainLease(Vec::with_capacity(chain.len()));
     let mut verified_host_keys = Vec::with_capacity(chain.len());
     let mut auth_key_fingerprints = Vec::with_capacity(chain.len());
     let retention = if limits.retain_sessions {
@@ -1087,13 +1088,9 @@ async fn connect_chain(
         let session = pooled_connection(host, parent.as_ref(), limits, retention).await?;
         verified_host_keys.push(session.verified_host_key.clone());
         auth_key_fingerprints.push(session.auth_key_fingerprint.clone());
-        sessions.push(session);
+        sessions.0.push(session);
     }
-    Ok((
-        ChainLease(sessions),
-        verified_host_keys,
-        auth_key_fingerprints,
-    ))
+    Ok((sessions, verified_host_keys, auth_key_fingerprints))
 }
 
 async fn pooled_connection(

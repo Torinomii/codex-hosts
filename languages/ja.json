@@ -211,7 +211,7 @@
     "advanced_default_summary": "すべて既定値",
     "custom_value": "カスタム",
     "max_channels": "同時チャネル数",
-    "max_channels_hint": "このホストで同時に開く SSH チャネルの上限。exec_many の並列数と、セッション保持時の Codex の並行呼び出しを制限します。既定 8。",
+    "max_channels_hint": "このホストで同時に開くコマンドセッションチャネルの上限（sshd の MaxSessions に対応）。exec_many の並列数と、セッション保持時の Codex の並行呼び出しを制限します。踏み台経由のトンネルは数えません。既定 8。",
     "connect_timeout_default": "既定の接続タイムアウト",
     "timeout_default_hint": "Codex がタイムアウトを渡さないときに使います。呼び出しで明示された値が優先されます。既定：接続 120 秒、コマンド 600 秒。",
     "command_timeout_default": "既定のコマンドタイムアウト",

@@ -211,7 +211,7 @@
     "advanced_default_summary": "All defaults",
     "custom_value": "Custom",
     "max_channels": "Concurrent channels",
-    "max_channels_hint": "Upper bound on SSH channels open on this host at once: exec_many concurrency and, for kept sessions, parallel Codex calls. Default 8.",
+    "max_channels_hint": "Upper bound on command session channels open on this host at once (sshd MaxSessions): exec_many concurrency and, for kept sessions, parallel Codex calls. Tunnels through a jump host are not counted. Default 8.",
     "connect_timeout_default": "Default connect timeout",
     "timeout_default_hint": "Used when Codex does not pass a timeout; an explicit value in the call still wins. Defaults: 120 s to connect, 600 s per command.",
     "command_timeout_default": "Default command timeout",
