@@ -55,7 +55,7 @@ Failures are `{"status":"error","code":"...","message":"..."}` plus `host_alias`
 - The SSH pool keeps up to 16 authenticated connections and may temporarily use 32 while all are busy. After each call the server closes every connection the call used unless the host's `auth_persistence` keeps it; kept sessions send keepalives and are closed by `disconnect`, by their idle limit, or when the server exits with Codex.
 - At most 4 calls run at once. Calls to the same per-call host run one after another (each authenticates again); calls to a host that keeps its session share it, up to its `max_channels`; a batch runs alone.
 - Hardware-key and Agent signing is serialized across processes: only one authentication prompt runs at a time, and authenticated channels then run concurrently.
-- A cancelled call returns `CANCELLED` and closes its channel; a remote command that already started may keep running. A cancelled batch or `exec_many` stops every host or command that was running and returns only `CANCELLED`; results of hosts that had already finished are not returned, because the client has stopped listening.
+- When Codex cancels a call, the server stops it and closes its channel; a remote command that already started may keep running. No result is delivered for a cancelled call (the MCP client has stopped listening), so a cancelled batch or `exec_many` yields nothing, not even the hosts that had already finished.
 - Batches and `exec_many` on a jump chain: a hop keeps its session only when it and every hop before it keep sessions; a per-call hop makes everything behind it per-call, while a jump host that keeps sessions keeps its own even when the target is per-call.
 
 ## Error codes
