@@ -496,7 +496,7 @@ impl Server {
         &self,
         Parameters(params): Parameters<secrets::OpenParams>,
     ) -> CallToolResult {
-        finish(secrets::open(params).await)
+        finish(secrets::flag_errors(secrets::open(params).await))
     }
 
     #[tool(
@@ -508,7 +508,7 @@ impl Server {
         &self,
         Parameters(params): Parameters<secrets::StatusParams>,
     ) -> CallToolResult {
-        finish(secrets::status(params).await)
+        finish(secrets::flag_errors(secrets::status(params).await))
     }
 
     #[tool(
@@ -524,7 +524,7 @@ impl Server {
         &self,
         Parameters(params): Parameters<secrets::RunParams>,
     ) -> CallToolResult {
-        finish(secrets::run(params).await)
+        finish(secrets::flag_errors(secrets::run(params).await))
     }
 
     #[tool(
@@ -541,7 +541,7 @@ impl Server {
         &self,
         Parameters(params): Parameters<secrets::ClearParams>,
     ) -> CallToolResult {
-        finish(secrets::clear(params).await)
+        finish(secrets::flag_errors(secrets::clear(params).await))
     }
 
     #[tool(
@@ -568,8 +568,10 @@ impl Server {
                     params.aliases,
                     BatchAction::Probe,
                     params.max_concurrency,
-                    Some(connect_timeout_or_default(params.connect_timeout_ms)),
-                    Some(command_timeout_or_default(params.command_timeout_ms)),
+                    Arc::new(batch_timeouts(
+                        params.connect_timeout_ms,
+                        params.command_timeout_ms,
+                    )),
                     params.batch_timeout_ms,
                     params.continue_on_error,
                     true,
@@ -603,8 +605,10 @@ impl Server {
                     params.aliases,
                     BatchAction::Exec(params.command),
                     params.max_concurrency,
-                    Some(connect_timeout_or_default(params.connect_timeout_ms)),
-                    Some(command_timeout_or_default(params.command_timeout_ms)),
+                    Arc::new(batch_timeouts(
+                        params.connect_timeout_ms,
+                        params.command_timeout_ms,
+                    )),
                     params.batch_timeout_ms,
                     params.continue_on_error,
                     true,
@@ -729,21 +733,41 @@ fn load_store() -> Result<HostStore, RemoteFailure> {
 
 /// Explicit per-call timeouts win; otherwise the host profile's defaults, then
 /// the MCP-wide defaults.
+/// The call's timeouts, else the host's Advanced defaults, else the global
+/// defaults — the same resolution for single-host and batch tools.
+fn host_timeouts(
+    host: &HostProfile,
+    connect_timeout_ms: Option<u64>,
+    command_timeout_ms: Option<u64>,
+) -> (u64, u64) {
+    let seconds = |value: u32| u64::from(value) * 1000;
+    (
+        connect_timeout_or_default(
+            connect_timeout_ms.or(host.advanced.connect_timeout_s.map(seconds)),
+        ),
+        command_timeout_or_default(
+            command_timeout_ms.or(host.advanced.command_timeout_s.map(seconds)),
+        ),
+    )
+}
+
+fn batch_timeouts(
+    connect_timeout_ms: Option<u64>,
+    command_timeout_ms: Option<u64>,
+) -> impl Fn(&HostProfile) -> (Option<u64>, Option<u64>) + Send + Sync {
+    move |host| {
+        let (connect, command) = host_timeouts(host, connect_timeout_ms, command_timeout_ms);
+        (Some(connect), Some(command))
+    }
+}
+
 fn host_limits(
     host: &HostProfile,
     connect_timeout_ms: Option<u64>,
     command_timeout_ms: Option<u64>,
 ) -> OperationLimits {
-    let seconds = |value: u32| u64::from(value) * 1000;
-    let mut limits = tool::limits(
-        Some(connect_timeout_or_default(
-            connect_timeout_ms.or(host.advanced.connect_timeout_s.map(seconds)),
-        )),
-        Some(command_timeout_or_default(
-            command_timeout_ms.or(host.advanced.command_timeout_s.map(seconds)),
-        )),
-        None,
-    );
+    let (connect, command) = host_timeouts(host, connect_timeout_ms, command_timeout_ms);
+    let mut limits = tool::limits(Some(connect), Some(command), None);
     limits.retain_sessions = true;
     limits
 }
@@ -759,7 +783,7 @@ fn command_timeout_or_default(command_timeout_ms: Option<u64>) -> u64 {
 /// Convert a tool outcome into the MCP result and release every connection the
 /// call left behind, so the next call authenticates again (invariant: one
 /// authentication per call unless the host opts into retention).
-fn finish<T: Serialize>(outcome: Result<T, RemoteFailure>) -> CallToolResult {
+fn finish<T: Serialize, E: Serialize>(outcome: Result<T, E>) -> CallToolResult {
     let result = match outcome {
         Ok(value) => tool_result(&value, false),
         Err(error) => tool_result(&error, true),

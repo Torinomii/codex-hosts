@@ -94,6 +94,21 @@ pub(super) async fn run(params: RunParams) -> Result<Response, RemoteFailure> {
     call(params.session, request).await
 }
 
+/// The vault answers its own failures (`SECRET_MISSING`, `OPERATION_LIMIT`, ...)
+/// as a response with `status: "error"`; MCP clients read `isError`, so those
+/// become tool errors here, as the file protocol's `is_failure` already does.
+pub(super) fn flag_errors(
+    outcome: Result<Response, RemoteFailure>,
+) -> Result<Response, serde_json::Value> {
+    match outcome {
+        Ok(response) if response.status == "error" => {
+            Err(serde_json::to_value(response).unwrap_or_default())
+        }
+        Ok(response) => Ok(response),
+        Err(error) => Err(serde_json::to_value(error).unwrap_or_default()),
+    }
+}
+
 async fn call(session: uuid::Uuid, request: Request) -> Result<Response, RemoteFailure> {
     blocking(move || {
         temporary_secrets::call(session, request).map_err(|code| {

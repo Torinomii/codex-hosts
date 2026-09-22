@@ -524,15 +524,58 @@ impl SessionPool {
         }
     }
 
-    fn finish_batch_scope(&self, scope: uuid::Uuid) {
-        if let Ok(mut state) = self.state.lock() {
-            state
-                .blocked_reconnects
-                .retain(|(blocked_scope, _)| *blocked_scope != scope);
-            state
-                .batch_connections
-                .retain(|(batch_scope, _)| *batch_scope != scope);
+    /// Ends a batch: forgets its reconnect blocks and returns the unretained
+    /// sessions the batch opened or used, removed from the pool so no later
+    /// call can pick them up, whether the batch completed or was cancelled
+    /// with its workers still holding them.
+    fn finish_batch_scope(&self, scope: uuid::Uuid) -> Vec<Arc<PooledSession>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        state
+            .blocked_reconnects
+            .retain(|(blocked_scope, _)| *blocked_scope != scope);
+        let keys = state
+            .batch_connections
+            .iter()
+            .filter(|(batch_scope, _)| *batch_scope == scope)
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
+        state
+            .batch_connections
+            .retain(|(batch_scope, _)| *batch_scope != scope);
+        let mut released = Vec::new();
+        for key in keys {
+            let unretained = state
+                .entries
+                .get(&key)
+                .is_some_and(|entry| entry.retention.is_none());
+            if unretained && let Some(entry) = state.entries.remove(&key) {
+                released.push(entry.session);
+            }
         }
+        released
+    }
+
+    /// Removes the sessions a finished call must not leave behind: those
+    /// whose hop is not retained. Explicit, so a worker still holding a
+    /// reference (an aborted task, an in-flight disconnect) cannot keep the
+    /// session available to the next call.
+    fn evict(&self, sessions: &[Arc<PooledSession>]) -> Vec<Arc<PooledSession>> {
+        let Ok(mut state) = self.state.lock() else {
+            return Vec::new();
+        };
+        let mut released = Vec::new();
+        for session in sessions {
+            let pooled = state
+                .entries
+                .get(&session.key)
+                .is_some_and(|entry| Arc::ptr_eq(&entry.session, session));
+            if pooled && let Some(entry) = state.entries.remove(&session.key) {
+                released.push(entry.session);
+            }
+        }
+        released
     }
 
     /// Idle sessions whose chain includes the host (every session when
@@ -720,7 +763,7 @@ pub fn invalidate_profile(host_id: uuid::Uuid) {
 }
 
 pub fn finish_batch_scope(scope: uuid::Uuid) {
-    session_pool().finish_batch_scope(scope);
+    disconnect_sessions(session_pool().finish_batch_scope(scope));
 }
 
 pub fn profile_may_require_interaction(profile: &HostProfile, hosts: &[HostProfile]) -> bool {
@@ -1058,45 +1101,70 @@ async fn execute_many_async(
     })
 }
 
-/// The chain a call is using. Dropping it refreshes the sessions' idle clock,
-/// so a command that ran longer than the host's idle limit does not leave a
-/// retained session already expired. Hops are leased as they are acquired,
-/// so a later hop failing or being cancelled still refreshes the earlier ones.
-struct ChainLease(Vec<Arc<PooledSession>>);
+/// The chain a call is using, one entry per hop with the retention that hop
+/// earned. Dropping it is what ends the call's use of the chain: every hop
+/// gets its idle clock refreshed, and hops that are not retained are taken out
+/// of the pool and disconnected right here, rather than left for a sweep to
+/// discover, so the next call authenticates again no matter who still holds a
+/// reference. Inside a batch the unretained hops stay until the batch scope
+/// ends, because the batch shares them across its hosts. Hops are leased as
+/// they are acquired, so a later hop failing or being cancelled still
+/// releases the earlier ones.
+struct ChainLease {
+    hops: Vec<(Arc<PooledSession>, Option<Retention>)>,
+    batch_scope: Option<uuid::Uuid>,
+}
 
-impl std::ops::Deref for ChainLease {
-    type Target = [Arc<PooledSession>];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl ChainLease {
+    fn last(&self) -> Option<&Arc<PooledSession>> {
+        self.hops.last().map(|(session, _)| session)
     }
 }
 
 impl Drop for ChainLease {
     fn drop(&mut self) {
-        session_pool().touch(self.0.iter());
+        let pool = session_pool();
+        pool.touch(self.hops.iter().map(|(session, _)| session));
+        if self.batch_scope.is_some() {
+            return;
+        }
+        let released = self
+            .hops
+            .iter()
+            .filter(|(_, retention)| retention.is_none())
+            .map(|(session, _)| Arc::clone(session))
+            .collect::<Vec<_>>();
+        disconnect_sessions(pool.evict(&released));
     }
 }
 
+/// Connects (or reuses) every hop of the chain. A hop is retained only when it
+/// and every hop before it keep sessions, with the strictest of those limits:
+/// a retained jump host keeps its own session even when the target behind it
+/// is per-call, and a per-call jump makes everything behind it per-call, since
+/// a kept tunnel would let later calls skip that hop's authentication.
 async fn connect_chain(
     chain: &[&HostProfile],
     limits: OperationLimits,
 ) -> Result<(ChainLease, Vec<VerifiedHostKey>, Vec<Option<String>>), RemoteFailure> {
-    let mut sessions = ChainLease(Vec::with_capacity(chain.len()));
+    let mut sessions = ChainLease {
+        hops: Vec::with_capacity(chain.len()),
+        batch_scope: limits.batch_scope,
+    };
     let mut verified_host_keys = Vec::with_capacity(chain.len());
     let mut auth_key_fingerprints = Vec::with_capacity(chain.len());
-    let retention = if limits.retain_sessions {
-        chain_retention(chain.iter().copied())
-    } else {
-        None
-    };
 
-    for host in chain {
+    for (index, host) in chain.iter().enumerate() {
+        let retention = if limits.retain_sessions {
+            chain_retention(chain[..=index].iter().copied())
+        } else {
+            None
+        };
         let parent = sessions.last().cloned();
         let session = pooled_connection(host, parent.as_ref(), limits, retention).await?;
         verified_host_keys.push(session.verified_host_key.clone());
         auth_key_fingerprints.push(session.auth_key_fingerprint.clone());
-        sessions.0.push(session);
+        sessions.hops.push((session, retention));
     }
     Ok((sessions, verified_host_keys, auth_key_fingerprints))
 }

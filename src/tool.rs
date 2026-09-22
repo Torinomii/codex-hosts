@@ -439,8 +439,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
                 aliases,
                 BatchAction::Probe,
                 max_concurrency,
-                connect_timeout_ms,
-                command_timeout_ms,
+                Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
                 batch_timeout_ms,
                 continue_on_error,
                 false,
@@ -461,8 +460,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
                 aliases,
                 BatchAction::Exec(command),
                 max_concurrency,
-                connect_timeout_ms,
-                command_timeout_ms,
+                Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
                 batch_timeout_ms,
                 continue_on_error,
                 false,
@@ -535,6 +533,12 @@ pub(crate) fn list_hosts(
     })
 }
 
+/// Per-host connect and command timeouts in milliseconds; the MCP server
+/// resolves them from the call, then the host's Advanced defaults, then the
+/// global defaults, while the file protocol passes the request values through.
+pub(crate) type BatchTimeouts =
+    Arc<dyn Fn(&HostProfile) -> (Option<u64>, Option<u64>) + Send + Sync>;
+
 /// Runs every host as a task on the caller's runtime. Dropping the returned
 /// future (MCP cancellation) aborts the tasks, which closes their channels.
 #[allow(clippy::too_many_arguments)]
@@ -543,8 +547,7 @@ pub(crate) async fn execute_batch(
     aliases: Vec<String>,
     action: BatchAction,
     max_concurrency: Option<usize>,
-    connect_timeout_ms: Option<u64>,
-    command_timeout_ms: Option<u64>,
+    timeouts: BatchTimeouts,
     batch_timeout_ms: Option<u64>,
     continue_on_error: bool,
     retain_sessions: bool,
@@ -589,6 +592,7 @@ pub(crate) async fn execute_batch(
         let stop = Arc::clone(&stop);
         let snapshot = Arc::clone(&snapshot);
         let action = Arc::clone(&action);
+        let timeouts = Arc::clone(&timeouts);
         workers.spawn(async move {
             loop {
                 if stop.load(Ordering::Acquire) {
@@ -607,6 +611,7 @@ pub(crate) async fn execute_batch(
                         "The whole-batch deadline expired before this host started.",
                     ))
                 } else {
+                    let (connect_timeout_ms, command_timeout_ms) = timeouts(&host);
                     let mut operation_limits =
                         limits(connect_timeout_ms, command_timeout_ms, total_timeout);
                     operation_limits.output_bytes = Some(per_host_output_bytes);
