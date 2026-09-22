@@ -702,7 +702,7 @@ fn disconnect_hosts(params: DisconnectParams) -> Result<DisconnectResult, Remote
         Some(alias) => {
             let store = load_store()?;
             let host = tool::find_host(&store, &alias)?;
-            ssh::disconnect_host(host.id)
+            ssh::disconnect_host(Some(host.id))
         }
         None => ssh::disconnect_all(),
     };

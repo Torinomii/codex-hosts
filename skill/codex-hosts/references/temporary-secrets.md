@@ -12,6 +12,8 @@ weakening pipe permissions.
 2. Call `temporary_secrets_open` with `{"fields":["myproject-local-qwen-apikey"]}`. It opens or restores the
    main app and its internal editor and returns an opaque `session` UUID plus readiness metadata. The main (tray)
    app owns the vault, independently of the MCP server's lifetime. Repeated open calls reuse its session.
+   The server starts the app outside its own job object; if the job forbids that, the response carries a
+   `warning` saying the window will close with Codex, and the user should start the codex-hosts GUI by hand first.
 3. Inspect readiness for the exact required names in the returned session. If all are already
    `ready:true` and status is `ok` or `saved`, reuse them without asking for re-entry or another Save.
    For missing fields, ask the user to fill only those right-hand masked cells and click Save, never

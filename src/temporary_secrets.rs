@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -81,6 +81,10 @@ pub struct Response {
     operations: Vec<OperationStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     operation_id: Option<Uuid>,
+    /// Set by the launcher when the window it started shares the caller's
+    /// lifetime; older holders never send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
 impl Response {
@@ -93,9 +97,12 @@ impl Response {
             fields: vec![],
             operations: vec![],
             operation_id: None,
+            warning: None,
         }
     }
 }
+
+const HOLDER_SHARES_JOB_WARNING: &str = "The secret window was started inside the caller's job object and will close when that process (usually Codex) exits. Start the codex-hosts GUI by hand before opening secrets to keep the window independent.";
 
 // Deliberately no Serialize or Debug on secret-bearing types.
 struct Field {
@@ -375,6 +382,7 @@ impl SecretsApp {
             fields: self.vault.status(),
             operations: self.operations.iter().map(|o| o.result.clone()).collect(),
             operation_id: None,
+            warning: None,
         }
     }
     fn handle(&mut self, request: Request) -> Response {
@@ -889,15 +897,13 @@ pub fn open(fields: Vec<String>) -> Result<Response, &'static str> {
         return Ok(response);
     }
     let exe = std::env::current_exe().map_err(|_| "TEMPORARY_WINDOW_FAILED")?;
-    let mut child = Command::new(exe)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|_| "TEMPORARY_WINDOW_FAILED")?;
+    let (mut child, shares_job) = spawn_holder(&exe).map_err(|_| "TEMPORARY_WINDOW_FAILED")?;
     let start = Instant::now();
     loop {
-        if let Ok(response) = ipc::discover(request.clone()) {
+        if let Ok(mut response) = ipc::discover(request.clone()) {
+            if shares_job {
+                response.warning = Some(HOLDER_SHARES_JOB_WARNING.into());
+            }
             return Ok(response);
         }
         // A concurrent launcher may exit after handing off to the winning instance.
@@ -906,6 +912,65 @@ pub fn open(fields: Vec<String>) -> Result<Response, &'static str> {
             return Err("TEMPORARY_WINDOW_TIMEOUT");
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Starts the tray holder outside the caller's job object, so a window first
+/// opened from Codex's MCP server outlives Codex. A job that forbids breakaway
+/// gets a plain child instead; the flag says whether that child dies with the
+/// job.
+fn spawn_holder(exe: &Path) -> std::io::Result<(Child, bool)> {
+    let plain = |exe: &Path| {
+        let mut command = Command::new(exe);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+        if let Ok(child) = plain(exe).creation_flags(CREATE_BREAKAWAY_FROM_JOB).spawn() {
+            return Ok((child, false));
+        }
+        let child = plain(exe).spawn()?;
+        Ok((child, job_kills_on_close()))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok((plain(exe).spawn()?, false))
+    }
+}
+
+#[cfg(windows)]
+fn job_kills_on_close() -> bool {
+    use windows_sys::Win32::System::JobObjects::{
+        IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: plain Win32 queries on the current process with a zeroed,
+    // correctly sized output buffer; a null job handle means "the job of the
+    // calling process".
+    unsafe {
+        let mut in_job = 0;
+        if IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) == 0
+            || in_job == 0
+        {
+            return false;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        let queried = QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectExtendedLimitInformation,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        );
+        queried != 0
+            && info.BasicLimitInformation.LimitFlags & JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE != 0
     }
 }
 

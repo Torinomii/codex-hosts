@@ -265,7 +265,7 @@ impl SessionKey {
 struct PooledSession {
     key: SessionKey,
     handle: Arc<client::Handle<ServerKeyObserver>>,
-    _parent: Option<Arc<PooledSession>>,
+    parent: Option<Arc<PooledSession>>,
     verified_host_key: VerifiedHostKey,
     auth_key_fingerprint: Option<String>,
     chain_ids: Vec<uuid::Uuid>,
@@ -280,8 +280,22 @@ struct PoolEntry {
 }
 
 impl PoolEntry {
-    fn unused(&self) -> bool {
-        Arc::strong_count(&self.session) == 1
+    /// Whether no call holds the session once `taken` sessions are gone. A
+    /// jump hop is held by its pooled children, so it counts as free when
+    /// every reference beyond the pool's own comes from sessions already
+    /// being released; otherwise a per-call jump would linger, authenticated,
+    /// until its child's disconnect completed and be reused by the next call.
+    fn free_after(&self, taken: &[Arc<PooledSession>]) -> bool {
+        let held_by_taken = taken
+            .iter()
+            .filter(|session| {
+                session
+                    .parent
+                    .as_ref()
+                    .is_some_and(|parent| Arc::ptr_eq(parent, &self.session))
+            })
+            .count();
+        Arc::strong_count(&self.session) == 1 + held_by_taken
     }
 
     fn idle_expired(&self, now: Instant) -> bool {
@@ -300,6 +314,29 @@ struct PoolState {
     pending_connections: usize,
     blocked_reconnects: HashSet<(uuid::Uuid, SessionKey)>,
     batch_connections: HashSet<(uuid::Uuid, SessionKey)>,
+}
+
+impl PoolState {
+    /// Removes and returns the entries `include` selects that no call holds,
+    /// freeing jump hops together with the children that held them.
+    fn drain(&mut self, include: impl Fn(&PoolEntry) -> bool) -> Vec<Arc<PooledSession>> {
+        let mut taken: Vec<Arc<PooledSession>> = Vec::new();
+        loop {
+            let keys = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| include(entry) && entry.free_after(&taken))
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>();
+            if keys.is_empty() {
+                break taken;
+            }
+            taken.extend(
+                keys.into_iter()
+                    .filter_map(|key| self.entries.remove(&key).map(|entry| entry.session)),
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -388,25 +425,13 @@ impl SessionPool {
         let mut state = self.state.lock().map_err(|_| {
             RemoteFailure::new("SSH_POOL_FAILED", "The SSH connection pool lock failed.")
         })?;
-        let mut evicted = Vec::new();
-
-        let idle_keys = state
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.unused() && entry.idle_expired(now))
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        for key in idle_keys {
-            if let Some(entry) = state.entries.remove(&key) {
-                evicted.push(entry.session);
-            }
-        }
+        let mut evicted = state.drain(|entry| entry.idle_expired(now));
 
         while state.entries.len() + state.pending_connections >= DEFAULT_RETAINED_CONNECTIONS {
             let oldest = state
                 .entries
                 .iter()
-                .filter(|(_, entry)| entry.unused() && entry.retention.is_none())
+                .filter(|(_, entry)| entry.retention.is_none() && entry.free_after(&evicted))
                 .min_by_key(|(_, entry)| entry.last_used)
                 .map(|(key, _)| key.clone());
             let Some(oldest) = oldest else {
@@ -510,26 +535,23 @@ impl SessionPool {
         }
     }
 
-    fn release_host(&self, host_id: uuid::Uuid) -> (Vec<Arc<PooledSession>>, usize) {
+    /// Idle sessions whose chain includes the host (every session when
+    /// `host_id` is `None`), removed from the pool; sessions a call still uses
+    /// lose their retention instead and are counted.
+    fn release(&self, host_id: Option<uuid::Uuid>) -> (Vec<Arc<PooledSession>>, usize) {
         let Ok(mut state) = self.state.lock() else {
             return (Vec::new(), 0);
         };
-        let mut idle_keys = Vec::new();
+        let matches = |entry: &PoolEntry| {
+            host_id.is_none_or(|host_id| entry.session.chain_ids.contains(&host_id))
+        };
+        let idle = state.drain(matches);
         let mut in_use = 0;
-        for (key, entry) in state.entries.iter_mut() {
-            if !entry.session.chain_ids.contains(&host_id) {
-                continue;
-            }
-            if entry.unused() {
-                idle_keys.push(key.clone());
-            } else if entry.retention.take().is_some() {
+        for entry in state.entries.values_mut() {
+            if matches(entry) && entry.retention.take().is_some() {
                 in_use += 1;
             }
         }
-        let idle = idle_keys
-            .into_iter()
-            .filter_map(|key| state.entries.remove(&key).map(|entry| entry.session))
-            .collect();
         (idle, in_use)
     }
 
@@ -548,19 +570,11 @@ impl SessionPool {
             .collect()
     }
 
-    fn take_unused(&self, include_retained: bool) -> Vec<Arc<PooledSession>> {
+    fn take_unretained(&self) -> Vec<Arc<PooledSession>> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
-        let keys = state
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.unused() && (include_retained || entry.retention.is_none()))
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        keys.into_iter()
-            .filter_map(|key| state.entries.remove(&key).map(|entry| entry.session))
-            .collect()
+        state.drain(|entry| entry.retention.is_none())
     }
 
     fn idle_sessions(&self) -> Vec<Arc<PooledSession>> {
@@ -568,15 +582,7 @@ impl SessionPool {
             return Vec::new();
         };
         let now = Instant::now();
-        let keys = state
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.unused() && entry.idle_expired(now))
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        keys.into_iter()
-            .filter_map(|key| state.entries.remove(&key).map(|entry| entry.session))
-            .collect()
+        state.drain(|entry| entry.idle_expired(now))
     }
 }
 
@@ -823,19 +829,21 @@ pub(crate) async fn execute_many_bounded(
 /// this after each tool call so a long-lived process still authenticates once
 /// per call unless a host opts into retention.
 pub(crate) fn release_unused_connections() -> usize {
-    disconnect_sessions(session_pool().take_unused(false))
+    disconnect_sessions(session_pool().take_unretained())
 }
 
-/// Disconnect every session no operation is using, including retained ones.
+/// Disconnect every idle session, retained or not; a session a call is still
+/// using loses its retention instead and closes when that call ends.
 pub(crate) fn disconnect_all() -> usize {
-    disconnect_sessions(session_pool().take_unused(true))
+    disconnect_host(None)
 }
 
-/// Disconnect every idle session whose chain includes the host; a session a
-/// call is still using loses its retention instead and closes when that call
-/// ends, so an explicit disconnect never cuts a running command.
-pub(crate) fn disconnect_host(host_id: uuid::Uuid) -> usize {
-    let (idle, in_use) = session_pool().release_host(host_id);
+/// Disconnect every idle session whose chain includes the host (every session
+/// when `host_id` is `None`); a session a call is still using loses its
+/// retention instead and closes when that call ends, so an explicit
+/// disconnect never cuts a running command.
+pub(crate) fn disconnect_host(host_id: Option<uuid::Uuid>) -> usize {
+    let (idle, in_use) = session_pool().release(host_id);
     disconnect_sessions(idle) + in_use
 }
 
@@ -1247,7 +1255,7 @@ async fn connect_one(
     Ok(Arc::new(PooledSession {
         key,
         handle: Arc::new(session),
-        _parent: parent.cloned(),
+        parent: parent.cloned(),
         verified_host_key: VerifiedHostKey {
             host_id: host.id,
             alias: host.alias.clone(),
