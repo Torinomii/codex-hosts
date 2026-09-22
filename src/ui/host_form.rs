@@ -301,10 +301,7 @@ fn basic_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) 
                 let mut remove = None;
                 ui.horizontal_wrapped(|ui| {
                     for (index, tag) in editor.profile.tags.iter().enumerate() {
-                        if ui
-                            .add(egui::Button::new(format!("{tag} ×")).small().truncate())
-                            .clicked()
-                        {
+                        if tag_chip(ui, tag).clicked() {
                             remove = Some(index);
                         }
                     }
@@ -315,6 +312,40 @@ fn basic_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) 
             }
         });
     });
+}
+
+/// A removable tag pill. The text is centred on its painted glyph bounds rather
+/// than on the font's line box: the CJK fallback fonts have tall line boxes,
+/// which left a small button's text sitting visibly below the middle.
+fn tag_chip(ui: &mut egui::Ui, tag: &str) -> egui::Response {
+    let padding = egui::vec2(8.0, 3.0);
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let max_width = (ui.available_width() - 2.0 * padding.x).max(40.0);
+    let galley = ui.painter().layout_job(egui::text::LayoutJob {
+        wrap: egui::text::TextWrapping::truncate_at_width(max_width),
+        ..egui::text::LayoutJob::simple_singleline(
+            format!("{tag} ×"),
+            font,
+            ui.visuals().text_color(),
+        )
+    });
+    let glyphs = galley.mesh_bounds;
+    let height = glyphs.height().max(ui.spacing().interact_size.y * 0.6) + 2.0 * padding.y;
+    let size = egui::vec2(galley.rect.width() + 2.0 * padding.x, height);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact(&response);
+        ui.painter().rect(
+            rect,
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let pos = rect.center() - glyphs.center().to_vec2();
+        ui.painter().galley(pos, galley, visuals.text_color());
+    }
+    response
 }
 
 fn connection_section(
