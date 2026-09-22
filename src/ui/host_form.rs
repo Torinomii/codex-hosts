@@ -1132,6 +1132,41 @@ mod tests {
     }
 
     #[test]
+    fn host_key_card_lists_trust_history_and_telnet_shows_the_fixed_option() {
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut profile = metadata_profile();
+        profile.host_fingerprint = Some("SHA256:abcdefghijklmnop".into());
+        profile.host_key_algorithm = Some("ssh-ed25519".into());
+        profile.host_key_first_seen_unix = Some(1_758_500_000);
+        profile.host_key_last_verified_unix = Some(1_758_586_400);
+        let mut app = metadata_test_app(&context, "en", profile);
+        let output = run_form(&mut app, &context, 760.0);
+        for (key, stamp) in [
+            ("host_key_first_seen", "2025-09-22 00:13 UTC"),
+            ("host_key_last_verified", "2025-09-23 00:13 UTC"),
+        ] {
+            let line = format!("{}: {stamp}", app.catalog.text(key));
+            assert!(
+                find_text_rect(&output.shapes, &line).is_some(),
+                "missing {line}"
+            );
+        }
+
+        app.editor.as_mut().unwrap().profile.protocol = Protocol::Telnet;
+        let output = run_form(&mut app, &context, 760.0);
+        let note = app.catalog.text("persistence_telnet_note");
+        assert!(
+            find_text_rect(&output.shapes, note).is_some(),
+            "telnet note is shown"
+        );
+        assert!(
+            find_text_rect(&output.shapes, app.catalog.text("persistence_per_call")).is_some(),
+            "the fixed per-call option is listed"
+        );
+    }
+
+    #[test]
     fn form_sections_render_titles_in_order_for_all_locales() {
         for locale in ["en", "zh-CN", "zh-TW", "ja"] {
             let context = egui::Context::default();

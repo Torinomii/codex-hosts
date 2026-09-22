@@ -2255,6 +2255,63 @@ mod tests {
     }
 
     #[test]
+    fn persistence_change_dialog_renders_and_cancel_reverts() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            for size in WINDOW_SIZES {
+                let context = egui::Context::default();
+                configure_fonts(&context, locale);
+                apply_style(&context);
+                let mut app = layout_test_app(&context, locale);
+                app.editor.as_mut().unwrap().profile.auth_persistence = AuthPersistence::Session;
+                app.save(&context);
+                assert!(
+                    app.persistence_prompt.is_some(),
+                    "{locale} {size:?}: changing persistence must ask first"
+                );
+                let output = run_full_window(&mut app, &context, size);
+                let texts = painted_texts(&output.shapes);
+                let label = format!("persistence dialog {locale} {size:?}");
+                for key in [
+                    "persistence_change_title",
+                    "persistence_change_confirm",
+                    "cancel",
+                ] {
+                    let wanted = app.catalog.text(key);
+                    assert!(
+                        texts.iter().any(|(text, _, _)| text.starts_with(wanted)),
+                        "{label}: missing {key}"
+                    );
+                }
+                let warning = app.catalog.text("persistence_warning_ssh");
+                assert!(
+                    texts
+                        .iter()
+                        .any(|(text, _, _)| text.contains(&warning[..12])),
+                    "{label}: relaxing must repeat the warning"
+                );
+                for (text, rect, clip) in &texts {
+                    if rect.intersect(*clip).is_negative() {
+                        continue;
+                    }
+                    assert!(
+                        rect.right() <= clip.right() + 1.0,
+                        "{label}: text {text:?} is cut horizontally"
+                    );
+                }
+                app.apply_persistence_choice(false, &context);
+                let editor = app.editor.as_ref().unwrap();
+                assert_eq!(editor.profile.auth_persistence, AuthPersistence::PerCall);
+                assert!(app.persistence_prompt.is_none());
+                assert_eq!(
+                    app.store.hosts[0].auth_persistence,
+                    AuthPersistence::PerCall,
+                    "{label}: cancel writes nothing"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn filtered_bulk_selection_never_keeps_hidden_hosts() {
         let visible = HostProfile {
             tags: vec!["prod".into()],
