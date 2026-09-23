@@ -39,10 +39,6 @@
 
 ## 安装
 
-### 直接下载
-
-预编译版本支持 64 位 Windows 10 或更高版本，可从 [Releases](https://github.com/Torinomii/codex-hosts/releases/latest) 下载。
-
 ### 安装 Codex Skill
 
 完整 Skill 的安装结构：
@@ -56,13 +52,13 @@
 └── references\
 ```
 
-将 Release ZIP 解压到会长期保留的目录，在该目录运行链接安装脚本：
+按下文从源码构建，然后在源码目录运行链接安装脚本：
 
 ```powershell
-pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 ```
 
-脚本会将完整 Skill 和 `bin\codex-hosts.exe` 链接到解压目录。请保留该目录；移动或删除后链接会失效。当前 Windows 用户须有创建符号链接的权限。随后在 `%USERPROFILE%\.codex\config.toml`（或工作区的 `.codex\config.toml`）中注册 MCP 服务器：
+脚本会将完整 Skill 和 `bin\codex-hosts.exe` 链接到源码目录。请保留该目录；移动或删除后链接会失效。当前 Windows 用户须有创建符号链接的权限。随后在 `%USERPROFILE%\.codex\config.toml`（或工作区的 `.codex\config.toml`）中注册 MCP 服务器：
 
 ```toml
 [mcp_servers.codex-hosts]
@@ -84,13 +80,13 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-不要只安装 `SKILL.md` 或可执行文件，应保留完整的 Release 解压目录。
+不要只安装 `SKILL.md` 或可执行文件，应保留完整的源码目录和构建后的可执行文件。
 
 也可以直接让 Codex 安装：
 
 ```text
-从 https://github.com/Torinomii/codex-hosts/releases/latest 下载最新版 codex-hosts，解压到固定目录，运行其中的 install-local-skill.ps1 -ReleasePackage。
-确认完整 Skill 和可执行文件均为符号链接，按 SKILL.md 在 config.toml 中注册 codex-hosts MCP 服务器，并保留解压目录。
+将 https://github.com/Torinomii/codex-hosts.git 克隆到固定目录，运行 cargo build --locked --release，然后在源码目录运行 scripts/install-local-skill.ps1。
+确认完整 Skill 和可执行文件均为符号链接，按 SKILL.md 在 config.toml 中注册 codex-hosts MCP 服务器，并保留源码目录。
 ```
 
 ### 从源代码构建
@@ -121,7 +117,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 脚本会将已安装的 `SKILL.md`、`agents` 和 `references` 链接到 `skill\codex-hosts`，并将已安装的 `bin\codex-hosts.exe` 直接链接到 `target\release\codex-hosts.exe`。替换现有安装前会验证全部源文件，安装后会核对链接目标；如果安装失败，则恢复原有安装。可随时再次运行以验证同一套链接。当前 Windows 用户必须具备创建符号链接的权限。
 
-从 Release ZIP 安装时也使用同一脚本，加上 `-ReleasePackage`，并保留解压目录。
+从本地制作的分发 ZIP 安装时也使用同一脚本，加上 `-ReleasePackage`，并保留解压目录。
 
 ## 快速上手
 

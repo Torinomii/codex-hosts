@@ -39,10 +39,6 @@
 
 ## Installation
 
-### Download a release
-
-The prebuilt version supports 64-bit Windows 10 or newer. Download it from [Releases](https://github.com/Torinomii/codex-hosts/releases/latest).
-
 ### Install the Codex Skill
 
 The installed Skill should look like this:
@@ -56,13 +52,13 @@ The installed Skill should look like this:
 └── references\
 ```
 
-Extract the release ZIP to a directory you will keep, then run its link installer from that directory:
+Build from source as described below, then run the link installer from the checkout:
 
 ```powershell
-pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 ```
 
-The installer links the complete Skill and `bin\codex-hosts.exe` to the extracted release. Keep that directory in place; moving or deleting it breaks the links. Windows must permit symbolic-link creation for the current user. Then register the MCP server in `%USERPROFILE%\.codex\config.toml` (or a workspace `.codex\config.toml`):
+The installer links the complete Skill and `bin\codex-hosts.exe` to the checkout. Keep that directory in place; moving or deleting it breaks the links. Windows must permit symbolic-link creation for the current user. Then register the MCP server in `%USERPROFILE%\.codex\config.toml` (or a workspace `.codex\config.toml`):
 
 ```toml
 [mcp_servers.codex-hosts]
@@ -84,13 +80,13 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-Do not install only `SKILL.md` or the executable; keep the complete extracted release.
+Do not install only `SKILL.md` or the executable; keep the complete checkout and built executable.
 
 You can also ask Codex to install it:
 
 ```text
-Download the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest, extract it to a stable directory, and run its install-local-skill.ps1 with -ReleasePackage.
-Confirm that the complete Skill and executable are symbolic links, register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the extracted directory in place.
+Clone https://github.com/Torinomii/codex-hosts.git to a stable directory, run cargo build --locked --release, then run scripts/install-local-skill.ps1 from the checkout.
+Confirm that the complete Skill and executable are symbolic links, register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the checkout in place.
 ```
 
 ### Build from source
@@ -121,7 +117,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 The script links `SKILL.md`, `agents`, and `references` to `skill\codex-hosts`, and links the installed `bin\codex-hosts.exe` directly to `target\release\codex-hosts.exe`. It validates all sources before replacing an existing installation, verifies the final targets, and rolls back if installation fails. Run it again at any time to verify the same layout. Windows must permit symbolic-link creation for the current user.
 
-The same installer also supports a retained, extracted release with `-ReleasePackage`; its ZIP includes the installer.
+The same installer also supports a retained, extracted distribution ZIP with `-ReleasePackage`; a locally packaged ZIP includes the installer.
 
 ## Quick start
 

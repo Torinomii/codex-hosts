@@ -39,10 +39,6 @@
 
 ## インストール
 
-### Release をダウンロード
-
-ビルド済みバージョンは 64 ビット版 Windows 10 以降に対応しています。[Releases](https://github.com/Torinomii/codex-hosts/releases/latest) からダウンロードできます。
-
 ### Codex Skill をインストール
 
 インストール後の Skill は次の構成になります：
@@ -56,13 +52,13 @@
 └── references\
 ```
 
-Release ZIP を保持するディレクトリに展開し、そのディレクトリでリンク用スクリプトを実行します：
+以下の手順でソースからビルドし、チェックアウト内でリンク用スクリプトを実行します：
 
 ```powershell
-pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 ```
 
-スクリプトは完全な Skill と `bin\codex-hosts.exe` を展開先へリンクします。展開先を移動または削除するとリンクが切れるため、そのまま保持してください。現在の Windows ユーザーにシンボリックリンク作成権限が必要です。その後、`%USERPROFILE%\.codex\config.toml`（またはワークスペースの `.codex\config.toml`）に MCP サーバーを登録します：
+スクリプトは完全な Skill と `bin\codex-hosts.exe` をチェックアウトへリンクします。チェックアウトを移動または削除するとリンクが切れるため、そのまま保持してください。現在の Windows ユーザーにシンボリックリンク作成権限が必要です。その後、`%USERPROFILE%\.codex\config.toml`（またはワークスペースの `.codex\config.toml`）に MCP サーバーを登録します：
 
 ```toml
 [mcp_servers.codex-hosts]
@@ -84,13 +80,13 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-`SKILL.md` または実行ファイルだけをインストールせず、展開した Release 全体を保持してください。
+`SKILL.md` または実行ファイルだけをインストールせず、チェックアウトとビルド済み実行ファイルを保持してください。
 
 Codex にインストールを依頼することもできます：
 
 ```text
-https://github.com/Torinomii/codex-hosts/releases/latest から最新版の codex-hosts をダウンロードし、固定ディレクトリに展開して install-local-skill.ps1 -ReleasePackage を実行してください。
-完全な Skill と実行ファイルがシンボリックリンクであることを確認し、SKILL.md に従って config.toml に codex-hosts MCP サーバーを登録し、展開先を保持してください。
+https://github.com/Torinomii/codex-hosts.git を固定ディレクトリにクローンし、cargo build --locked --release を実行してから、チェックアウト内の scripts/install-local-skill.ps1 を実行してください。
+完全な Skill と実行ファイルがシンボリックリンクであることを確認し、SKILL.md に従って config.toml に codex-hosts MCP サーバーを登録し、チェックアウトを保持してください。
 ```
 
 ### ソースからビルド
@@ -121,7 +117,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 このスクリプトは、インストール先の `SKILL.md`、`agents`、`references` を `skill\codex-hosts` にリンクし、`bin\codex-hosts.exe` を `target\release\codex-hosts.exe` に直接リンクします。既存インストールを置き換える前にすべてのソースを検証し、完了後にリンク先を確認します。失敗した場合は以前のインストールを復元します。同じ構成を確認するため、いつでも再実行できます。現在の Windows ユーザーにシンボリックリンクを作成する権限が必要です。
 
-Release ZIP の場合も同じスクリプトを `-ReleasePackage` 付きで使い、展開先を保持してください。
+ローカルで作成した配布 ZIP を展開した場合も、同じスクリプトを `-ReleasePackage` 付きで使い、展開先を保持してください。
 
 ## クイックスタート
 
