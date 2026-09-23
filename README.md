@@ -56,21 +56,13 @@ The installed Skill should look like this:
 └── references\
 ```
 
-For a manual installation:
+Extract the release ZIP to a directory you will keep, then run its link installer from that directory:
 
-1. Place the release executable at:
-
-```text
-%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe
+```powershell
+pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
 ```
 
-2. Copy the complete contents of `skill\codex-hosts` from the release into:
-
-```text
-%USERPROFILE%\.codex\skills\codex-hosts
-```
-
-3. Register the MCP server in `%USERPROFILE%\.codex\config.toml` (or a workspace `.codex\config.toml`):
+The installer links the complete Skill and `bin\codex-hosts.exe` to the extracted release. Keep that directory in place; moving or deleting it breaks the links. Windows must permit symbolic-link creation for the current user. Then register the MCP server in `%USERPROFILE%\.codex\config.toml` (or a workspace `.codex\config.toml`):
 
 ```toml
 [mcp_servers.codex-hosts]
@@ -92,13 +84,13 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-Do not install only `SKILL.md` or the executable; keep the complete Skill directory.
+Do not install only `SKILL.md` or the executable; keep the complete extracted release.
 
 You can also ask Codex to install it:
 
 ```text
-Download and install the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest.
-Automatically find the Skill installation directory for the current environment, install the complete Skill and executable, register the codex-hosts MCP server in config.toml as described in SKILL.md, and confirm that all required files are in place.
+Download the latest codex-hosts release from https://github.com/Torinomii/codex-hosts/releases/latest, extract it to a stable directory, and run its install-local-skill.ps1 with -ReleasePackage.
+Confirm that the complete Skill and executable are symbolic links, register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the extracted directory in place.
 ```
 
 ### Build from source
@@ -117,7 +109,7 @@ The executable is created at:
 target\release\codex-hosts.exe
 ```
 
-Place it in the Skill's `bin` directory after the build completes.
+After the build completes, run the linked installation command below.
 
 ### Link a local source checkout
 
@@ -129,7 +121,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 The script links `SKILL.md`, `agents`, and `references` to `skill\codex-hosts`, and links the installed `bin\codex-hosts.exe` directly to `target\release\codex-hosts.exe`. It validates all sources before replacing an existing installation, verifies the final targets, and rolls back if installation fails. Run it again at any time to verify the same layout. Windows must permit symbolic-link creation for the current user.
 
-This linked workflow is for a local source checkout. Keep using the copy-based steps above for downloaded release archives.
+The same installer also supports a retained, extracted release with `-ReleasePackage`; its ZIP includes the installer.
 
 ## Quick start
 

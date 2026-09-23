@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$RepositoryRoot,
-    [string]$CodexHome
+    [string]$CodexHome,
+    [switch]$ReleasePackage
 )
 
 Set-StrictMode -Version Latest
@@ -142,8 +143,55 @@ function Remove-ExactTree {
     }
 }
 
+function Assert-ReplaceableInstallation {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $installed = Get-ExistingItem -LiteralPath $Path
+    if ($null -eq $installed) {
+        return
+    }
+    if (-not $installed.PSIsContainer -or $installed.LinkType) {
+        throw "Existing Skill path is not a regular directory: '$Path'."
+    }
+
+    $allowedEntries = @{
+        '' = @('SKILL.md', 'agents', 'references', 'bin')
+        'agents' = @('openai.yaml')
+        'references' = @('hardware-keys.md', 'host-editor.md', 'long-running.md', 'temporary-secrets.md', 'tool-protocol.md')
+        'bin' = @('codex-hosts.exe')
+    }
+    foreach ($relative in $allowedEntries.Keys) {
+        $directory = if ($relative) { Join-Path $Path $relative } else { $Path }
+        $item = Get-ExistingItem -LiteralPath $directory
+        if ($null -eq $item) {
+            continue
+        }
+        if (-not $item.PSIsContainer) {
+            if ($relative -eq 'bin') {
+                throw "Existing Skill bin path is not a directory: '$directory'."
+            }
+            continue
+        }
+        if ($relative -and $item.LinkType) {
+            continue
+        }
+        foreach ($child in @(Get-ChildItem -LiteralPath $directory -Force)) {
+            if ($child.Name -cnotin $allowedEntries[$relative]) {
+                throw "Existing Skill contains an unmanaged entry; refusing replacement: '$($child.FullName)'."
+            }
+            $shouldBeDirectory = -not $relative -and $child.Name -in @('agents', 'references', 'bin')
+            if ($child.PSIsContainer -ne $shouldBeDirectory) {
+                throw "Existing Skill entry has an unexpected type: '$($child.FullName)'."
+            }
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
-    $RepositoryRoot = Split-Path -Parent $PSScriptRoot
+    $RepositoryRoot = if ($ReleasePackage) { $PSScriptRoot } else { Split-Path -Parent $PSScriptRoot }
 }
 $RepositoryRoot = Get-NormalizedPath -Path $RepositoryRoot
 
@@ -158,10 +206,24 @@ if ([string]::IsNullOrWhiteSpace($CodexHome)) {
 $CodexHome = Get-NormalizedPath -Path $CodexHome
 
 $skillSource = Join-Path $RepositoryRoot 'skill\codex-hosts'
-$releaseExecutable = Join-Path $RepositoryRoot 'target\release\codex-hosts.exe'
+$releaseExecutable = if ($ReleasePackage) {
+    Join-Path $RepositoryRoot 'bin\codex-hosts.exe'
+}
+else {
+    Join-Path $RepositoryRoot 'target\release\codex-hosts.exe'
+}
 $skillFile = Join-Path $skillSource 'SKILL.md'
 $agentsDirectory = Join-Path $skillSource 'agents'
 $referencesDirectory = Join-Path $skillSource 'references'
+$requiredSkillFiles = @(
+    $skillFile,
+    (Join-Path $agentsDirectory 'openai.yaml'),
+    (Join-Path $referencesDirectory 'hardware-keys.md'),
+    (Join-Path $referencesDirectory 'host-editor.md'),
+    (Join-Path $referencesDirectory 'long-running.md'),
+    (Join-Path $referencesDirectory 'temporary-secrets.md'),
+    (Join-Path $referencesDirectory 'tool-protocol.md')
+)
 
 foreach ($requiredDirectory in @($RepositoryRoot, $skillSource, $agentsDirectory, $referencesDirectory)) {
     if (-not (Test-Path -LiteralPath $requiredDirectory -PathType Container)) {
@@ -169,7 +231,7 @@ foreach ($requiredDirectory in @($RepositoryRoot, $skillSource, $agentsDirectory
     }
 }
 
-foreach ($requiredFile in @($skillFile, $releaseExecutable)) {
+foreach ($requiredFile in @($requiredSkillFiles + $releaseExecutable)) {
     if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
         throw "Required file does not exist: '$requiredFile'."
     }
@@ -182,6 +244,7 @@ if ((Get-Item -LiteralPath $releaseExecutable -Force).Length -le 0) {
 $skillsRoot = Get-NormalizedPath -Path (Join-Path $CodexHome 'skills')
 $installedSkill = Join-Path $skillsRoot 'codex-hosts'
 Assert-SafeSiblingPath -Path $installedSkill -ExpectedParent $skillsRoot -ExpectedNamePrefix 'codex-hosts'
+Assert-ReplaceableInstallation -Path $installedSkill
 
 $mappings = @(
     [pscustomobject]@{ RelativePath = 'SKILL.md'; Target = $skillFile },
@@ -226,7 +289,12 @@ try {
 
     foreach ($mapping in $mappings) {
         $linkPath = Join-Path $stagingPath $mapping.RelativePath
-        New-Item -ItemType SymbolicLink -Path $linkPath -Target $mapping.Target | Out-Null
+        try {
+            New-Item -ItemType SymbolicLink -Path $linkPath -Target $mapping.Target | Out-Null
+        }
+        catch {
+            throw "Cannot create symbolic link '$linkPath' to '$($mapping.Target)': $($_.Exception.Message)"
+        }
     }
 
     Assert-ExpectedLayout -LayoutRoot $stagingPath -Mappings $mappings

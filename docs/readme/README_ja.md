@@ -56,21 +56,13 @@
 └── references\
 ```
 
-手動でインストールする場合：
+Release ZIP を保持するディレクトリに展開し、そのディレクトリでリンク用スクリプトを実行します：
 
-1. Release 内の `codex-hosts.exe` を次の場所に配置します：
-
-```text
-%USERPROFILE%\.codex\skills\codex-hosts\bin\codex-hosts.exe
+```powershell
+pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
 ```
 
-2. Release 内の `skill\codex-hosts` の内容をすべて次の場所へコピーします：
-
-```text
-%USERPROFILE%\.codex\skills\codex-hosts
-```
-
-3. `%USERPROFILE%\.codex\config.toml`（またはワークスペースの `.codex\config.toml`）に MCP サーバーを登録します：
+スクリプトは完全な Skill と `bin\codex-hosts.exe` を展開先へリンクします。展開先を移動または削除するとリンクが切れるため、そのまま保持してください。現在の Windows ユーザーにシンボリックリンク作成権限が必要です。その後、`%USERPROFILE%\.codex\config.toml`（またはワークスペースの `.codex\config.toml`）に MCP サーバーを登録します：
 
 ```toml
 [mcp_servers.codex-hosts]
@@ -92,13 +84,13 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-`SKILL.md` または実行ファイルだけをコピーせず、Skill ディレクトリ全体を保持してください。
+`SKILL.md` または実行ファイルだけをインストールせず、展開した Release 全体を保持してください。
 
 Codex にインストールを依頼することもできます：
 
 ```text
-https://github.com/Torinomii/codex-hosts/releases/latest から最新版の codex-hosts をダウンロードしてインストールしてください。
-現在の環境の Skill インストールディレクトリを自動的に特定し、完全な Skill と実行ファイルをインストールし、SKILL.md の説明に従って config.toml に codex-hosts MCP サーバーを登録して、必要なファイルがすべて配置されていることを確認してください。
+https://github.com/Torinomii/codex-hosts/releases/latest から最新版の codex-hosts をダウンロードし、固定ディレクトリに展開して install-local-skill.ps1 -ReleasePackage を実行してください。
+完全な Skill と実行ファイルがシンボリックリンクであることを確認し、SKILL.md に従って config.toml に codex-hosts MCP サーバーを登録し、展開先を保持してください。
 ```
 
 ### ソースからビルド
@@ -117,7 +109,7 @@ cargo build --locked --release
 target\release\codex-hosts.exe
 ```
 
-ビルド後、この実行ファイルを Skill の `bin` ディレクトリに配置します。
+ビルド後、以下のリンク用インストールコマンドを実行します。
 
 ### ローカルソースチェックアウトをリンクする
 
@@ -129,7 +121,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 このスクリプトは、インストール先の `SKILL.md`、`agents`、`references` を `skill\codex-hosts` にリンクし、`bin\codex-hosts.exe` を `target\release\codex-hosts.exe` に直接リンクします。既存インストールを置き換える前にすべてのソースを検証し、完了後にリンク先を確認します。失敗した場合は以前のインストールを復元します。同じ構成を確認するため、いつでも再実行できます。現在の Windows ユーザーにシンボリックリンクを作成する権限が必要です。
 
-このリンク方式はローカルソースチェックアウト専用です。ダウンロードした Release アーカイブでは、上記のコピー方式を引き続き使用してください。
+Release ZIP の場合も同じスクリプトを `-ReleasePackage` 付きで使い、展開先を保持してください。
 
 ## クイックスタート
 

@@ -92,15 +92,19 @@ jobs:
           Copy-Item -LiteralPath ".\skill\codex-hosts\agents\openai.yaml" -Destination $agentDirectory
           Copy-Item -LiteralPath ".\skill\codex-hosts\references\hardware-keys.md" -Destination $referenceDirectory
           Copy-Item -LiteralPath ".\skill\codex-hosts\references\host-editor.md" -Destination $referenceDirectory
+          Copy-Item -LiteralPath ".\skill\codex-hosts\references\long-running.md" -Destination $referenceDirectory
           Copy-Item -LiteralPath ".\skill\codex-hosts\references\temporary-secrets.md" -Destination $referenceDirectory
           Copy-Item -LiteralPath ".\skill\codex-hosts\references\tool-protocol.md" -Destination $referenceDirectory
+          Copy-Item -LiteralPath ".\scripts\install-local-skill.ps1" -Destination $stagingRoot
 
           $expectedFiles = @(
             "bin/codex-hosts.exe",
+            "install-local-skill.ps1",
             "skill/codex-hosts/SKILL.md",
             "skill/codex-hosts/agents/openai.yaml",
             "skill/codex-hosts/references/hardware-keys.md",
             "skill/codex-hosts/references/host-editor.md",
+            "skill/codex-hosts/references/long-running.md",
             "skill/codex-hosts/references/temporary-secrets.md",
             "skill/codex-hosts/references/tool-protocol.md"
           ) | Sort-Object
