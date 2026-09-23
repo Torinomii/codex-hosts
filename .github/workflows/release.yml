@@ -13,10 +13,14 @@ jobs:
   build-release:
     name: Build release
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install Rust 1.92
         shell: pwsh
@@ -137,4 +141,58 @@ jobs:
           Write-Output "ZIP files: $($archiveFiles -join ', ')"
           Write-Output "Executable SHA-256: $((Get-FileHash -Algorithm SHA256 -LiteralPath '.\target\release\codex-hosts.exe').Hash)"
           Remove-Item -LiteralPath $stagingRoot -Recurse -Force
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $assetPath = Join-Path $PWD "dist\codex-hosts-windows-x86_64.zip"
+          $assetName = Split-Path -Leaf $assetPath
+          if (-not (Test-Path -LiteralPath $assetPath -PathType Leaf)) {
+            throw "Verified distribution ZIP is missing: $assetPath"
+          }
+          $buildSha = git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $buildSha -notmatch '^[0-9a-f]{40}$') {
+            throw "Could not resolve the built source revision"
+          }
+
+          $tagRef = "refs/tags/$env:RELEASE_TAG"
+          $tagLines = @(git ls-remote --tags origin $tagRef "$tagRef^{}")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not inspect remote release tag '$env:RELEASE_TAG'"
+          }
+          $peeledTag = $tagLines | Where-Object { $_ -match '\^\{\}$' } | Select-Object -First 1
+          $directTag = $tagLines | Where-Object { $_ -match [regex]::Escape($tagRef) + '$' } | Select-Object -First 1
+          $tagLine = if ($peeledTag) { $peeledTag } else { $directTag }
+          if ($tagLine) {
+            $tagCommit = ($tagLine -split '\s+')[0]
+            if ($tagCommit -ne $buildSha) {
+              throw "Tag '$env:RELEASE_TAG' points to $tagCommit, not built commit $buildSha. Bump the package version before publishing new source."
+            }
+          }
+
+          $releaseJson = gh release view "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --json assets,isDraft,url 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $existingRelease = $releaseJson | ConvertFrom-Json
+            if ($existingRelease.isDraft) {
+              throw "Release '$env:RELEASE_TAG' exists as a draft and is not downloadable. Resolve the draft before rerunning."
+            }
+            if (-not $tagLine) {
+              throw "Release '$env:RELEASE_TAG' exists but its remote tag is missing. Resolve the release before rerunning."
+            }
+            if (-not @($existingRelease.assets | Where-Object { $_.name -eq $assetName }).Count) {
+              throw "Release '$env:RELEASE_TAG' exists without $assetName. Resolve the incomplete release before rerunning."
+            }
+            Write-Output "Existing downloadable release: $($existingRelease.url)"
+            exit 0
+          }
+
+          $releaseUrl = gh release create "$env:RELEASE_TAG" "$assetPath" --repo "$env:GITHUB_REPOSITORY" --target "$buildSha" --generate-notes --title "$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not publish release '$env:RELEASE_TAG' with $assetName"
+          }
+          Write-Output "Downloadable release: $releaseUrl"
 

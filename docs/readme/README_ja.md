@@ -52,7 +52,7 @@
 └── references\
 ```
 
-以下の手順でソースからビルドし、チェックアウト内でリンク用スクリプトを実行します：
+ダウンロードした Release は以下のパッケージ手順に従ってインストールします。ソースからビルドする場合は、チェックアウト内でリンク用スクリプトを実行します：
 
 ```powershell
 pwsh -NoProfile -File .\scripts\install-local-skill.ps1
@@ -80,7 +80,7 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-`SKILL.md` または実行ファイルだけをインストールせず、チェックアウトとビルド済み実行ファイルを保持してください。
+`SKILL.md` または実行ファイルだけをインストールせず、チェックアウトまたは展開した Release ディレクトリ全体を保持してください。
 
 Codex にインストールを依頼することもできます：
 
@@ -88,6 +88,16 @@ Codex にインストールを依頼することもできます：
 https://github.com/Torinomii/codex-hosts.git を固定ディレクトリにクローンし、cargo build --locked --release を実行してから、チェックアウト内の scripts/install-local-skill.ps1 を実行してください。
 完全な Skill と実行ファイルがシンボリックリンクであることを確認し、SKILL.md に従って config.toml に codex-hosts MCP サーバーを登録し、チェックアウトを保持してください。
 ```
+
+### GitHub Release をダウンロード
+
+[Releases ページ](https://github.com/Torinomii/codex-hosts/releases)から `codex-hosts-windows-x86_64.zip` をダウンロードし、固定ディレクトリに展開してから、そのディレクトリで次を実行します：
+
+```powershell
+pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
+```
+
+インストールされた Skill と実行ファイルは展開先へのシンボリックリンクなので、そのディレクトリを保持してください。
 
 ### ソースからビルド
 

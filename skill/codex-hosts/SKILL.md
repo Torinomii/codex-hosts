@@ -17,7 +17,7 @@ All host work goes through the `codex-hosts` MCP server (tools named `list_hosts
 
 ## Setup
 
-Install the complete Skill and executable as symbolic links. From a built source checkout, run `pwsh -NoProfile -File .\scripts\install-local-skill.ps1`; from a locally prepared distribution ZIP, run `pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage` after extraction. Keep the source or extraction directory in place so the links remain valid. See the [project README](https://github.com/Torinomii/codex-hosts#installation) for the full setup.
+Install the complete Skill and executable as symbolic links. From a built source checkout, run `pwsh -NoProfile -File .\scripts\install-local-skill.ps1`; from a downloaded or locally prepared distribution ZIP, run `pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage` after extraction. Keep the source or extraction directory in place so the links remain valid. See the [project README](https://github.com/Torinomii/codex-hosts#installation) for the full setup.
 
 If the `codex-hosts` MCP server is not available, register it once in `~/.codex/config.toml` (or the workspace `.codex/config.toml`), pointing `command` at the executable next to this `SKILL.md`:
 

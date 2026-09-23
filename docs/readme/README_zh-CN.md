@@ -52,7 +52,7 @@
 └── references\
 ```
 
-按下文从源码构建，然后在源码目录运行链接安装脚本：
+下载 Release 请按下文的安装步骤操作。若从源码构建，则在源码目录运行链接安装脚本：
 
 ```powershell
 pwsh -NoProfile -File .\scripts\install-local-skill.ps1
@@ -80,7 +80,7 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-不要只安装 `SKILL.md` 或可执行文件，应保留完整的源码目录和构建后的可执行文件。
+不要只安装 `SKILL.md` 或可执行文件；请保留完整的源码目录或解压后的 Release 目录。
 
 也可以直接让 Codex 安装：
 
@@ -88,6 +88,16 @@ approval_mode = "prompt"
 将 https://github.com/Torinomii/codex-hosts.git 克隆到固定目录，运行 cargo build --locked --release，然后在源码目录运行 scripts/install-local-skill.ps1。
 确认完整 Skill 和可执行文件均为符号链接，按 SKILL.md 在 config.toml 中注册 codex-hosts MCP 服务器，并保留源码目录。
 ```
+
+### 下载 GitHub Release
+
+从 [Releases 页面](https://github.com/Torinomii/codex-hosts/releases)下载 `codex-hosts-windows-x86_64.zip`，解压到固定目录，然后在该目录运行：
+
+```powershell
+pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
+```
+
+安装后的 Skill 和可执行文件均链接到解压目录，因此请保留该目录。
 
 ### 从源代码构建
 

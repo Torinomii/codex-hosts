@@ -52,7 +52,7 @@ The installed Skill should look like this:
 └── references\
 ```
 
-Build from source as described below, then run the link installer from the checkout:
+For a downloaded Release, use the package instructions below. If building from source, run the link installer from the checkout:
 
 ```powershell
 pwsh -NoProfile -File .\scripts\install-local-skill.ps1
@@ -80,7 +80,7 @@ approval_mode = "prompt"
 approval_mode = "prompt"
 ```
 
-Do not install only `SKILL.md` or the executable; keep the complete checkout and built executable.
+Do not install only `SKILL.md` or the executable; keep the complete checkout or extracted release directory in place.
 
 You can also ask Codex to install it:
 
@@ -88,6 +88,16 @@ You can also ask Codex to install it:
 Clone https://github.com/Torinomii/codex-hosts.git to a stable directory, run cargo build --locked --release, then run scripts/install-local-skill.ps1 from the checkout.
 Confirm that the complete Skill and executable are symbolic links, register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the checkout in place.
 ```
+
+### Download a GitHub Release
+
+Download `codex-hosts-windows-x86_64.zip` from the [Releases page](https://github.com/Torinomii/codex-hosts/releases), extract it to a stable directory, and run its installer:
+
+```powershell
+pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
+```
+
+Keep the extracted directory in place because the installed Skill and executable are symbolic links into it.
 
 ### Build from source
 
@@ -117,7 +127,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 The script links `SKILL.md`, `agents`, and `references` to `skill\codex-hosts`, and links the installed `bin\codex-hosts.exe` directly to `target\release\codex-hosts.exe`. It validates all sources before replacing an existing installation, verifies the final targets, and rolls back if installation fails. Run it again at any time to verify the same layout. Windows must permit symbolic-link creation for the current user.
 
-The same installer also supports a retained, extracted distribution ZIP with `-ReleasePackage`; a locally packaged ZIP includes the installer.
+The same installer also supports a retained, locally prepared distribution ZIP with `-ReleasePackage`.
 
 ## Quick start
 
