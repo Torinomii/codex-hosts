@@ -240,10 +240,6 @@ They expire when the `codex-hosts` tray application exits, the user signs out, o
 
 See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md) for the complete behavior.
 
-### Policy gates such as hol-guard
-
-Because every action is an MCP tool call with structured parameters, a policy layer that intercepts `mcp__*` calls sees the tool name and its arguments. With [hol-guard](https://github.com/hashgraph-online/hol-guard), add the executable as a custom extension (`codex-hosts.exe --mcp`) and treat `exec`, `exec_stdin`, `exec_many`, `batch_exec`, `temporary_secrets_run`, and `open_host_editor` as tools to review; the remaining tools are read-only or only tighten access.
-
 ## FIDO / security keys
 
 `codex-hosts` can use existing OpenSSH ECDSA-SK and Ed25519-SK FIDO handles.
