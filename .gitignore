@@ -1,4 +1,5 @@
 /target/
+/skill/codex-hosts/bin/
 /dist/
 /bin/*.exe
 *.pdb

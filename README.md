@@ -58,7 +58,7 @@ For a downloaded Release, use the package instructions below. If building from s
 pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 ```
 
-The installer links the complete Skill and `bin\codex-hosts.exe` to the checkout. Keep that directory in place; moving or deleting it breaks the links. Windows must permit symbolic-link creation for the current user. Then register the MCP server in `%USERPROFILE%\.codex\config.toml` (or a workspace `.codex\config.toml`):
+The installer makes the entire installed `codex-hosts` Skill directory one symbolic link to `skill\codex-hosts`. Inside the source Skill directory, `bin\codex-hosts.exe` links to the release build. Keep the checkout in place; moving or deleting it breaks the links. Windows must permit symbolic-link creation for the current user. The MCP server still needs a one-time registration in `%USERPROFILE%\.codex\config.toml` (or a workspace `.codex\config.toml`):
 
 ```toml
 [mcp_servers.codex-hosts]
@@ -86,7 +86,7 @@ You can also ask Codex to install it:
 
 ```text
 Clone https://github.com/Torinomii/codex-hosts.git to a stable directory, run cargo build --locked --release, then run scripts/install-local-skill.ps1 from the checkout.
-Confirm that the complete Skill and executable are symbolic links, register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the checkout in place.
+Confirm that the installed codex-hosts Skill directory is one symbolic link and its executable resolves to the release build; register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the checkout in place.
 ```
 
 ### Download a GitHub Release
@@ -97,7 +97,7 @@ Download `codex-hosts-windows-x86_64.zip` from the [Releases page](https://githu
 pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
 ```
 
-Keep the extracted directory in place because the installed Skill and executable are symbolic links into it.
+Keep the extracted directory in place because the installed Skill directory links to it.
 
 ### Build from source
 
@@ -125,7 +125,7 @@ When developing from a stable local checkout, install symbolic links instead of 
 pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 ```
 
-The script links `SKILL.md`, `agents`, and `references` to `skill\codex-hosts`, and links the installed `bin\codex-hosts.exe` directly to `target\release\codex-hosts.exe`. It validates all sources before replacing an existing installation, verifies the final targets, and rolls back if installation fails. Run it again at any time to verify the same layout. Windows must permit symbolic-link creation for the current user.
+The script links the installed `codex-hosts` directory to `skill\codex-hosts` as one unit. The source Skill's `bin\codex-hosts.exe` links to `target\release\codex-hosts.exe`, so rebuilding updates the installed executable without reinstalling. It validates all sources before replacing an existing installation, verifies the final targets, and rolls back if installation fails. Run it again at any time to verify the same layout. Windows must permit symbolic-link creation for the current user.
 
 The same installer also supports a retained, locally prepared distribution ZIP with `-ReleasePackage`.
 

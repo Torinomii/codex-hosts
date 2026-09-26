@@ -83,23 +83,6 @@ function Test-ExpectedLink {
     )
 }
 
-function Assert-ExpectedLayout {
-    param(
-        [Parameter(Mandatory)]
-        [string]$LayoutRoot,
-
-        [Parameter(Mandatory)]
-        [object[]]$Mappings
-    )
-
-    foreach ($mapping in $Mappings) {
-        $linkPath = Join-Path $LayoutRoot $mapping.RelativePath
-        if (-not (Test-ExpectedLink -LinkPath $linkPath -ExpectedTarget $mapping.Target)) {
-            throw "Symbolic link verification failed: '$linkPath' must target '$($mapping.Target)'."
-        }
-    }
-}
-
 function Assert-SafeSiblingPath {
     param(
         [Parameter(Mandatory)]
@@ -138,22 +121,37 @@ function Remove-ExactTree {
     )
 
     Assert-SafeSiblingPath -Path $Path -ExpectedParent $ExpectedParent -ExpectedNamePrefix $ExpectedNamePrefix
-    if ($null -ne (Get-ExistingItem -LiteralPath $Path)) {
-        Remove-Item -LiteralPath $Path -Recurse -Force
+    $item = Get-ExistingItem -LiteralPath $Path
+    if ($null -ne $item) {
+        if ($item.LinkType) {
+            Remove-Item -LiteralPath $Path -Force
+        }
+        else {
+            Remove-Item -LiteralPath $Path -Recurse -Force
+        }
     }
 }
 
 function Assert-ReplaceableInstallation {
     param(
         [Parameter(Mandatory)]
-        [string]$Path
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [string]$ExpectedTarget
     )
 
     $installed = Get-ExistingItem -LiteralPath $Path
     if ($null -eq $installed) {
         return
     }
-    if (-not $installed.PSIsContainer -or $installed.LinkType) {
+    if ($installed.LinkType) {
+        if (-not (Test-ExpectedLink -LinkPath $Path -ExpectedTarget $ExpectedTarget)) {
+            throw "Existing Skill link points elsewhere; refusing replacement: '$Path'."
+        }
+        return
+    }
+    if (-not $installed.PSIsContainer) {
         throw "Existing Skill path is not a regular directory: '$Path'."
     }
 
@@ -244,31 +242,41 @@ if ((Get-Item -LiteralPath $releaseExecutable -Force).Length -le 0) {
 $skillsRoot = Get-NormalizedPath -Path (Join-Path $CodexHome 'skills')
 $installedSkill = Join-Path $skillsRoot 'codex-hosts'
 Assert-SafeSiblingPath -Path $installedSkill -ExpectedParent $skillsRoot -ExpectedNamePrefix 'codex-hosts'
-Assert-ReplaceableInstallation -Path $installedSkill
+Assert-ReplaceableInstallation -Path $installedSkill -ExpectedTarget $skillSource
 
-$mappings = @(
-    [pscustomobject]@{ RelativePath = 'SKILL.md'; Target = $skillFile },
-    [pscustomobject]@{ RelativePath = 'agents'; Target = $agentsDirectory },
-    [pscustomobject]@{ RelativePath = 'references'; Target = $referencesDirectory },
-    [pscustomobject]@{ RelativePath = 'bin\codex-hosts.exe'; Target = $releaseExecutable }
-)
-
-$alreadyCorrect = $null -ne (Get-ExistingItem -LiteralPath $installedSkill)
-if ($alreadyCorrect) {
-    foreach ($mapping in $mappings) {
-        $linkPath = Join-Path $installedSkill $mapping.RelativePath
-        if (-not (Test-ExpectedLink -LinkPath $linkPath -ExpectedTarget $mapping.Target)) {
-            $alreadyCorrect = $false
-            break
+# Keep the executable next to the Skill through one link inside the source
+# directory. The installed Skill directory itself remains a single link.
+$sourceBin = Join-Path $skillSource 'bin'
+$sourceExecutable = Join-Path $sourceBin 'codex-hosts.exe'
+$binItem = Get-ExistingItem -LiteralPath $sourceBin
+if ($null -ne $binItem) {
+    if (-not $binItem.PSIsContainer -or $binItem.LinkType) {
+        throw "Skill source bin path is not a regular directory: '$sourceBin'."
+    }
+    foreach ($child in @(Get-ChildItem -LiteralPath $sourceBin -Force)) {
+        if ($child.Name -cne 'codex-hosts.exe') {
+            throw "Skill source bin contains an unmanaged entry: '$($child.FullName)'."
         }
     }
 }
+$sourceExecutableItem = Get-ExistingItem -LiteralPath $sourceExecutable
+if ($null -ne $sourceExecutableItem -and
+    -not (Test-ExpectedLink -LinkPath $sourceExecutable -ExpectedTarget $releaseExecutable)) {
+    throw "Skill source executable link points elsewhere; refusing replacement: '$sourceExecutable'."
+}
+if ($null -eq $binItem) {
+    New-Item -ItemType Directory -Path $sourceBin | Out-Null
+}
+if ($null -eq $sourceExecutableItem) {
+    New-Item -ItemType SymbolicLink -Path $sourceExecutable -Target $releaseExecutable | Out-Null
+}
+if (-not (Test-ExpectedLink -LinkPath $sourceExecutable -ExpectedTarget $releaseExecutable)) {
+    throw "Executable link verification failed: '$sourceExecutable'."
+}
 
-if ($alreadyCorrect) {
-    Write-Output "Linked codex-hosts Skill is already current: $installedSkill"
-    foreach ($mapping in $mappings) {
-        Write-Output "Verified: $($mapping.RelativePath) -> $($mapping.Target)"
-    }
+if (Test-ExpectedLink -LinkPath $installedSkill -ExpectedTarget $skillSource) {
+    Write-Output "Linked codex-hosts Skill is already current: $installedSkill -> $skillSource"
+    Write-Output "Verified executable: $sourceExecutable -> $releaseExecutable"
     return
 }
 
@@ -284,20 +292,15 @@ $previousMoved = $false
 $newInstalled = $false
 
 try {
-    New-Item -ItemType Directory -Path $stagingPath | Out-Null
-    New-Item -ItemType Directory -Path (Join-Path $stagingPath 'bin') | Out-Null
-
-    foreach ($mapping in $mappings) {
-        $linkPath = Join-Path $stagingPath $mapping.RelativePath
-        try {
-            New-Item -ItemType SymbolicLink -Path $linkPath -Target $mapping.Target | Out-Null
-        }
-        catch {
-            throw "Cannot create symbolic link '$linkPath' to '$($mapping.Target)': $($_.Exception.Message)"
-        }
+    try {
+        New-Item -ItemType SymbolicLink -Path $stagingPath -Target $skillSource | Out-Null
     }
-
-    Assert-ExpectedLayout -LayoutRoot $stagingPath -Mappings $mappings
+    catch {
+        throw "Cannot create symbolic link '$stagingPath' to '$skillSource': $($_.Exception.Message)"
+    }
+    if (-not (Test-ExpectedLink -LinkPath $stagingPath -ExpectedTarget $skillSource)) {
+        throw "Skill directory link verification failed: '$stagingPath'."
+    }
 
     if ($null -ne (Get-ExistingItem -LiteralPath $installedSkill)) {
         Move-Item -LiteralPath $installedSkill -Destination $backupPath
@@ -306,7 +309,12 @@ try {
 
     Move-Item -LiteralPath $stagingPath -Destination $installedSkill
     $newInstalled = $true
-    Assert-ExpectedLayout -LayoutRoot $installedSkill -Mappings $mappings
+    if (-not (Test-ExpectedLink -LinkPath $installedSkill -ExpectedTarget $skillSource)) {
+        throw "Skill directory link verification failed: '$installedSkill'."
+    }
+    if (-not (Test-ExpectedLink -LinkPath (Join-Path $installedSkill 'bin\codex-hosts.exe') -ExpectedTarget $releaseExecutable)) {
+        throw "Installed executable link verification failed: '$installedSkill'."
+    }
 
     if ($previousMoved) {
         Remove-ExactTree -Path $backupPath -ExpectedParent $skillsRoot -ExpectedNamePrefix '.codex-hosts.backup-'
@@ -334,7 +342,5 @@ finally {
     }
 }
 
-Write-Output "Installed linked codex-hosts Skill: $installedSkill"
-foreach ($mapping in $mappings) {
-    Write-Output "Verified: $($mapping.RelativePath) -> $($mapping.Target)"
-}
+Write-Output "Installed linked codex-hosts Skill: $installedSkill -> $skillSource"
+Write-Output "Verified executable: $sourceExecutable -> $releaseExecutable"

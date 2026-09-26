@@ -58,7 +58,7 @@
 pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 ```
 
-脚本会将完整 Skill 和 `bin\codex-hosts.exe` 链接到源码目录。请保留该目录；移动或删除后链接会失效。当前 Windows 用户须有创建符号链接的权限。随后在 `%USERPROFILE%\.codex\config.toml`（或工作区的 `.codex\config.toml`）中注册 MCP 服务器：
+脚本会把已安装的整个 `codex-hosts` Skill 目录作为一个符号链接指向 `skill\codex-hosts`；源码 Skill 目录内的 `bin\codex-hosts.exe` 再链接到发布版构建。请保留源码目录；移动或删除后链接会失效。当前 Windows 用户须有创建符号链接的权限。MCP 服务器仍须在 `%USERPROFILE%\.codex\config.toml`（或工作区的 `.codex\config.toml`）中注册一次：
 
 ```toml
 [mcp_servers.codex-hosts]
@@ -86,7 +86,7 @@ approval_mode = "prompt"
 
 ```text
 将 https://github.com/Torinomii/codex-hosts.git 克隆到固定目录，运行 cargo build --locked --release，然后在源码目录运行 scripts/install-local-skill.ps1。
-确认完整 Skill 和可执行文件均为符号链接，按 SKILL.md 在 config.toml 中注册 codex-hosts MCP 服务器，并保留源码目录。
+确认已安装的整个 codex-hosts Skill 目录是一个符号链接、可执行文件解析到发布版构建，按 SKILL.md 在 config.toml 中注册 codex-hosts MCP 服务器，并保留源码目录。
 ```
 
 ### 下载 GitHub Release
@@ -97,7 +97,7 @@ approval_mode = "prompt"
 pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
 ```
 
-安装后的 Skill 和可执行文件均链接到解压目录，因此请保留该目录。
+安装后的整个 Skill 目录链接到解压目录，因此请保留该目录。
 
 ### 从源代码构建
 
@@ -125,7 +125,7 @@ target\release\codex-hosts.exe
 pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 ```
 
-脚本会将已安装的 `SKILL.md`、`agents` 和 `references` 链接到 `skill\codex-hosts`，并将已安装的 `bin\codex-hosts.exe` 直接链接到 `target\release\codex-hosts.exe`。替换现有安装前会验证全部源文件，安装后会核对链接目标；如果安装失败，则恢复原有安装。可随时再次运行以验证同一套链接。当前 Windows 用户必须具备创建符号链接的权限。
+脚本会把已安装的 `codex-hosts` 目录整体链接到 `skill\codex-hosts`。源码 Skill 目录内的 `bin\codex-hosts.exe` 链接到 `target\release\codex-hosts.exe`，因此重新构建后无需重装。替换现有安装前会验证全部源文件，安装后会核对链接目标；如果安装失败，则恢复原有安装。可随时再次运行以验证同一套链接。当前 Windows 用户必须具备创建符号链接的权限。
 
 从本地制作的分发 ZIP 安装时也使用同一脚本，加上 `-ReleasePackage`，并保留解压目录。
 
