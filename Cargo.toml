@@ -1,6 +1,6 @@
 [package]
 name = "codex-hosts"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
@@ -33,6 +33,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shel
 
 [build-dependencies]
 serde_json = "1"
+winresource = "0.1.31"
 
 [profile.release]
 lto = "fat"
