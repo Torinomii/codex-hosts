@@ -385,20 +385,36 @@ async fn sudo_repeat_missing_and_policy_failure_close_without_guessing() {
 async fn sudo_timeout_drops_input_and_releases_channel_in_each_auth_phase() {
     for mode in ["stall-before", "stall-input", "stall-ready"] {
         let (client, server, observations) = connect_test_server().await;
-        let error = run_with_optional_timeout(
-            Some(Duration::from_millis(500)),
-            "COMMAND_TIMEOUT",
-            "test deadline",
-            run_sudo(
-                &client,
-                sudo_test_launch(mode),
-                &CaptureBudget::new(0),
-                |_| Ok(zeroize::Zeroizing::new("x".repeat(MAX_STDIN_BYTES))),
-            ),
-        )
-        .await
-        .err()
-        .unwrap();
+        let error = {
+            let budget = CaptureBudget::new(0);
+            let operation = run_sudo(&client, sudo_test_launch(mode), &budget, |_| {
+                Ok(zeroize::Zeroizing::new("x".repeat(MAX_STDIN_BYTES)))
+            });
+            tokio::pin!(operation);
+            if mode == "stall-ready" {
+                // Time the stalled phase, not scheduling + transferring 2 MiB
+                // under concurrent UI tests. Still bound setup independently.
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    tokio::select! {
+                        result = &mut operation => panic!("operation ended before READY (success: {})", result.is_ok()),
+                        _ = async {
+                            while !observations.sudo_ready.load(Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(1)).await;
+                            }
+                        } => {}
+                    }
+                }).await.unwrap();
+            }
+            run_with_optional_timeout(
+                Some(Duration::from_millis(500)),
+                "COMMAND_TIMEOUT",
+                "test deadline",
+                &mut operation,
+            )
+            .await
+            .err()
+            .unwrap()
+        };
         assert_eq!(error.code, "COMMAND_TIMEOUT");
         if mode == "stall-ready" {
             assert!(

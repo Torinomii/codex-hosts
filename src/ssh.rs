@@ -1432,7 +1432,7 @@ async fn authenticate(
 ) -> Result<Option<String>, RemoteFailure> {
     match host.ssh_auth {
         SshAuth::Password => {
-            let password = credentials::load(host.id, CredentialKind::Password)
+            let password = credentials::load(host.id, credentials::login_password_kind(host))
                 .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?
                 .ok_or_else(|| {
                     RemoteFailure::new(

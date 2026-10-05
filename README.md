@@ -23,11 +23,23 @@
 - SSH host-key pinning with explicit user confirmation.
 - Verified SSH jump-host chains.
 - Single-host command execution.
+- Explicit sudo / su execution with account-bound saved passwords and independent password-supply permissions.
+- Optional per-call SSH approval with full command details and batch review.
 - Concurrent commands over one SSH connection.
 - Multi-host SSH / Telnet probing and execution.
 - Memory-only temporary secrets for API keys, tokens, and other values that should not be exposed to Codex.
 - An MCP server with risk-annotated tools, plus a Codex Skill for host lookup, connection, authentication, and command execution.
 - Per-host authentication persistence: keep the session while Codex runs (proposed for new hosts and confirmed on the first save), re-authenticate on every operation, or drop it after idle time.
+
+## What's new in 0.3.3
+
+- Sudo / su: `exec_sudo` and `exec_su` run an absolute program with exact arguments as an explicitly chosen user. Their independent Advanced switches authorize saved-password supply; passwordless execution still works with them off. Passwords stay bound to their accounts and never enter tool parameters.
+- Editor: sudo/su use the same form rows and checkboxes as other Advanced options. Optional account passwords are collapsed by default; login fields are not duplicated, and no execution target or dedicated sudo/su test is saved. Changing an account never transfers its saved password to another user.
+- Call approval: an optional per-host switch asks before each SSH call, including probes, user switches and batches. Blue dialogs show exact commands and inputs, full details, expiry and decision feedback; bulk buttons apply only to the displayed batch, and retained connections never reuse approval.
+- Temporary secrets: each field has its own approval switch, enabled by default. A run needs approval if any referenced field requires it; otherwise it starts directly or waits for the current local child to finish. Saving or clearing fields revokes waiting runs.
+- Skill: updated sudo/su and authorization-dialog guidance, including passwordless paths, explicit execution users and failure handling. Ordinary commands and script-internal sudo/su do not gain transparent password supply.
+- Credential safety: login-password records rotate when the account changes, so in-flight sudo/su calls cannot read another account's new password. Legacy migration removes the old slot, and deletion clears it too.
+- Installation: source and Release installs now use symbolic links only. The step-by-step script checks the environment, asks before compiling/installing, and offers to update old copies or wrong links with backups.
 
 ## What's new in 0.3.1
 
@@ -68,7 +80,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
-`tool_timeout_sec` is only a ceiling; each call carries its own timeout. If you never use blocking waits for long jobs you can leave Codex's default.
+`tool_timeout_sec` is only a ceiling; each call carries its own timeout, which must stay below it. With Codex's default (300 s), a command that outlives it keeps running until its own timeout (10 minutes unless set), and later calls to that host wait for it unless the host keeps its session.
 
 Codex runs `probe` and `batch_probe` without asking, because they are marked read-only: they only run `hostname`, and letting them run unattended (and in parallel) is what makes pre-authenticating a host that keeps its session useful. They still connect and authenticate, so a hardware key will ask for a touch. If you would rather confirm each one, tell Codex so:
 
@@ -85,7 +97,7 @@ Do not install only `SKILL.md` or the executable; keep the complete checkout or 
 You can also ask Codex to install it:
 
 ```text
-Clone https://github.com/Torinomii/codex-hosts.git to a stable directory, run cargo build --locked --release, then run scripts/install-local-skill.ps1 from the checkout.
+Clone https://github.com/Torinomii/codex-hosts.git to a stable directory and run scripts/install-local-skill.ps1. Let it check the build environment, then ask me before compiling, installing links or replacing old paths.
 Confirm that the installed codex-hosts Skill directory is one symbolic link and its executable resolves to the release build; register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the checkout in place.
 ```
 
@@ -97,11 +109,15 @@ Download `codex-hosts-windows-x86_64.zip` from the [Releases page](https://githu
 pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
 ```
 
-Keep the extracted directory in place because the installed Skill directory links to it.
+The ZIP includes the program, the complete Skill and both `install-local-skill.ps1` and `install.cmd`. Double-click `install.cmd` for the same guided flow; it tells you if PowerShell 7.2+ is missing. Release installation does not need Rust or Visual Studio. After environment checks, confirm the installation path and any proposed replacement of an old copy, stale link or executable path.
+
+Keep the extracted directory in place because the installed Skill directory links to it. Releases after 0.3.1 also carry `codex-hosts-windows-x86_64.zip.sha256`; compare it with `(Get-FileHash .\codex-hosts-windows-x86_64.zip).Hash` before extracting.
 
 ### Build from source
 
-Source builds require Rust 1.92 or newer and the MSVC toolchain:
+The recommended entry point is `pwsh -NoProfile -File .\scripts\install-local-skill.ps1` (or `scripts\install.cmd`). It checks PowerShell 7.2+, Rust 1.92+, the x86_64 MSVC toolchain and Windows SDK, then asks whether to compile and whether to install symbolic links. Missing tools are explained, not installed automatically. A guided build writes `target\x86_64-pc-windows-msvc\release\codex-hosts.exe`.
+
+You can still compile manually with Rust 1.92+ and the MSVC toolchain:
 
 ```powershell
 git clone https://github.com/Torinomii/codex-hosts.git
@@ -115,17 +131,21 @@ The executable is created at:
 target\release\codex-hosts.exe
 ```
 
-After the build completes, run the linked installation command below.
+After a manual build, run the linked installation command below with `-SkipBuild`; it prefers an existing guided build, then falls back to `target\release\codex-hosts.exe`.
 
 ### Link a local source checkout
 
 When developing from a stable local checkout, install symbolic links instead of copying after every build:
 
 ```powershell
-pwsh -NoProfile -File .\scripts\install-local-skill.ps1
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1 -SkipBuild
 ```
 
-The script links the installed `codex-hosts` directory to `skill\codex-hosts` as one unit. The source Skill's `bin\codex-hosts.exe` links to `target\release\codex-hosts.exe`, so rebuilding updates the installed executable without reinstalling. It validates all sources before replacing an existing installation, verifies the final targets, and rolls back if installation fails. Run it again at any time to verify the same layout. Windows must permit symbolic-link creation for the current user.
+The script links the installed `codex-hosts` directory to `skill\codex-hosts` as one unit. The source Skill's `bin\codex-hosts.exe` links to the selected build, so rebuilding that target updates the executable without copying. It shows old/new paths and asks before replacing copied files/directories, wrong links or dangling links. Old contents remain in adjacent `.codex-hosts.backup-*` paths; a failed installation attempts to restore both links. Correct links are left unchanged. Keep the checkout or extracted package in place; after moving it, rerun the script and confirm the new targets.
+
+Windows must allow symbolic-link creation. If the check fails, enable Developer Mode yourself or run an elevated PowerShell, then retry. The script never changes system settings, stops applications or falls back to copying. If a running executable is locked, close it yourself when convenient before rebuilding.
+
+Use `-CodexHome <directory>` to override `CODEX_HOME` / `%USERPROFILE%\.codex` (for example, `-CodexHome "$env:USERPROFILE\.agents"` installs under `.agents\skills`). Automation can use `-NonInteractive -Build -Install`, or `-NonInteractive -SkipBuild -Install` with an existing build; replacement additionally requires `-ReplaceExisting`. `-SkipInstall` builds without installing. Without explicit approval, prompts default to No.
 
 The same installer also supports a retained, locally prepared distribution ZIP with `-ReleasePackage`.
 
@@ -234,7 +254,9 @@ While a session is kept, later Codex commands on that host run without re-authen
 
 These values live only in the current `codex-hosts` process memory. They are not stored in Windows Credential Manager and are not returned to Codex.
 
-Each field has a Call approval switch, enabled by default, with a blue On state and a neutral Off state. If any field used by a program requires approval, a blue dialog inside the temporary-secret editor asks before injecting the values into its environment. Its top buttons decide only this run; clicking the command opens full details with paged text and full-text copying. Back or Escape in details makes no decision. Switching off approval for all referenced fields allows direct execution.
+Each field has a Call approval checkbox matching the main interface, enabled by default. Field names, masked values and approval controls share aligned columns; narrow windows stack them. If any field used by a program requires approval, a blue dialog inside the temporary-secret editor asks before injecting the values into its environment. Its top buttons decide only this run; clicking the command opens full details with paged text and full-text copying. Back or Escape in details makes no decision. Switching off approval for all referenced fields allows direct execution.
+
+**Delete all** asks for confirmation before removing every field, saved value and unsaved draft. Waiting operations are cancelled; running programs are not stopped. Per-field Clear and `temporary_secrets_clear` still clear values without removing fields.
 
 They expire when the `codex-hosts` tray application exits, the user signs out, or the system restarts. Codex starting or stopping does not affect them.
 
@@ -391,12 +413,12 @@ Codex talks to `codex-hosts.exe --mcp` over stdio. Every tool returns the same J
 
 | Tool | Purpose |
 | --- | --- |
-| `list_hosts` | Saved hosts with non-secret details, trust state, `auth_persistence`, `max_channels`, `remote_env` |
+| `list_hosts` | Saved hosts with non-secret details, trust state, `auth_persistence`, `require_call_approval`, sudo/su supply permissions, `max_channels`, `remote_env` |
 | `agent_identities`, `fido_identities` | Public identity details of loaded Agent keys and FIDO handles |
 | `probe`, `batch_probe` | Authenticate and run `hostname`; surface unknown or changed host keys |
 | `exec`, `exec_stdin`, `exec_many`, `batch_exec` | Run commands; `exec_stdin` is separate because program text on stdin is opaque to review |
-| `exec_sudo` | Execute an absolute program with argv as root or another user on an SSH host; uses the current user's SSH login password when password supply is allowed |
-| `exec_su` | Execute an absolute program as a target user using su; passwords are optional when the remote policy allows |
+| `exec_sudo` | Execute an absolute program with argv as the explicitly selected `user` on an SSH host; ordinary sudo uses the current user's SSH login password when supply is allowed |
+| `exec_su` | Execute an absolute program as the explicitly selected target `user`; passwords are optional when the remote policy allows |
 | `disconnect` | Drop sessions kept for hosts that opted in |
 | `open_host_editor` | Open the editor window prefilled with non-secret details, or to confirm a reported host key |
 | `temporary_secrets_open`, `_status`, `_run`, `_clear` | Memory-only secrets held by the tray application |
@@ -405,9 +427,13 @@ Parameters never contain a password, passphrase, or PIN; the editor collects tho
 
 **Approve each Codex call** in Advanced settings defaults off for SSH hosts. When enabled on a target or jump host, a blue dialog reviews the call's hosts and commands before connecting. One approval covers that Codex call from launch to completion, including all its batch hosts and commands; the next call asks again, even on a retained connection. Top **Allow all / Reject all** buttons decide only the currently displayed batch of waiting calls. Later requests wait for **View next batch**. Click a command for full details, with separate execution and jump hosts, exact commands, stdin, and sudo user when applicable; its top buttons decide that entire call. Long text supports paging and full-text copying. Back or Escape in details makes no decision. The dialog shows counts, an expiry countdown, and decision feedback. Allow buttons are red and reject buttons white.
 
-**Allow sudo passwords** in **Advanced** authorizes automatic saved-password supply. Passwordless or cached authentication works with the switch off; a password request then returns `SUDO_AUTO_AUTH_DISABLED` without reading or sending a password for that request. Codex must choose the execution user on each call: `exec_sudo` requires `alias`, an absolute `program` and `user`, with optional exact `args` and timeouts. To execute as root, pass `"user":"root"`. There is no saved default target. Advanced has separate sudo and su sections. The sudo section shows the current SSH login user as a read-only identity: password logins reuse its login password; key/Agent logins can supply that same user's system password in one masked row. There is no sudo authentication-user selector. Other accounts are listed one per row in the su section. Key/Agent credentials and another user's login password are never substituted. `rootpw`, `targetpw` and `runaspw` use the actual authentication prompt's username. Blank keeps a saved password; clear/delete is explicit; renaming deletes the old secret and permits an optional replacement. **Save and test sudo** asks for a temporary target, initially root, then runs `/usr/bin/id`; cancelling saves and executes nothing. No raw command, password, business stdin or automatic retry is accepted. See [sudo.md](skill/codex-hosts/references/sudo.md) for the shell-launcher and TTY/PAM limits.
+SSH call approval, temporary-secret approval and sudo/su password supply are independent. Waiting reviews expire after five minutes; approval feedback does not mean the command succeeded. See [approvals.md](skill/codex-hosts/references/approvals.md) for dialog behavior and failure handling.
 
-**Allow su passwords** in **Advanced** authorizes password supply independently of sudo; passwordless execution works with this switch off, while a password request returns `SU_AUTO_AUTH_DISABLED`. `exec_su` likewise requires a per-call `user`, absolute `program`, and optional exact `args` and timeouts. The su section manages optional target-user passwords, one user per row. The current login user's password is entered once in the row above; the same account password can be used for su when su supply is allowed. Remote passwordless paths, including root-to-user when allowed, require no record and never load/send a password. **Save and test su** asks for a temporary target, initially blank; any valid username is allowed and the target is not stored. Requires util-linux `/usr/bin/su`, `/usr/bin/env`, `/bin/sh` and the standard Linux-PAM prompt, without PTY or business stdin. Old JSON defaults are ignored while saved password slots remain; older calls omitting `user` fail without execution. See [su.md](skill/codex-hosts/references/su.md).
+**Allow saved passwords for sudo** in **Advanced** authorizes automatic saved-password supply. Passwordless or cached authentication works with the switch off; a password request then returns `SUDO_AUTO_AUTH_DISABLED` without reading or sending a password for that request. Codex must choose the execution user on each call: `exec_sudo` requires `alias`, an absolute `program` and `user`, with optional exact `args` and timeouts. To execute as root, pass `"user":"root"`. There is no saved default target. The sudo/su switches use the same rows and checkboxes as other options. Password logins reuse the SSH login password without another login row. Key/Agent logins, or accounts with an existing override, can expand **Separate system password (optional)** when supply is enabled. **Other account passwords (optional)** manages additional accounts. Key/Agent credentials and another user's login password are never substituted. `rootpw`, `targetpw` and `runaspw` use the actual authentication prompt's username. Blank keeps a saved password; removing a separate password still permits eligible login-password reuse. Renaming deletes the old secret and permits an optional replacement. There are no dedicated sudo/su save-and-test buttons; ordinary connection testing is unchanged. No raw command, password, business stdin or automatic retry is accepted. See [sudo.md](skill/codex-hosts/references/sudo.md) for the shell-launcher and TTY/PAM limits.
+
+**Allow saved passwords for su** in **Advanced** authorizes password supply independently of sudo; passwordless execution works with this switch off, while a password request returns `SU_AUTO_AUTH_DISABLED`. `exec_su` likewise requires a per-call `user`, absolute `program`, and optional exact `args` and timeouts. Optional target-user passwords are managed in the collapsed **Other account passwords** area, one user per row. The same account password can be used for su when su supply is allowed; login credentials need not be entered twice. Remote passwordless paths, including root-to-user when allowed, require no record and never load/send a password. Requires util-linux `/usr/bin/su`, `/usr/bin/env`, `/bin/sh` and the standard Linux-PAM prompt, without PTY or business stdin. Old JSON defaults are ignored while saved password slots remain; older calls omitting `user` fail without execution. See [su.md](skill/codex-hosts/references/su.md).
+
+These tools handle only the outer sudo/su authentication. Ordinary `exec` / `exec_stdin` and sudo/su inside an already-started script do not receive automatic password supply; an inner failure does not trigger elevation of the whole script or automatic replay.
 
 Authentication arguments to `open_host_editor` use stable names: `password`; `private-key` / `private_key` for an ordinary private-key file or a FIDO handle (`fido-handle` is also accepted); `ssh-agent` / `ssh_agent` for Windows OpenSSH Agent or Pageant.
 

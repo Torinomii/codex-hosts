@@ -18,7 +18,7 @@ mod dialogs;
 mod host_form;
 mod host_list;
 mod status;
-mod theme;
+pub(crate) mod theme;
 mod toolbar;
 
 pub(crate) use theme::configure_fonts;
@@ -85,13 +85,6 @@ enum PendingAction {
     Save,
     Test,
     TestAll,
-    TestPrivilege { su: bool, target: String },
-}
-
-struct PrivilegeTestPrompt {
-    host_id: Uuid,
-    su: bool,
-    target: String,
 }
 
 #[derive(Default)]
@@ -136,7 +129,7 @@ enum PasswordMode {
 impl HostEditor {
     fn load(profile: HostProfile) -> Self {
         let (saved_password_mode, password_read_error) =
-            match credentials::load(profile.id, CredentialKind::Password) {
+            match credentials::load(profile.id, credentials::login_password_kind(&profile)) {
                 Ok(Some(password)) => (
                     Some(if password.is_empty() {
                         PasswordMode::NoPassword
@@ -413,8 +406,6 @@ struct ImportCleanupPrompt {
 enum EditorAction {
     Save,
     Test,
-    TestSudo,
-    TestSu,
     CancelCodex,
     BrowsePrivateKey,
     DiscoverFido,
@@ -448,8 +439,6 @@ pub struct HostsApp {
     editor: Option<HostEditor>,
     status: StatusMessage,
     test_operations: HashMap<Uuid, TestOperation>,
-    sudo_test: Option<(Uuid, TestOperation)>,
-    privilege_test_prompt: Option<PrivilegeTestPrompt>,
     pending_tests: VecDeque<Uuid>,
     test_hosts_snapshot: Option<Arc<Vec<HostProfile>>>,
     test_states: HashMap<Uuid, HostTestState>,
@@ -619,8 +608,6 @@ impl HostsApp {
             editor,
             status,
             test_operations: HashMap::new(),
-            sudo_test: None,
-            privilege_test_prompt: None,
             pending_tests: VecDeque::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
@@ -732,9 +719,17 @@ impl HostsApp {
         let store_password = editor.should_store_password();
         let store_key_passphrase = editor.should_store_key_passphrase();
         let clear_login_password = editor.should_clear_login_password();
+        let mut profile = editor.profile.clone();
+        let old_password_kind = credentials::login_password_kind(&editor.original);
+        // Never reuse a host-wide slot for a new login identity, even when
+        // switching to key/Agent auth without saving a password yet.
+        if editor.login_user_changed() || (store_password && profile.login_password_id.is_none()) {
+            profile.login_password_id = Some(Uuid::new_v4());
+        }
+        let password_kind = credentials::login_password_kind(&profile);
         let credential_update = if store_password {
             Some((
-                CredentialKind::Password,
+                password_kind,
                 match editor.password_mode {
                     PasswordMode::Password => editor.password.clone(),
                     PasswordMode::NoPassword => Zeroizing::new(String::new()),
@@ -748,11 +743,10 @@ impl HostsApp {
         let (sudo_settings, mut sudo_updates) = editor
             .sudo_changes()
             .map_err(|key| self.catalog.text(key).to_owned())?;
-        if clear_login_password {
-            sudo_updates.push((CredentialKind::Password, None));
+        if clear_login_password || password_kind != old_password_kind {
+            sudo_updates.push((old_password_kind, None));
         }
         let id = editor.profile.id;
-        let mut profile = editor.profile.clone();
         profile.advanced.sudo = sudo_settings;
         profile.tags = normalize_tags(
             profile
@@ -928,7 +922,6 @@ impl HostsApp {
             PendingAction::Save => self.save(context),
             PendingAction::Test => self.start_test(),
             PendingAction::TestAll => self.start_all_tests(),
-            PendingAction::TestPrivilege { su, target } => self.start_privilege_test(su, target),
         }
     }
 
@@ -972,88 +965,8 @@ impl HostsApp {
         self.set_status_key("testing");
     }
 
-    fn open_privilege_test(&mut self, su: bool) {
-        if !self.tests_idle() {
-            return;
-        }
-        if let Some(editor) = &self.editor {
-            self.privilege_test_prompt = Some(PrivilegeTestPrompt {
-                host_id: editor.profile.id,
-                su,
-                target: if su { String::new() } else { "root".into() },
-            });
-        }
-    }
-
-    fn start_privilege_test(&mut self, su: bool, target: String) {
-        if self.sudo_test.is_some() || !self.tests_idle() {
-            return;
-        }
-        let Some(editor) = &self.editor else {
-            return;
-        };
-        let validate = if su {
-            crate::su::validate
-        } else {
-            crate::sudo::validate
-        };
-        let target = match validate(&editor.profile, "/usr/bin/id", &[], Some(&target)) {
-            Ok(target) => target,
-            Err(error) => {
-                self.set_status(StatusKind::Error, error.message);
-                return;
-            }
-        };
-        if self.ask_persistence_confirmation(PendingAction::TestPrivilege {
-            su,
-            target: target.clone(),
-        }) {
-            return;
-        }
-        if let Err(error) = self.persist_editor() {
-            self.set_status(StatusKind::Error, error);
-            return;
-        }
-        let Some(profile) = self.editor.as_ref().map(|editor| editor.profile.clone()) else {
-            return;
-        };
-        let hosts = self.store.hosts.clone();
-        let timeout = GUI_INTERACTIVE_TEST_TIMEOUT;
-        let (sender, receiver) = mpsc::channel();
-        let repaint = self.repaint_context.clone();
-        self.sudo_test = Some((
-            profile.id,
-            TestOperation {
-                receiver,
-                started_at: Instant::now(),
-                timeout,
-            },
-        ));
-        self.repaint_context.request_repaint_after(timeout);
-        self.set_status_key(if su { "su_testing" } else { "sudo_testing" });
-        thread::spawn(move || {
-            let execute = if su {
-                connection::execute_su
-            } else {
-                connection::execute_sudo
-            };
-            let result = execute(
-                &profile,
-                &hosts,
-                "/usr/bin/id",
-                &[],
-                Some(&target),
-                gui_test_limits(timeout),
-            );
-            if sender.send((Instant::now(), result)).is_ok() {
-                repaint.request_repaint();
-            }
-        });
-    }
-
     fn start_test_host(&mut self, id: Uuid) {
         if self.testing_all
-            || self.sudo_test.is_some()
             || self.test_operations.contains_key(&id)
             || self.pending_tests.contains(&id)
         {
@@ -1101,7 +1014,7 @@ impl HostsApp {
     }
 
     fn tests_idle(&self) -> bool {
-        self.test_operations.is_empty() && self.pending_tests.is_empty() && self.sudo_test.is_none()
+        self.test_operations.is_empty() && self.pending_tests.is_empty()
     }
 
     fn start_all_tests(&mut self) {
@@ -1142,64 +1055,6 @@ impl HostsApp {
     }
 
     fn poll_tests(&mut self) {
-        if let Some((id, operation)) = &self.sudo_test {
-            let id = *id;
-            let outcome = match operation.receiver.try_recv() {
-                Ok((_, result)) => Some(result),
-                Err(mpsc::TryRecvError::Disconnected) => Some(Err(RemoteFailure::new(
-                    "TEST_WORKER_STOPPED",
-                    "The user-switch test worker stopped unexpectedly.",
-                ))),
-                Err(mpsc::TryRecvError::Empty)
-                    if operation.started_at.elapsed() >= operation.timeout =>
-                {
-                    Some(Err(RemoteFailure::new(
-                        "TEST_TIMEOUT",
-                        "The user-switch test timed out; remote execution may have started.",
-                    )))
-                }
-                Err(mpsc::TryRecvError::Empty) => None,
-            };
-            if let Some(outcome) = outcome {
-                self.sudo_test = None;
-                match outcome {
-                    Ok(result) if result.exit_code == 0 => {
-                        let text = self.catalog.format(
-                            if result.su_user.is_some() {
-                                "su_test_ok"
-                            } else {
-                                "sudo_test_ok"
-                            },
-                            &[("result", result.stdout.trim())],
-                        );
-                        self.set_status(StatusKind::Success, text);
-                    }
-                    Ok(result) => self.set_status(
-                        StatusKind::Error,
-                        format!(
-                            "{}: exit {} — {}",
-                            if result.su_user.is_some() {
-                                "su"
-                            } else {
-                                "sudo"
-                            },
-                            result.exit_code,
-                            result.stderr
-                        ),
-                    ),
-                    Err(error) if matches!(error.code, "HOSTKEY_UNKNOWN" | "HOSTKEY_MISMATCH") => {
-                        self.finish_test(id, Err(error));
-                        if let Some(prompt) = &mut self.fingerprint_prompt {
-                            prompt.retry_test = false;
-                        }
-                    }
-                    Err(error) => self.set_status(
-                        StatusKind::Error,
-                        format!("{}: {}", error.code, error.message),
-                    ),
-                }
-            }
-        }
         let mut completed = Vec::new();
         for (&id, operation) in &self.test_operations {
             match operation.receiver.try_recv() {
@@ -1669,7 +1524,7 @@ impl HostsApp {
         let imported_ids = batch
             .hosts
             .iter()
-            .map(|item| item.profile.id)
+            .map(|item| item.profile.clone())
             .collect::<Vec<_>>();
         for item in &batch.hosts {
             if let Some((kind, secret)) = imported_credential(item)
@@ -2043,7 +1898,6 @@ impl HostsApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(panel_fill))
             .show(ui, |ui| self.editor_panel(ui, &context));
-        self.privilege_test_dialog(&context);
         self.show_dialogs(&context);
         self.toasts(&context);
         if let Some(temporary) = &mut self.temporary {
@@ -2126,9 +1980,9 @@ fn gui_test_limits(timeout: Duration) -> OperationLimits {
     }
 }
 
-fn rollback_import_credentials(ids: &[Uuid]) {
-    for id in ids {
-        let _ = credentials::delete_all(*id);
+fn rollback_import_credentials(hosts: &[HostProfile]) {
+    for host in hosts {
+        let _ = credentials::delete_host(host);
     }
 }
 
@@ -2158,7 +2012,10 @@ fn with_rollback_error(primary: String, rollback: Option<String>) -> String {
 fn imported_credential(item: &import::ImportedHost) -> Option<(CredentialKind, &str)> {
     match (item.profile.protocol, item.profile.ssh_auth) {
         (Protocol::Telnet, _) | (Protocol::Ssh, SshAuth::Password) => (!item.password.is_empty())
-            .then_some((CredentialKind::Password, item.password.as_str())),
+            .then_some((
+                credentials::login_password_kind(&item.profile),
+                item.password.as_str(),
+            )),
         (Protocol::Ssh, SshAuth::PrivateKey) => (!item.key_passphrase.is_empty())
             .then_some((CredentialKind::KeyPassphrase, item.key_passphrase.as_str())),
         (Protocol::Ssh, SshAuth::SshAgent) => None,
@@ -2324,8 +2181,6 @@ mod tests {
             editor: Some(editor),
             status: StatusMessage::info(""),
             test_operations: HashMap::new(),
-            sudo_test: None,
-            privilege_test_prompt: None,
             pending_tests: VecDeque::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),

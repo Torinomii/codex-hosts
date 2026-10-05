@@ -639,7 +639,7 @@ pub(crate) fn list_hosts(
         // the whole list; that host simply reports no usable secret.
         let has_required_secret = match (host.protocol, host.ssh_auth) {
             (Protocol::Ssh, SshAuth::PrivateKey | SshAuth::SshAgent) => true,
-            _ => credentials::has(host.id, CredentialKind::Password).unwrap_or(false),
+            _ => credentials::has(host.id, credentials::login_password_kind(host)).unwrap_or(false),
         };
         hosts.push(HostSummary {
             alias: host.alias.clone(),

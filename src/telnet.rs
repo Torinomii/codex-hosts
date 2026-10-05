@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use crate::credentials::{self, CredentialKind};
+use crate::credentials;
 use crate::model::HostProfile;
 use crate::ssh::{OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE};
 
@@ -82,7 +82,7 @@ async fn execute_async(
     command: &str,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
-    let password = credentials::load(profile.id, CredentialKind::Password)
+    let password = credentials::load(profile.id, credentials::login_password_kind(profile))
         .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?
         .ok_or_else(|| {
             RemoteFailure::new(

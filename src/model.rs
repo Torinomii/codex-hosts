@@ -251,6 +251,9 @@ pub struct HostProfile {
     pub address: String,
     pub port: u16,
     pub username: String,
+    /// Immutable credential record for this login identity. None reads legacy profiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_password_id: Option<Uuid>,
     pub protocol: Protocol,
     pub ssh_auth: SshAuth,
     pub private_key_path: String,
@@ -275,6 +278,7 @@ impl Default for HostProfile {
             address: String::new(),
             port: 22,
             username: String::new(),
+            login_password_id: None,
             protocol: Protocol::Ssh,
             ssh_auth: SshAuth::Password,
             private_key_path: String::new(),
@@ -341,6 +345,7 @@ impl HostProfile {
         self.address.trim() == other.address.trim()
             && self.port == other.port
             && self.username.trim() == other.username.trim()
+            && self.login_password_id == other.login_password_id
             && self.protocol == other.protocol
             && self.ssh_auth == other.ssh_auth
             && self.private_key_path.trim() == other.private_key_path.trim()

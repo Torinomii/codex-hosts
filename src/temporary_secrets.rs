@@ -395,6 +395,7 @@ pub(crate) struct SecretsApp {
     operations: VecDeque<Operation>,
     running: Option<Running>,
     new_name: String,
+    delete_all_prompt: Option<Vec<String>>,
     notice: Option<&'static str>,
     input_status: &'static str,
     context: egui::Context,
@@ -745,6 +746,7 @@ impl SecretsApp {
             operations: VecDeque::new(),
             running: None,
             new_name: String::new(),
+            delete_all_prompt: None,
             notice: None,
             input_status: "ok",
             context,
@@ -795,11 +797,12 @@ impl SecretsApp {
         let window = egui::Window::new(catalog.text("temp_title"))
             .id(egui::Id::new("temporary_secrets_window"))
             .open(&mut open)
-            .enabled(!approval_pending && !ssh_pending)
+            .enabled(!approval_pending && !ssh_pending && self.delete_all_prompt.is_none())
             .collapsible(false)
             .resizable(true)
-            .default_width(760.0)
-            .min_width(710.0)
+            .default_width((context.content_rect().width() - 56.0).min(760.0))
+            .max_width((context.content_rect().width() - 56.0).max(280.0))
+            .min_width(280.0)
             .min_height(320.0)
             .frame(
                 egui::Frame::window(&context.global_style()).inner_margin(egui::Margin::same(18)),
@@ -810,12 +813,16 @@ impl SecretsApp {
         self.visible = open;
         if let Some(window) = window
             && !ssh_pending
+            && self.delete_all_prompt.is_none()
         {
             self.show_approval(context, window.response.rect);
         } else if ssh_pending {
             self.approval_ready_at = context.input(|input| input.time) + 0.25;
         }
         self.ssh_approvals.show(context, catalog);
+        if !ssh_pending {
+            self.show_delete_all(context);
+        }
         if !approval_pending && !ssh_pending {
             self.feedback.show(context, "temporary_feedback");
         }
@@ -1157,43 +1164,7 @@ impl SecretsApp {
                 .color(ui.visuals().weak_text_color()),
         );
         ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            let name_width = (ui.available_width() - 224.0).max(220.0);
-            ui.add_sized(
-                [name_width, 34.0],
-                egui::TextEdit::singleline(&mut self.new_name)
-                    .hint_text(self.catalog.text("temp_name_hint"))
-                    .desired_width(name_width)
-                    .char_limit(256),
-            );
-            if ui
-                .add_sized(
-                    [104.0, 34.0],
-                    egui::Button::new(self.catalog.text("temp_add")),
-                )
-                .clicked()
-            {
-                match self.vault.request(std::slice::from_ref(&self.new_name)) {
-                    Ok(()) => {
-                        self.new_name.clear();
-                        self.notice = None;
-                        self.input_status = "ok";
-                    }
-                    Err(_) => self.notice = Some("temp_invalid_field"),
-                }
-            }
-            if ui
-                .add_sized(
-                    [104.0, 34.0],
-                    egui::Button::new(self.catalog.text("temp_clear_all")),
-                )
-                .clicked()
-            {
-                let _ = self.vault.clear(&[]);
-                self.input_status = "ok";
-                self.cancel_pending();
-            }
-        });
+        self.field_toolbar(ui);
         if let Some(notice) = self.notice {
             ui.colored_label(ui.visuals().warn_fg_color, self.catalog.text(notice));
         }
@@ -1203,182 +1174,7 @@ impl SecretsApp {
             .auto_shrink([false, true])
             .max_height((context.content_rect().height() - 240.0).clamp(120.0, 460.0))
             .show(ui, |ui| {
-                egui::Frame::group(ui.style())
-                    .inner_margin(egui::Margin::same(18))
-                    .show(ui, |ui| {
-                        let secret_width =
-                            (ui.available_width() - 160.0 - 24.0 - 104.0 - 24.0).max(320.0);
-                        // Grid cells are vertically centered by egui; explicit top-aligned rows
-                        // keep short field names aligned with the first line of multiline inputs.
-                        ui.spacing_mut().item_spacing = egui::vec2(24.0, 14.0);
-                        ui.vertical(|ui| {
-                            ui.horizontal_top(|ui| {
-                                ui.add_sized(
-                                    [160.0, 24.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(self.catalog.text("temp_field"))
-                                            .strong(),
-                                    )
-                                    .wrap()
-                                    .halign(egui::Align::Min),
-                                );
-                                ui.add_sized(
-                                    [secret_width, 24.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(self.catalog.text("temp_secret"))
-                                            .strong(),
-                                    )
-                                    .wrap()
-                                    .halign(egui::Align::Min),
-                                );
-                                ui.add_sized(
-                                    [104.0, 24.0],
-                                    egui::Label::new(
-                                        egui::RichText::new(
-                                            self.catalog.text("temp_field_approval"),
-                                        )
-                                        .strong(),
-                                    )
-                                    .wrap()
-                                    .halign(egui::Align::Min),
-                                );
-                            });
-                            let mut input_status_change = None;
-                            for field in &mut self.vault.fields {
-                                ui.horizontal_top(|ui| {
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(160.0, 24.0),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            ui.set_width(160.0);
-                                            ui.add(
-                                                egui::Label::new(
-                                                    egui::RichText::new(&field.name).strong(),
-                                                )
-                                                .halign(egui::Align::Min)
-                                                .wrap(),
-                                            );
-                                        },
-                                    );
-                                    // TextEdit's desired_width is clamped to the Grid's available width.
-                                    // Reserve the entire column explicitly before measuring the multiline edit.
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(secret_width, 88.0),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            ui.set_width(secret_width);
-                                            let mut output =
-                                                egui::TextEdit::multiline(&mut *field.draft)
-                                                    .id(egui::Id::new((
-                                                        "temporary_secret_input",
-                                                        &field.name,
-                                                    )))
-                                                    .password(true)
-                                                    .desired_rows(3)
-                                                    .desired_width(secret_width)
-                                                    .min_size(egui::vec2(secret_width, 48.0))
-                                                    .char_limit(MAX_VALUE_BYTES)
-                                                    .hint_text(self.catalog.text(
-                                                        if field.value.is_some() {
-                                                            "temp_replace_hint"
-                                                        } else {
-                                                            "temp_empty_hint"
-                                                        },
-                                                    ))
-                                                    .show(ui);
-                                            if output.response.changed() {
-                                                input_status_change = Some("ok");
-                                            }
-                                            #[cfg(test)]
-                                            context.data_mut(|data| {
-                                                data.insert_temp(
-                                                    egui::Id::new((
-                                                        "temporary_layout_input",
-                                                        &field.name,
-                                                    )),
-                                                    output.response.rect,
-                                                )
-                                            });
-                                            output.state.clear_undoer();
-                                            output.state.store(&context, output.response.id);
-                                            ui.add_space(4.0);
-                                            ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-                                            ui.horizontal(|ui| {
-                                                if ui
-                                                    .add_sized(
-                                                        [80.0, 34.0],
-                                                        egui::Button::new(
-                                                            self.catalog.text("temp_save"),
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    match field.save() {
-                                                        Ok(()) => {
-                                                            self.notice = None;
-                                                            input_status_change = Some("saved");
-                                                        }
-                                                        Err(_) => {
-                                                            self.notice = Some("temp_invalid_value")
-                                                        }
-                                                    }
-                                                }
-                                                if ui
-                                                    .add_sized(
-                                                        [80.0, 34.0],
-                                                        egui::Button::new(
-                                                            self.catalog.text("temp_clear"),
-                                                        ),
-                                                    )
-                                                    .clicked()
-                                                {
-                                                    field.clear();
-                                                    input_status_change = Some("ok");
-                                                }
-                                                ui.label(
-                                                    egui::RichText::new(self.catalog.text(
-                                                        if field.value.is_some() {
-                                                            "temp_ready"
-                                                        } else {
-                                                            "temp_missing"
-                                                        },
-                                                    ))
-                                                    .color(ui.visuals().weak_text_color()),
-                                                );
-                                            });
-                                        },
-                                    );
-                                    ui.allocate_ui_with_layout(
-                                        egui::vec2(104.0, 34.0),
-                                        egui::Layout::top_down(egui::Align::Min),
-                                        |ui| {
-                                            let response = crate::approval_ui::toggle(
-                                                ui,
-                                                &self.catalog,
-                                                &mut field.requires_approval,
-                                            );
-                                            if response.changed() {
-                                                input_status_change = Some("ok");
-                                            }
-                                            #[cfg(test)]
-                                            context.data_mut(|data| {
-                                                data.insert_temp(
-                                                    egui::Id::new((
-                                                        "temporary_layout_approval",
-                                                        &field.name,
-                                                    )),
-                                                    response.rect,
-                                                )
-                                            });
-                                        },
-                                    );
-                                });
-                            }
-                            if let Some(status) = input_status_change {
-                                self.record_input_status(status);
-                            }
-                        });
-                    });
+                self.field_rows(ui);
                 if !self.operations.is_empty() {
                     ui.separator();
                     ui.strong(self.catalog.text("temp_operations"));
@@ -1748,6 +1544,7 @@ mod tests {
             operations: VecDeque::new(),
             running: None,
             new_name: String::new(),
+            delete_all_prompt: None,
             notice: None,
             input_status: "ok",
             context: egui::Context::default(),
@@ -2184,99 +1981,105 @@ mod tests {
     #[test]
     fn secret_fields_keep_form_width_across_locales_and_frames() {
         for locale in ["en", "zh-CN", "zh-TW", "ja"] {
-            for width in [774.0, 820.0, 1040.0] {
-                let mut app = app();
-                app.vault = Vault::default();
-                app.vault
-                    .request(&["0202".into(), "myproject-staging-qwen-apikey".into()])
-                    .unwrap();
-                app.visible = true;
-                let context = egui::Context::default();
-                crate::ui::configure_fonts(&context, locale);
-                let catalog = Catalog::for_locale(Some(locale));
-                for frame in 0..4 {
-                    let input = egui::RawInput {
-                        screen_rect: Some(egui::Rect::from_min_size(
-                            egui::Pos2::ZERO,
-                            egui::vec2(width, 760.0),
-                        )),
-                        time: Some(frame as f64 * 0.1),
-                        ..Default::default()
-                    };
-                    let output = context.run_ui(input, |ui| app.show(ui.ctx(), &catalog));
-                    // Capture this pass's actual TextEdit output: read_response can return the
-                    // previous pass's hit-test geometry after run_ui finishes.
-                    let first = context
-                        .data(|data| {
-                            data.get_temp::<egui::Rect>(egui::Id::new((
-                                "temporary_layout_input",
-                                "0202",
-                            )))
-                        })
-                        .unwrap();
-                    let second = context
-                        .data(|data| {
-                            data.get_temp::<egui::Rect>(egui::Id::new((
-                                "temporary_layout_input",
-                                "myproject-staging-qwen-apikey",
-                            )))
-                        })
-                        .unwrap();
-                    let approval = context
-                        .data(|data| {
-                            data.get_temp::<egui::Rect>(egui::Id::new((
-                                "temporary_layout_approval",
-                                "0202",
-                            )))
-                        })
-                        .unwrap();
-                    assert!(approval.left() >= first.right() + 23.0);
-                    assert!(approval.width() >= 104.0 && approval.height() >= 34.0);
-                    assert!(
-                        approval.right() <= width,
-                        "approval column must fit: {approval:?}"
-                    );
-                    assert!(
-                        first.width() >= 320.0,
-                        "{locale} width={width} frame={frame}: {first:?}"
-                    );
-                    assert!(
-                        first.height() >= 48.0,
-                        "{locale} frame={frame} rect={first:?}"
-                    );
-                    assert!((first.left() - second.left()).abs() < 1.0);
-                    assert!((first.width() - second.width()).abs() < 1.0);
-                    assert!(
-                        second.top() >= first.bottom() + 34.0,
-                        "row controls must not overlap the next input"
-                    );
-                    if frame > 0 {
-                        fn label_position(shape: &egui::Shape) -> Option<egui::Pos2> {
-                            match shape {
-                                egui::Shape::Text(text) if text.galley.job.text == "0202" => {
-                                    Some(text.pos + text.galley.rect.min.to_vec2())
+            for dark in [false, true] {
+                for width in [380.0, 540.0, 774.0, 820.0, 1040.0] {
+                    let mut app = app();
+                    app.vault = Vault::default();
+                    let names = [
+                        "0202",
+                        "myproject-staging-qwen-apikey-with-a-long-name",
+                        "项目测试用的长字段名称用于检查自动换行与左对齐",
+                    ];
+                    app.vault.request(&names.map(str::to_owned)).unwrap();
+                    app.vault.fields[0]
+                        .draft
+                        .push_str("plaintext-layout-sentinel");
+                    app.catalog = Catalog::for_locale(Some(locale));
+                    let context = egui::Context::default();
+                    context.set_visuals(if dark {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    });
+                    crate::ui::configure_fonts(&context, locale);
+                    for frame in 0..4 {
+                        let output = context.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(width, 2400.0),
+                                )),
+                                time: Some(frame as f64 * 0.1),
+                                ..Default::default()
+                            },
+                            |ui| {
+                                ui.set_width(width);
+                                app.field_rows(ui);
+                            },
+                        );
+                        let rect = |kind, name| {
+                            context
+                                .data(|d| d.get_temp::<egui::Rect>(egui::Id::new((kind, name))))
+                                .unwrap()
+                        };
+                        let wide = width - 26.0 >= 600.0;
+                        let mut previous = None::<egui::Rect>;
+                        let first = rect("temporary_layout_input", names[0]);
+                        for name in names {
+                            let label = rect("temporary_layout_name", name);
+                            let input = rect("temporary_layout_input", name);
+                            let approval = rect("temporary_layout_approval", name);
+                            for bounds in [label, input, approval] {
+                                assert!(
+                                    bounds.left() >= 0.0 && bounds.right() <= width + 1.0,
+                                    "{locale} {dark} {width}: {bounds:?}"
+                                );
+                            }
+                            assert!(input.height() >= 64.0 && input.width() >= 220.0);
+                            assert!(
+                                (input.left() - first.left()).abs() < 1.0
+                                    && (input.width() - first.width()).abs() < 1.0
+                            );
+                            if let Some(previous) = previous {
+                                assert!(label.top() > previous.bottom());
+                            }
+                            if wide {
+                                for (bounds, key) in [
+                                    (label, "temp_field"),
+                                    (input, "temp_secret"),
+                                    (approval, "temp_field_approval"),
+                                ] {
+                                    assert!(
+                                        (bounds.left() - rect("temporary_header", key).left())
+                                            .abs()
+                                            < 1.0,
+                                        "{locale} {width}: header alignment {key}"
+                                    );
                                 }
-                                egui::Shape::Vec(shapes) => shapes.iter().find_map(label_position),
-                                _ => None,
+                                assert!(
+                                    label.right() < input.left() && input.right() < approval.left()
+                                );
+                                assert!((label.top() - input.top()).abs() < 2.0);
+                            } else {
+                                assert!((label.left() - input.left()).abs() < 1.0);
+                                assert!(
+                                    input.top() > label.bottom() && approval.top() > input.bottom()
+                                );
+                            }
+                            previous = Some(label.union(input).union(approval));
+                        }
+                        fn no_plaintext(shape: &egui::Shape) {
+                            match shape {
+                                egui::Shape::Text(text) => assert!(
+                                    !text.galley.job.text.contains("plaintext-layout-sentinel")
+                                ),
+                                egui::Shape::Vec(shapes) => shapes.iter().for_each(no_plaintext),
+                                _ => {}
                             }
                         }
-                        let label = output
-                            .shapes
-                            .iter()
-                            .find_map(|shape| label_position(&shape.shape))
-                            .expect("field label must actually be painted");
-                        assert!(
-                            (first.top() - label.y).abs() <= 8.0,
-                            "label must align with input top: {label:?}, {first:?}"
-                        );
-                        assert!(
-                            (first.left() - label.x - 184.0).abs() <= 8.0,
-                            "label must be left aligned in the 160px column"
-                        );
-                        assert!(
-                            first.right() <= width,
-                            "input must fit the viewport: {first:?}"
-                        );
+                        for shape in &output.shapes {
+                            no_plaintext(&shape.shape);
+                        }
                     }
                 }
             }
@@ -2639,51 +2442,208 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
-    fn field_approval_button_changes_only_its_row_and_has_a_distinct_enabled_color() {
+    fn field_approval_checkbox_changes_only_its_row_and_revokes_waiting_calls() {
         let mut app = app();
         app.vault.request(&["other-field".into()]).unwrap();
         app.visible = true;
         let context = egui::Context::default();
         crate::ui::configure_fonts(&context, "zh-CN");
         let catalog = Catalog::for_locale(Some("zh-CN"));
-        let frame = |app: &mut SecretsApp| {
-            approval_frame(app, &context, &catalog, egui::vec2(820.0, 620.0), vec![]).0
-        };
         for _ in 0..4 {
-            frame(&mut app);
+            approval_frame(
+                &mut app,
+                &context,
+                &catalog,
+                egui::vec2(820.0, 620.0),
+                vec![],
+            );
         }
         let rect = context
-            .data(|data| {
-                data.get_temp::<egui::Rect>(egui::Id::new((
+            .data(|d| {
+                d.get_temp::<egui::Rect>(egui::Id::new((
                     "temporary_layout_approval",
                     "project-local-qwen-apikey",
                 )))
             })
             .unwrap();
-        fn fill(shape: &egui::Shape, rect: egui::Rect) -> Option<egui::Color32> {
-            match shape {
-                egui::Shape::Rect(shape) if shape.rect == rect => Some(shape.fill),
-                egui::Shape::Vec(shapes) => shapes.iter().find_map(|shape| fill(shape, rect)),
-                _ => None,
-            }
-        }
-        let enabled = frame(&mut app)
-            .shapes
-            .iter()
-            .find_map(|shape| fill(&shape.shape, rect))
+        let standard = context.run_ui(egui::RawInput::default(), |ui| {
+            let response = ui.checkbox(&mut true, "");
+            context.data_mut(|d| d.insert_temp(egui::Id::new("standard_checkbox"), response.rect));
+        });
+        assert!(!standard.shapes.is_empty());
+        let expected = context
+            .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("standard_checkbox")))
             .unwrap();
-        assert_eq!(enabled, egui::Color32::from_rgb(35, 98, 193));
+        assert_eq!(rect.size(), expected.size());
+        for _ in 0..3 {
+            approval_frame(
+                &mut app,
+                &context,
+                &catalog,
+                egui::vec2(820.0, 620.0),
+                vec![],
+            );
+        }
         approval_click(&mut app, &context, &catalog, rect.center());
         assert!(!app.vault.fields[0].requires_approval);
         assert!(app.vault.fields[1].requires_approval);
-        let disabled = frame(&mut app)
-            .shapes
-            .iter()
-            .find_map(|shape| fill(&shape.shape, rect))
-            .unwrap();
-        assert_ne!(enabled, disabled);
+        // Model a run queued behind an existing worker; the checkbox must revoke it.
+        app.operations.push_back(Operation {
+            execution: execution(),
+            requested: Instant::now(),
+            result: OperationStatus {
+                id: Uuid::new_v4(),
+                status: "queued".into(),
+                exit_code: None,
+            },
+        });
         approval_click(&mut app, &context, &catalog, rect.center());
         assert!(app.vault.fields[0].requires_approval);
+        assert!(app.vault.fields[1].requires_approval);
+        assert_eq!(app.operations[0].result.status, "cancelled");
+    }
+
+    #[test]
+    fn delete_all_removes_fields_and_drafts_revokes_waiters_but_keeps_running() {
+        let mut app = app();
+        let name = app.vault.fields[0].name.clone();
+        app.vault.fields[0]
+            .draft
+            .push_str("unsaved-delete-sentinel");
+        app.new_name = "unfinished-field".into();
+        let (sender, result) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let running_id = Uuid::new_v4();
+        app.running = Some(Running {
+            id: running_id,
+            cancel: cancel.clone(),
+            result,
+            worker: None,
+        });
+        for (id, status) in [
+            (running_id, "running"),
+            (Uuid::new_v4(), "queued"),
+            (Uuid::new_v4(), "pending"),
+        ] {
+            app.operations.push_back(Operation {
+                execution: execution(),
+                requested: Instant::now(),
+                result: OperationStatus {
+                    id,
+                    status: status.into(),
+                    exit_code: None,
+                },
+            });
+        }
+        app.delete_all_fields();
+        assert!(app.vault.fields.is_empty() && app.new_name.is_empty());
+        assert_eq!(app.operations[0].result.status, "running");
+        assert!(
+            app.operations
+                .iter()
+                .skip(1)
+                .all(|op| op.result.status == "cancelled")
+        );
+        assert_eq!(app.running.as_ref().unwrap().id, running_id);
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(app.response().fields.is_empty());
+        app.handle(Request::Declare { fields: vec![name] });
+        assert!(app.vault.fields[0].requires_approval);
+        assert!(app.vault.fields[0].value.is_none() && app.vault.fields[0].draft.is_empty());
+        assert_eq!(
+            app.handle(Request::Execute(execution())).code.as_deref(),
+            Some("SECRET_MISSING")
+        );
+        drop(sender);
+    }
+
+    #[test]
+    fn delete_all_requires_confirmation_and_cancel_preserves_values_in_every_locale() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let mut app = app();
+            app.visible = true;
+            let context = egui::Context::default();
+            crate::ui::configure_fonts(&context, locale);
+            let catalog = Catalog::for_locale(Some(locale));
+            for confirm in [false, true] {
+                warm_approval(&mut app, &context, &catalog);
+                let (button, enabled) = context
+                    .data(|d| {
+                        d.get_temp::<(egui::Rect, bool)>(egui::Id::new(
+                            "temporary_delete_all_button",
+                        ))
+                    })
+                    .unwrap();
+                assert!(enabled);
+                approval_click(&mut app, &context, &catalog, button.center());
+                assert!(app.delete_all_prompt.is_some());
+                // A late request must not replace the deletion confirmation with
+                // an approval dialog or start a process.
+                if confirm {
+                    app.handle(Request::Execute(execution()));
+                }
+                for _ in 0..4 {
+                    approval_frame(
+                        &mut app,
+                        &context,
+                        &catalog,
+                        egui::vec2(820.0, 620.0),
+                        vec![],
+                    );
+                }
+                assert_eq!(app.vault.fields.len(), 1);
+                let buttons = context
+                    .data(|d| {
+                        d.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new(
+                            "temporary_delete_buttons",
+                        ))
+                    })
+                    .unwrap();
+                approval_click(
+                    &mut app,
+                    &context,
+                    &catalog,
+                    if confirm { buttons.0 } else { buttons.1 }.center(),
+                );
+                assert!(app.delete_all_prompt.is_none());
+                if confirm {
+                    assert!(app.vault.fields.is_empty());
+                    assert_eq!(app.operations[0].result.status, "cancelled");
+                    assert!(app.running.is_none());
+                } else {
+                    assert_eq!(
+                        app.vault.fields[0].value.as_ref().unwrap().as_str(),
+                        "temporary-sentinel"
+                    );
+                }
+            }
+            warm_approval(&mut app, &context, &catalog);
+            let (button, enabled) = context
+                .data(|d| {
+                    d.get_temp::<(egui::Rect, bool)>(egui::Id::new("temporary_delete_all_button"))
+                })
+                .unwrap();
+            assert!(!enabled);
+            approval_click(&mut app, &context, &catalog, button.center());
+            assert!(app.delete_all_prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn changed_field_list_invalidates_delete_confirmation_and_mcp_clear_keeps_fields() {
+        let mut app = app();
+        app.delete_all_prompt = Some(app.vault.fields.iter().map(|f| f.name.clone()).collect());
+        app.handle(Request::Declare {
+            fields: vec!["new-arrival".into()],
+        });
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |_| app.show_delete_all(&context));
+        assert!(app.delete_all_prompt.is_none());
+        assert_eq!(app.notice, Some("temp_fields_changed"));
+        assert_eq!(app.vault.fields.len(), 2);
+        let response = app.handle(Request::Clear { fields: vec![] });
+        assert_eq!(response.fields.len(), 2);
+        assert!(response.fields.iter().all(|f| !f.ready));
     }
 
     #[test]
@@ -2892,3 +2852,5 @@ mod tests {
         assert_eq!(app.operations[1].result.status, "running");
     }
 }
+
+mod editor;

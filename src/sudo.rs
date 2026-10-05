@@ -189,7 +189,7 @@ pub fn login_password_available(profile: &HostProfile) -> bool {
     profile.protocol == Protocol::Ssh
         && profile.ssh_auth == SshAuth::Password
         && PasswordMethod::Sudo.allowed(profile)
-        && credentials::load(profile.id, CredentialKind::Password)
+        && credentials::load(profile.id, credentials::login_password_kind(profile))
             .ok()
             .flatten()
             .is_some_and(|password| !password.is_empty() && validate_password(&password).is_ok())
@@ -235,8 +235,8 @@ fn password_for_method_with<E>(
         && profile.ssh_auth == SshAuth::Password
         && username == profile.username.trim()
     {
-        let password =
-            load(CredentialKind::Password).map_err(|_| method.failure("read", username))?;
+        let password = load(credentials::login_password_kind(profile))
+            .map_err(|_| method.failure("read", username))?;
         if let Some(password) = password.filter(|password| !password.is_empty()) {
             validate_password(&password).map_err(|_| method.failure("invalid", username))?;
             return Ok(password);

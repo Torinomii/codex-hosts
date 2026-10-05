@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex Hosts"
-  short_description: "Saved SSH/Telnet hosts and memory-only secrets"
-  default_prompt: "Use $codex-hosts to run a command on a saved host, complete a host in its editor, or collect memory-only project secrets as field references."
+  short_description: "SSH/Telnet, sudo/su, approvals and memory-only secrets"
+  default_prompt: "Use $codex-hosts for saved-host commands, explicit sudo/su user switching, host editing, or memory-only secret field references. Respect the user's app approval dialogs and independent password-supply permissions; never handle password values in chat or tool arguments."

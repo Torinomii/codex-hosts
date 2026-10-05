@@ -23,11 +23,23 @@
 - SSH 主機指紋固定與使用者確認。
 - 支援已驗證的 SSH Jump Host / 跳板鏈。
 - 支援單一主機命令執行。
+- 支援明確指定的 sudo / su 執行，儲存密碼依帳號綁定，供密權限分別設定。
+- 支援依呼叫審批 SSH 操作，查看完整命令詳情並審批等待中的呼叫批次。
 - 支援在同一條 SSH 連線上並行執行多條命令。
 - 支援 SSH / Telnet 多主機批次探測與執行。
 - 支援僅存在於記憶體中的臨時秘密，可用於 API Key、Token 等不適合直接交給 Codex 的敏感參數。
 - 帶風險註解的 MCP 伺服器，加上一份 Codex Skill，涵蓋主機查找、連線、驗證與命令執行。
 - 依主機設定認證保持：Codex 工作階段期間保持（新建主機預選，首次儲存時確認）、每次操作重新認證，或閒置後斷開。
+
+## 0.3.3 更新內容
+
+- Sudo / su：`exec_sudo` 與 `exec_su` 以明確選擇的使用者執行絕對路徑程式及原樣參數。「進階」中的獨立開關只授權使用儲存密碼，關閉時仍可免密執行。密碼保持與帳號綁定，不進入工具參數。
+- 編輯器：sudo/su 使用與其他進階選項一致的表單列和核取方塊，選用帳號密碼預設摺疊；不重複登入輸入，不設定預設執行目標，也不再提供專用的 sudo/su 儲存測試按鈕。修改帳號不會把已有密碼轉移給另一使用者。
+- 呼叫審批：依主機設定的選用開關在每次 SSH 呼叫前要求確認，涵蓋探測、使用者切換與批次操作。藍色對話框提供完整命令、輸入、詳情、到期提示與決定回饋；批次按鈕只作用於目前展示的呼叫批次，保持連線不會重用審批。
+- 臨時秘密：每個欄位都有預設開啟的審批開關。引用欄位只要有一個要求審批，本次執行就需確認；全部關閉時直接執行，或等待目前本機子行程結束。儲存或清除欄位會撤銷等待中的執行。
+- Skill：更新 sudo/su 與授權對話框指引，說明免密路徑、明確的執行使用者與失敗處理。一般命令及腳本內部的 sudo/su 不會獲得透明自動供密。
+- 憑據安全：修改登入帳號時輪換密碼記錄，進行中的 sudo/su 呼叫無法讀取另一帳號的新密碼。舊版密碼移轉成功後清理舊槽，刪除密碼時也會清理移轉來源。
+- 安裝：原始碼與 Release 統一使用軟連結。分步指令碼檢查環境、詢問是否編譯與安裝；發現舊副本或錯誤連結時，提示更新路徑並保留備份。
 
 ## 0.3.1 更新內容
 
@@ -68,7 +80,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
-`tool_timeout_sec` 只是上限；每次呼叫都帶有自己的逾時。若從不使用阻塞等待處理長作業，可以保留 Codex 的預設值。
+`tool_timeout_sec` 只是上限；每次呼叫都帶有自己的逾時，且必須低於該上限。若保留 Codex 的預設值（300 秒），超過它的命令仍會執行到自身逾時（未指定時為 10 分鐘），不保持工作階段的主機的後續呼叫要等它結束。
 
 `probe` 與 `batch_probe` 標註為唯讀，Codex 會不經確認（且可平行）直接執行它們：它們只執行 `hostname`，而無人值守地預先驗證一台保持工作階段的主機正是這個設計的價值所在。它們仍會連線並驗證，因此硬體金鑰會要求觸碰。若希望每次都確認，可在 Codex 中這樣設定：
 
@@ -85,7 +97,7 @@ approval_mode = "prompt"
 也可以直接請 Codex 安裝：
 
 ```text
-將 https://github.com/Torinomii/codex-hosts.git 複製到固定目錄，執行 cargo build --locked --release，然後在原始碼目錄執行 scripts/install-local-skill.ps1。
+將 https://github.com/Torinomii/codex-hosts.git 複製到固定目錄，執行 scripts/install-local-skill.ps1 檢查編譯環境；編譯、安裝軟連結與替換舊路徑前都先讓我確認。
 確認已安裝的整個 codex-hosts Skill 目錄是單一符號連結、執行檔解析至發行版建置，依 SKILL.md 在 config.toml 中註冊 codex-hosts MCP 伺服器，並保留原始碼目錄。
 ```
 
@@ -97,11 +109,15 @@ approval_mode = "prompt"
 pwsh -NoProfile -File .\install-local-skill.ps1 -ReleasePackage
 ```
 
-安裝後的整個 Skill 目錄連結到解壓目錄，因此請保留該目錄。
+ZIP 預設包含程式、完整 Skill、`install-local-skill.ps1` 與 `install.cmd`。按兩下 `install.cmd` 可進入相同的分步流程，缺少 PowerShell 7.2+ 時會提供安裝提示。Release 安裝不需要 Rust 或 Visual Studio；環境檢查後確認安裝路徑，發現舊副本、過期連結或錯誤的程式路徑時，再確認更新覆寫。
+
+安裝後的整個 Skill 目錄連結到解壓目錄，因此請保留該目錄。0.3.1 之後的 Release 另附 `codex-hosts-windows-x86_64.zip.sha256`，解壓前請與 `(Get-FileHash .\codex-hosts-windows-x86_64.zip).Hash` 核對。
 
 ### 從原始碼建置
 
-需要 Rust 1.92 或更新版本以及 MSVC 工具鏈：
+建議執行 `pwsh -NoProfile -File .\scripts\install-local-skill.ps1`（也可按兩下 `scripts\install.cmd`）。指令碼自動檢查 PowerShell 7.2+、Rust 1.92+、x86_64 MSVC 工具鏈與 Windows SDK，再依序詢問是否開始編譯、是否安裝軟連結。缺少工具時提供指引，不會自動安裝。引導式編譯輸出為 `target\x86_64-pc-windows-msvc\release\codex-hosts.exe`。
+
+也可使用 Rust 1.92+ 與 MSVC 工具鏈手動編譯：
 
 ```powershell
 git clone https://github.com/Torinomii/codex-hosts.git
@@ -115,17 +131,21 @@ cargo build --locked --release
 target\release\codex-hosts.exe
 ```
 
-建置完成後，執行下方的連結安裝命令。
+手動建置後，執行下方的連結安裝命令並加上 `-SkipBuild`；指令碼優先使用已有的引導式編譯產物，否則使用 `target\release\codex-hosts.exe`。
 
 ### 連結本機原始碼目錄
 
 若在固定路徑的本機原始碼目錄中開發，可安裝軟連結，之後每次建置都不必再複製：
 
 ```powershell
-pwsh -NoProfile -File .\scripts\install-local-skill.ps1
+pwsh -NoProfile -File .\scripts\install-local-skill.ps1 -SkipBuild
 ```
 
-此指令碼會把已安裝的整個 `codex-hosts` 目錄連結到 `skill\codex-hosts`。原始碼 Skill 目錄內的 `bin\codex-hosts.exe` 連結到 `target\release\codex-hosts.exe`，因此重新建置後無須重新安裝。替換現有安裝前會驗證所有來源，安裝後會核對連結目標；若安裝失敗，則還原原有安裝。可隨時再次執行以驗證相同配置。目前的 Windows 使用者必須有建立符號連結的權限。
+指令碼將已安裝的 `codex-hosts` 目錄整體連結到 `skill\codex-hosts`，其中的 `bin\codex-hosts.exe` 再連結到所選建置產物；重新建置相同目標後無須複製。發現複製式檔案/目錄、錯誤或懸空連結時，會顯示舊、新路徑並詢問是否替換。原內容保留在相鄰的 `.codex-hosts.backup-*` 路徑中；安裝失敗時嘗試還原兩處連結。正確連結保持不變。請保留原始碼或解壓目錄；移動後重新執行指令碼並確認新目標。
+
+Windows 必須允許建立符號連結。檢查失敗時，請自行開啟「開發人員模式」或以系統管理員身分執行 PowerShell 後重試。指令碼不會修改系統設定、關閉應用程式或退回複製安裝；若執行中的程式被鎖定，請在方便時自行關閉後再編譯。
+
+可用 `-CodexHome <目錄>` 覆寫 `CODEX_HOME` / `%USERPROFILE%\.codex`（例如 `-CodexHome "$env:USERPROFILE\.agents"` 安裝到 `.agents\skills`）。自動化可用 `-NonInteractive -Build -Install`，已有建置產物則用 `-NonInteractive -SkipBuild -Install`；替換舊內容還須明確加上 `-ReplaceExisting`。`-SkipInstall` 表示只編譯不安裝，未明確同意的提示預設選擇否。
 
 從本機製作的發佈 ZIP 安裝時也使用相同指令碼，加上 `-ReleasePackage`，並保留解壓目錄。
 
@@ -234,7 +254,9 @@ SSH 主機指紋必須由使用者明確確認。
 
 這些值只保存在目前 `codex-hosts` 處理程序的記憶體中，不會儲存到 Windows 認證管理員，也不會傳回給 Codex。
 
-每個欄位右側都有「呼叫審批」滑動開關，預設開啟，藍色表示開啟、中性色表示關閉。程式使用的欄位只要有一個開啟審批，就會在臨時秘密視窗內顯示藍色授權對話框，頂部按鈕只決定本次執行。點擊命令可開啟完整詳情，長文字支援分頁和複製全文；詳情裡的返回或 Esc 不作審批決定。所有引用欄位都關閉審批時，可直接注入指定程式的環境變數並執行。
+每個欄位的「呼叫審批」使用與主介面一致的核取方塊，預設開啟。欄位名稱、遮罩秘密值和審批控制項依統一欄寬對齊，窄視窗自動上下排列。程式使用的欄位只要有一個開啟審批，就會在臨時秘密視窗內顯示藍色授權對話框，頂部按鈕只決定本次執行。點擊命令可開啟完整詳情，長文字支援分頁和複製全文；詳情裡的返回或 Esc 不作審批決定。所有引用欄位都關閉審批時，可直接注入指定程式的環境變數並執行。
+
+頂部「全部刪除」經確認後移除所有欄位、已儲存值和未儲存草稿，同時取消等待中的操作；不會停止已執行的程式。單項「清空」和 `temporary_secrets_clear` 仍只清空值、保留欄位。
 
 退出 `codex-hosts` 系統匣程式、登出或重新啟動系統後，這些臨時值會失效；Codex 的啟動或退出不影響它們。
 
@@ -395,12 +417,12 @@ Codex 透過 stdio 與 `codex-hosts.exe --mcp` 通訊。每個工具都同時以
 
 | 工具 | 用途 |
 | --- | --- |
-| `list_hosts` | 已儲存主機的非敏感資訊、信任狀態、`auth_persistence`、`max_channels`、`remote_env` |
+| `list_hosts` | 已儲存主機的非敏感資訊、信任狀態、`auth_persistence`、`require_call_approval`、sudo/su 供密權限、`max_channels`、`remote_env` |
 | `agent_identities`、`fido_identities` | 已載入 Agent 身分與 FIDO Handle 的公開資訊 |
 | `probe`、`batch_probe` | 認證並執行 `hostname`；揭露未知或變更的主機金鑰 |
 | `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 執行命令；`exec_stdin` 單獨成工具，因為 stdin 中的程式內容對審查不透明 |
-| `exec_sudo` | 在 SSH 主機上以 root 或其他使用者執行絕對路徑程式及 argv；預設重用目前使用者的 SSH 登入密碼 |
-| `exec_su` | 透過 su 以目標使用者執行絕對路徑程式；遠端原則允許時無需密碼 |
+| `exec_sudo` | 在 SSH 主機上以明確指定的 `user` 執行絕對路徑程式及 argv；供密獲准時，一般 sudo 沿用目前使用者的 SSH 登入密碼 |
+| `exec_su` | 透過 su 以明確指定的目標 `user` 執行絕對路徑程式；遠端原則允許時無需密碼 |
 | `disconnect` | 斷開為已選擇保持工作階段的主機保留的連線 |
 | `open_host_editor` | 開啟預填非敏感資訊的編輯器視窗，或確認回報的主機金鑰 |
 | `temporary_secrets_open`、`_status`、`_run`、`_clear` | 由系統匣程式持有的僅記憶體秘密 |
@@ -409,9 +431,13 @@ Codex 透過 stdio 與 `codex-hosts.exe --mcp` 通訊。每個工具都同時以
 
 SSH 主機的「進階」中有「每次 Codex 呼叫前審批」，預設關閉。目標或跳板主機開啟後，連線前以藍色對話框審批本次呼叫涉及的全部主機與命令。授權涵蓋這次 Codex 呼叫從啟動到結束的生命週期；下次呼叫須重新審批，保持連線不會延長授權。頂部「全部允許 / 全部拒絕」只處理目前展示的這批等待呼叫，後來到達的請求須點擊「查看下一批」。點擊命令可開啟完整詳情，區分實際執行主機和跳板，並展示完整命令、標準輸入及 sudo 使用者；詳情頂部按鈕決定整次呼叫。長文字可分頁查看和複製全文，詳情中的返回或 Esc 不作決定。介面顯示數量、到期倒數及審批回饋；允許按鈕為紅色，拒絕按鈕為白色。
 
-「進階」中的「允許 sudo 自動供密」僅授權使用儲存的密碼。關閉時仍可使用免密或既有認證快取；實際要求密碼時回傳 `SUDO_AUTO_AUTH_DISABLED`，不為該認證請求讀取或傳送密碼。執行使用者由 Codex 每次選擇：`exec_sudo` 必填 `alias`、絕對路徑 `program`、`user`，可選原樣 `args` 和逾時參數；需要 root 時明確傳入 `"user":"root"`，不再儲存預設目標。進階頁將 sudo 與 su 分為兩個獨立區域。sudo 固定顯示目前 SSH 登入使用者，名稱唯讀：密碼登入沿用其登入密碼，金鑰或 Agent 登入可在同一行補充該使用者的系統密碼；沒有 sudo 認證使用者選擇器。其他帳號在 su 區域每使用者一行；不使用其他使用者的登入密碼、金鑰口令或 Agent 憑據。`rootpw`、`targetpw`、`runaspw` 依實際認證提示選擇密碼。空白保留已有密碼，清除或刪除須明確操作；改名刪除舊密碼，可输入替換密碼或留空。「儲存並測試 sudo」臨時選擇目標（初始 root）後執行 `/usr/bin/id`，取消不儲存也不執行。不接受原始命令、密碼或業務 stdin，不自動重試。shell 啟動器及 TTY/PAM 限制見 [sudo.md](../../skill/codex-hosts/references/sudo.md)。
+SSH 呼叫審批、臨時秘密審批與 sudo/su 供密權限彼此獨立。等待審批的要求在五分鐘後到期，審批通過不代表命令執行成功。對話框行為與失敗處理見 [approvals.md](../../skill/codex-hosts/references/approvals.md)。
 
-「進階」中的「允許 su 自動供密」獨立授權 su 使用儲存的密碼；關閉時仍可免密執行，實際要求密碼時回傳 `SU_AUTO_AUTH_DISABLED`。`exec_su` 同樣要求每次填寫 `user`、絕對路徑 `program`，可選原樣 `args` 和逾時參數；su 區域管理目標使用者的可選密碼，每使用者一行。目前登入使用者的密碼只在上方輸入一次，su 供密授權允許時可沿用同一帳號密碼。遠端允許的 root 到一般使用者等免密路徑無需記錄，完全不讀取或傳送密碼。「儲存並測試 su」臨時輸入目標（初始空白），允許無密碼記錄的合法使用者名稱，目標不寫入主機設定。遠端須提供 util-linux `/usr/bin/su`、`/usr/bin/env`、`/bin/sh` 及標準 Linux-PAM 提示；無 PTY 或業務 stdin。舊 JSON 預設目標會被忽略，已存密碼槽保留；舊呼叫省略 `user` 會失敗且不執行。詳見 [su.md](../../skill/codex-hosts/references/su.md)。
+「進階」中的「允許 sudo 使用儲存的密碼」僅授權使用儲存的密碼。關閉時仍可使用免密或既有認證快取；實際要求密碼時回傳 `SUDO_AUTO_AUTH_DISABLED`，不為該認證請求讀取或傳送密碼。執行使用者由 Codex 每次選擇：`exec_sudo` 必填 `alias`、絕對路徑 `program`、`user`，可選原樣 `args` 和逾時參數；需要 root 時明確傳入 `"user":"root"`，不再儲存預設目標。sudo/su 開關採用與其他選項一致的表單列和核取方塊。密碼登入直接沿用 SSH 登入密碼，不重複顯示登入使用者名稱和密碼框；金鑰、Agent 登入或已有獨立密碼的帳號，可在開啟供密後展開「獨立系統密碼（選填）」。額外帳號在「其他帳號密碼（選填）」摺疊區管理。不使用其他使用者的登入密碼、金鑰口令或 Agent 憑據；`rootpw`、`targetpw`、`runaspw` 依實際認證提示選擇密碼。空白保留已有密碼；移除獨立密碼後仍可沿用符合條件的登入密碼。改名刪除舊密碼，可輸入替換密碼或留空。不再提供專用 sudo/su 儲存測試按鈕，一般連線測試保持不變。不接受原始命令、密碼或業務 stdin，不自動重試。shell 啟動器及 TTY/PAM 限制見 [sudo.md](../../skill/codex-hosts/references/sudo.md)。
+
+「進階」中的「允許 su 使用儲存的密碼」獨立授權 su 使用儲存的密碼；關閉時仍可免密執行，實際要求密碼時回傳 `SU_AUTO_AUTH_DISABLED`。`exec_su` 同樣要求每次填寫 `user`、絕對路徑 `program`，可選原樣 `args` 和逾時參數。目標使用者的選用密碼在「其他帳號密碼」摺疊區每使用者一列管理；su 供密授權允許時可沿用同一帳號密碼，無需重複輸入登入密碼。遠端允許的 root 到一般使用者等免密路徑無需記錄，完全不讀取或傳送密碼。遠端須提供 util-linux `/usr/bin/su`、`/usr/bin/env`、`/bin/sh` 及標準 Linux-PAM 提示；無 PTY 或業務 stdin。舊 JSON 預設目標會被忽略，已存密碼槽保留；舊呼叫省略 `user` 會失敗且不執行。詳見 [su.md](../../skill/codex-hosts/references/su.md)。
+
+這兩個工具只處理外層 sudo/su 認證。一般 `exec` / `exec_stdin` 和已啟動腳本內部的 sudo/su 不會自動供密；內部失敗不會觸發整段腳本提權或自動重播。
 
 `open_host_editor` 的驗證參數使用穩定名稱：`password`；`private-key` / `private_key` 表示一般私鑰檔案或 FIDO Handle（也接受 `fido-handle`）；`ssh-agent` / `ssh_agent` 表示 Windows OpenSSH Agent 或 Pageant。
 

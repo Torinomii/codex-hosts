@@ -9,11 +9,13 @@ const LEGACY_SERVICE: &str = "Codex Remote GUI";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
     Password,
+    LoginPassword(Uuid),
     KeyPassphrase,
     SudoPassword(Uuid),
 }
 
 pub struct CredentialSnapshot {
+    password_kind: CredentialKind,
     password: Option<Zeroizing<String>>,
     key_passphrase: Option<Zeroizing<String>>,
     sudo: Vec<(Uuid, Option<Zeroizing<String>>)>,
@@ -23,10 +25,17 @@ impl CredentialKind {
     fn account_suffix(self) -> String {
         match self {
             Self::Password => "password".into(),
+            Self::LoginPassword(id) => format!("login-password:{id}"),
             Self::KeyPassphrase => "key-passphrase".into(),
             Self::SudoPassword(id) => format!("sudo-password:{id}"),
         }
     }
+}
+
+pub fn login_password_kind(host: &crate::model::HostProfile) -> CredentialKind {
+    host.login_password_id
+        .map(CredentialKind::LoginPassword)
+        .unwrap_or(CredentialKind::Password)
 }
 
 pub fn store(id: Uuid, kind: CredentialKind, secret: &str) -> Result<(), CredentialError> {
@@ -49,18 +58,16 @@ pub fn has(id: Uuid, kind: CredentialKind) -> Result<bool, CredentialError> {
     Ok(load(id, kind)?.is_some())
 }
 
-pub fn snapshot(id: Uuid) -> Result<CredentialSnapshot, CredentialError> {
-    Ok(CredentialSnapshot {
-        password: load(id, CredentialKind::Password)?,
-        key_passphrase: load(id, CredentialKind::KeyPassphrase)?,
-        sudo: Vec::new(),
-    })
-}
-
 pub fn snapshot_host(
     host: &crate::model::HostProfile,
 ) -> Result<CredentialSnapshot, CredentialError> {
-    let mut snapshot = snapshot(host.id)?;
+    let password_kind = login_password_kind(host);
+    let mut snapshot = CredentialSnapshot {
+        password_kind,
+        password: load(host.id, password_kind)?,
+        key_passphrase: load(host.id, CredentialKind::KeyPassphrase)?,
+        sudo: Vec::new(),
+    };
     if let Some(sudo) = &host.advanced.sudo {
         for credential in &sudo.credentials {
             snapshot.sudo.push((
@@ -93,7 +100,7 @@ pub fn restore_kind(
 pub fn restore(id: Uuid, snapshot: &CredentialSnapshot) -> Result<(), CredentialError> {
     let mut first_error = None;
     for (kind, secret) in [
-        (CredentialKind::Password, snapshot.password.as_ref()),
+        (snapshot.password_kind, snapshot.password.as_ref()),
         (
             CredentialKind::KeyPassphrase,
             snapshot.key_passphrase.as_ref(),
@@ -131,6 +138,9 @@ pub fn delete_all(id: Uuid) -> Result<(), CredentialError> {
 
 pub fn delete_host(host: &crate::model::HostProfile) -> Result<(), CredentialError> {
     delete_all(host.id)?;
+    if host.login_password_id.is_some() {
+        delete(host.id, login_password_kind(host))?;
+    }
     if let Some(sudo) = &host.advanced.sudo {
         for credential in &sudo.credentials {
             delete(host.id, CredentialKind::SudoPassword(credential.id))?;
@@ -203,7 +213,16 @@ fn transact(
 }
 
 pub fn delete(id: Uuid, kind: CredentialKind) -> Result<(), CredentialError> {
-    match entry(id, kind)?.delete_credential() {
+    // Remove the migration source first: a deleted current password must never
+    // become eligible for legacy recovery on the next read.
+    if kind == CredentialKind::Password {
+        delete_entry(Entry::new(LEGACY_SERVICE, &id.to_string())?)?;
+    }
+    delete_entry(entry(id, kind)?)
+}
+
+fn delete_entry(entry: Entry) -> Result<(), CredentialError> {
+    match entry.delete_credential() {
         Ok(()) | Err(KeyringError::NoEntry) => Ok(()),
         Err(error) => Err(error.into()),
     }
@@ -224,6 +243,7 @@ fn load_and_migrate_legacy_password(
         Ok(secret) => {
             let secret = Zeroizing::new(secret);
             entry(id, CredentialKind::Password)?.set_password(secret.as_str())?;
+            delete_entry(legacy)?;
             Ok(Some(secret))
         }
         Err(KeyringError::NoEntry) => Ok(None),
@@ -364,3 +384,6 @@ mod tests {
         assert_eq!(restored.as_str(), "sudo-fixture");
     }
 }
+
+#[cfg(test)]
+mod regression_tests;

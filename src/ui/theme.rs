@@ -49,7 +49,7 @@ pub(super) fn success_color(visuals: &egui::Visuals) -> Color32 {
     }
 }
 
-pub(super) fn section_fill(visuals: &egui::Visuals) -> Color32 {
+pub(crate) fn section_fill(visuals: &egui::Visuals) -> Color32 {
     if visuals.dark_mode {
         Color32::from_gray(36)
     } else {
@@ -57,7 +57,7 @@ pub(super) fn section_fill(visuals: &egui::Visuals) -> Color32 {
     }
 }
 
-pub(super) fn section_stroke(visuals: &egui::Visuals) -> egui::Stroke {
+pub(crate) fn section_stroke(visuals: &egui::Visuals) -> egui::Stroke {
     visuals.widgets.noninteractive.bg_stroke
 }
 
