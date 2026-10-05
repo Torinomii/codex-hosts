@@ -713,6 +713,9 @@ fn advanced_summary(profile: &HostProfile, catalog: &Catalog) -> String {
     if advanced.codex_hidden {
         parts.push(catalog.text("codex_hidden").to_owned());
     }
+    if profile.protocol == Protocol::Ssh && advanced.require_call_approval {
+        parts.push(catalog.text("ssh_call_approval").to_owned());
+    }
     if advanced.telnet_prompts.is_some() {
         parts.push(catalog.text("telnet_prompts").to_owned());
     }
@@ -820,6 +823,16 @@ fn advanced_rows(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) 
             ui.checkbox(&mut advanced.codex_hidden, "");
         },
     );
+    if !telnet {
+        form.row(
+            ui,
+            "ssh_call_approval",
+            Some(catalog.text("ssh_call_approval_hint").to_owned()),
+            |ui, _| {
+                ui.checkbox(&mut advanced.require_call_approval, "");
+            },
+        );
+    }
     if telnet {
         form.row(
             ui,

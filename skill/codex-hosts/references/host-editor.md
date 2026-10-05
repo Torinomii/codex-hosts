@@ -15,6 +15,8 @@ Read this when a host must be created, completed, corrected, or its host key con
 - Metadata prefill: omitting `description` or `tags` keeps the saved values, `description: ""` clears the notes, and `tags: [""]` clears the tags. Tags are trimmed and de-duplicated ignoring case, keeping the first spelling.
 - The editor marks required fields with `*` and, if the user tries to save with one empty, highlights it. A new host also requires the user to choose the authentication-persistence option; do not pre-empt that choice or suggest one.
 
+- **Approve each Codex call** is an SSH-only Advanced setting, default off. The user changes it in the app; `open_host_editor` has no parameter for it. One approval covers one call's hosts and commands from launch to completion, independent of authentication retention.
+
 For host-key confirmation, call the same alias with the values from the `HOSTKEY_UNKNOWN` or `HOSTKEY_MISMATCH` failure:
 
 ```json

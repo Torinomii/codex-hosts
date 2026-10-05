@@ -1,4 +1,4 @@
-//! Reference-only, same-user IPC. Secret values never enter this protocol.
+//! Same-user IPC for field references and SSH call reviews. Vault values never enter it.
 use std::io;
 use std::sync::{
     Arc,
@@ -15,7 +15,8 @@ use uuid::Uuid;
 
 use super::{Envelope, Request, Response};
 
-const MAX_FRAME: usize = 128 * 1024;
+// SSH reviews may include the exact 1 MiB stdin, escaped as JSON.
+const MAX_FRAME: usize = 8 * 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn pipe_name(session: Uuid) -> String {

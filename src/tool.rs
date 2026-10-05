@@ -128,6 +128,7 @@ pub(crate) struct HostSummary {
     pub(crate) jump_host: Option<String>,
     pub(crate) verified: bool,
     pub(crate) auth_persistence: AuthPersistence,
+    pub(crate) require_call_approval: bool,
     pub(crate) max_channels: usize,
     pub(crate) remote_env: RemoteEnv,
     pub(crate) has_required_secret: bool,
@@ -375,6 +376,13 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         } => {
             let host = find_host(&store, &alias)?.clone();
             validate_profile(&host)?;
+            crate::approval::authorize_sync(crate::approval::Review::new(
+                std::slice::from_ref(&host),
+                &store.hosts,
+                vec!["hostname".into()],
+                None,
+                None,
+            )?)?;
             let result = connection::probe(
                 &host,
                 &store.hosts,
@@ -392,6 +400,14 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
         } => {
             let host = find_host(&store, &alias)?;
             validate_profile(host)?;
+            ssh::validate_stdin(stdin.as_deref())?;
+            crate::approval::authorize_sync(crate::approval::Review::new(
+                std::slice::from_ref(host),
+                &store.hosts,
+                vec![command.clone()],
+                stdin.as_deref(),
+                None,
+            )?)?;
             Ok(ToolResponse::Remote(connection::execute_with_input(
                 host,
                 &store.hosts,
@@ -411,6 +427,13 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             validate_commands(&commands)?;
             let host = find_host(&store, &alias)?;
             validate_profile(host)?;
+            crate::approval::authorize_sync(crate::approval::Review::new(
+                std::slice::from_ref(host),
+                &store.hosts,
+                commands.clone(),
+                None,
+                None,
+            )?)?;
             let concurrency = max_concurrency
                 .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
                 .clamp(1, MAX_BATCH_CONCURRENCY);
@@ -520,6 +543,8 @@ pub(crate) fn list_hosts(
                 .map(|item| item.alias.clone()),
             verified: host.verified,
             auth_persistence: host.effective_auth_persistence(),
+            require_call_approval: host.protocol == Protocol::Ssh
+                && host.advanced.require_call_approval,
             max_channels: host.advanced.max_channels(),
             remote_env: host.advanced.remote_env,
             has_required_secret,
@@ -555,6 +580,18 @@ pub(crate) async fn execute_batch(
 ) -> Result<BatchResult, RemoteFailure> {
     let snapshot = Arc::new(hosts.to_vec());
     let hosts = resolve_batch_hosts(&snapshot, &aliases)?;
+    let command = match &action {
+        BatchAction::Probe => "hostname",
+        BatchAction::Exec(command) => command,
+    };
+    crate::approval::authorize(crate::approval::Review::new(
+        &hosts,
+        &snapshot,
+        vec![command.into()],
+        None,
+        None,
+    )?)
+    .await?;
     let concurrency = max_concurrency
         .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
         .clamp(1, MAX_BATCH_CONCURRENCY)

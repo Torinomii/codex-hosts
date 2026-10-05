@@ -51,6 +51,8 @@ tool_timeout_sec = 86400
 
 Read [references/tool-protocol.md](references/tool-protocol.md) for the complete parameter and result fields, limits, and error codes.
 
+A target or SSH jump host with `require_call_approval:true` requires GUI approval before a probe or execution call. One approval covers only that call's hosts and commands; retained connections never reuse it. Only the user changes this default-off switch in Advanced settings.
+
 ## Remote environment
 
 - Do not infer the remote operating system or shell from SSH alone; rely on facts the user gave, the profile's `remote_env` hint, or earlier output verified. Do not assume Bash, GNU utilities, `sudo`, systemd, a UTF-8 locale, or a TTY. Prefer minimal non-interactive commands.
@@ -70,4 +72,4 @@ Completion requires a structured tool result plus confirmation that no credentia
 ## Other modes
 
 - Hardware keys and Agents: read [references/hardware-keys.md](references/hardware-keys.md) when a host uses `private_key` with a `*_sk` handle or `ssh_agent`, when a FIDO SSH credential must be created or recovered, or when choosing between `fido_identities` and `agent_identities`.
-- Memory-only project secrets, such as API keys and tokens unrelated to host login: read [references/temporary-secrets.md](references/temporary-secrets.md). This mode needs no host profile. Declare detailed field names with `temporary_secrets_open`, use only field references for approved child-environment injection with `temporary_secrets_run`, never read or export plaintext, reuse fields that are already ready within the same session, and keep explicit approval for every execution.
+- Memory-only project secrets (API keys and tokens unrelated to host login; no host profile needed): read [references/temporary-secrets.md](references/temporary-secrets.md). Only field references leave the vault: never read or export a value. Approval defaults on for each field; `temporary_secrets_run` requires the app's approval if any referenced field has it enabled. Only the user changes field approval switches in the app.

@@ -1,50 +1,37 @@
-## Temporary project secrets (memory only)
+# Temporary project secrets (memory only)
 
-Use this in-app editor for API keys, tokens and secret parameters unrelated to host login.
-The tools are `temporary_secrets_open`, `temporary_secrets_status`, `temporary_secrets_run`, and `temporary_secrets_clear`.
-No host listing or host profile is needed for these actions. IPC is restricted to the same Windows user;
-if a sandbox uses a different user SID, use the approved interactive-user execution context rather than
-weakening pipe permissions.
+Use this for API keys, tokens, and secret parameters unrelated to host login; no host profile is needed. Tools: `temporary_secrets_open`, `temporary_secrets_status`, `temporary_secrets_run`, `temporary_secrets_clear`.
 
-1. Derive detailed, non-secret names from the current project/environment/service/purpose, e.g.
-   `myproject-local-qwen-apikey` or `myproject-staging-payments-signing-key`. Reuse exact names within
-   the active main-process session; never use the key value as the name. Use distinct project/environment prefixes because normal app launches share one in-memory vault.
-2. Call `temporary_secrets_open` with `{"fields":["myproject-local-qwen-apikey"]}`. It opens or restores the
-   main app and its internal editor and returns an opaque `session` UUID plus readiness metadata. The main (tray)
-   app owns the vault, independently of the MCP server's lifetime. Repeated open calls reuse its session.
-   The server starts the app outside its own job object; if the job forbids that, the response carries a
-   `warning` saying the window will close with Codex, and the user should start the codex-hosts GUI by hand first.
-3. Inspect readiness for the exact required names in the returned session. If all are already
-   `ready:true` and status is `ok` or `saved`, reuse them without asking for re-entry or another Save.
-   For missing fields, ask the user to fill only those right-hand masked cells and click Save, never
-   paste values into chat. Poll `temporary_secrets_status` with the `session` only as needed. A successful Save reports `saved`; verify every required name is present and ready
-   before execution. Another task's Save is not proof that your missing fields have been filled.
-   `saved` acknowledges input, not session-wide authorization: declaring fields or executing resets it
-   to `ok` without deleting saved values. Readiness, not a new `saved` event, permits later reuse.
-   Neither signal proves authentication or command success; every execution still needs approval.
-4. Add fields with another `temporary_secrets_open` call naming the new fields.
-   Existing saved fields are preserved. Up to 64 names of 256 bytes; values up to 32 KiB, including
-   whitespace/newlines (NUL unsupported). Save replaces a value; an empty editor after Save is normal.
-5. For use, call `temporary_secrets_run` with `{"session":"<UUID>","program":"C:\\absolute\\python.exe",
-   "args":["C:\\project\\trusted_script.py"],"cwd":"C:\\project",
-   "env":{"QWEN_API_KEY":"myproject-local-qwen-apikey"},"timeout_ms":60000}`.
-   Use only trusted project programs and non-secret arguments. It returns `operation_id` immediately.
-   The popup shows the exact executable, arguments, directory and mappings for explicit user approval.
-   Poll `temporary_secrets_status` for this ID; only `completed` with exit code 0 is success. Pending approvals expire in
-   five minutes. At most one child runs, timeout is 1–600000 ms, and the last 16 operations are retained.
-6. Never request plaintext read/export, echo a secret, write it into `.env` or other project files,
-   or reconstruct it from process memory/logs. Values are injected directly into the selected child's
-   environment, never shell-substituted into arguments. stdin/stdout/stderr are discarded and no
-   child output is returned. The receiving program is trusted, not sandboxed: it can write files,
-   make network calls, or spawn descendants. Stop/timeout terminates only the direct child.
-7. `temporary_secrets_clear` with `fields` clears named values; an empty list clears all.
-   Saving/replacing/clearing cancels pending approvals; a running child already owns its environment.
-   Closing the editor hides it without clearing. Closing the main window hides to the tray and keeps
-   the process, IPC and values alive. Relaunching the executable or requesting fields restores the same
-   session; the MCP server starting or stopping with Codex does not affect it. Only tray Exit, process
-   termination, sign-out or system restart loses values and invalidates references. Do not silently substitute an expired session. No Credential Manager
-   or startup service. Existing --codex-edit callback windows still close/exit normally.
+## Rules
 
-Connection retries apply only before a request is sent when the pipe is busy, within a five-second
-total deadline. On an execute call with a missing response, do not resubmit automatically: poll the
-same session's operations to reconcile its outcome, or ask the user if it cannot be determined.
+- Never request a plaintext read or export, echo a value, write it into `.env` or any other file, or reconstruct it from process memory or logs. Values reach only the selected child's environment, never shell-substituted into arguments.
+- Each field's Call approval switch defaults on. A `temporary_secrets_run` requires the user's popup approval if any field referenced by `env` has `requires_approval:true`. All referenced fields switched off allows direct execution. Only the user changes these switches in the app; tools cannot disable approval.
+- The vault's IPC is restricted to the same Windows user. If a sandbox runs under a different user SID, use the approved interactive-user execution context; never weaken the pipe's permissions.
+- Never silently substitute a different or expired session.
+
+## Fields
+
+1. Name each field in detail from project, environment, service, and purpose, such as `myproject-local-qwen-apikey` or `myproject-staging-payments-signing-key`. A name is not secret and never the value. Normal app launches share one vault, so use distinct project and environment prefixes, and reuse exact names within the running session.
+2. `temporary_secrets_open` with `{"fields":["myproject-local-qwen-apikey"]}` opens or restores the main app and its editor and returns an opaque `session` UUID with per-field readiness. Repeated calls reuse the session; calling it with new names adds fields and keeps saved ones. Limits: 64 names of up to 256 bytes; values up to 32 KiB, whitespace and newlines included, no NUL.
+3. If every required name is `ready:true` and `status` is `ok` or `saved`, reuse them without asking for re-entry. Otherwise ask the user to fill only the missing fields in the right-hand masked cells and click Save, never to paste values into chat, and poll `temporary_secrets_status` only as needed. Before running, confirm every required name is ready; another task's Save proves nothing about your fields.
+4. `saved` acknowledges input, not authorization; declaring fields or running resets `status` to `ok` without deleting values. Readiness, not a new `saved`, allows reuse. Neither proves that a credential works or a run succeeded. Save replaces a value, and an empty editor after Save is normal.
+5. The rightmost Call approval column has a switch with a sliding thumb and On/Off text, blue when enabled and neutral when disabled. Open/status metadata reports each field's `requires_approval` without its value. Reopening or clearing a field preserves its approval setting within the vault session; new fields default on.
+
+## Run
+
+```json
+{"session":"<UUID>","program":"C:\\absolute\\python.exe","args":["C:\\project\\trusted_script.py"],"cwd":"C:\\project","env":{"QWEN_API_KEY":"myproject-local-qwen-apikey"},"timeout_ms":60000}
+```
+
+- Run only trusted project programs, with non-secret arguments; `env` maps variable names to field names. When approval is required, a blue popup nested inside the temporary-secret editor shows a run summary, waiting count, and five-minute approval countdown. Its top red Allow this run button approves only this operation; its white Reject this run button or Escape rejects it.
+- Click the command preview or View full details to open complete local execution details: program, JSON argument list, directory, execution timeout, and field mappings without secret values. Long text is paged without truncation and has Copy full text. The detail window's top buttons also decide only this operation; Back or Escape returns without making a decision. Expired or revoked details cannot authorize another run.
+- While another child runs, Allow is disabled with an explanation and Stop is available. Permission feedback is distinct from the actual execution result; active operations and the four most recent outcomes remain visible in the editor.
+- The call returns an `operation_id` at once; poll `temporary_secrets_status` for it. Only `completed` with exit code 0 is success. One child runs at a time; an approval-free call waits as `queued` if another child is running and then starts automatically. `timeout_ms` is 1–600000, and at most 16 active/recent operations are kept.
+- The child's stdin, stdout, and stderr are discarded; no output is returned. It is trusted, not sandboxed: it can write files, use the network, and spawn processes. Stop or timeout ends only the direct child.
+- If an execute call returns no response, do not resubmit: reconcile through that session's operations in `temporary_secrets_status`, or ask the user. The client itself retries only while the pipe is busy before the request is sent, within five seconds.
+
+## Clear and lifetime
+
+- `temporary_secrets_clear` with `fields` clears those values; an empty list clears all. Saving, replacing, clearing, or changing an approval switch cancels pending and queued operations; a running child keeps the environment it started with.
+- The main (tray) app holds the vault, independent of the MCP server, which starting or stopping with Codex does not affect. The server starts the app outside its own job object; if the job forbids that, the result carries a `warning` that the app will close with Codex, and the user should start the codex-hosts GUI by hand first.
+- Closing the editor or the main window only hides it; the process, IPC, and values stay, and relaunching or requesting fields restores the same session. Only tray Exit, process termination, sign-out, or restart loses the values and invalidates references. Nothing is written to Credential Manager, and no startup entry or service is added. Host-editor windows opened for Codex still close normally.

@@ -234,7 +234,7 @@ While a session is kept, later Codex commands on that host run without re-authen
 
 These values live only in the current `codex-hosts` process memory. They are not stored in Windows Credential Manager and are not returned to Codex.
 
-After user approval, they can be injected directly into the environment of a selected program.
+Each field has a Call approval switch, enabled by default, with a blue On state and a neutral Off state. If any field used by a program requires approval, a blue dialog inside the temporary-secret editor asks before injecting the values into its environment. Its top buttons decide only this run; clicking the command opens full details with paged text and full-text copying. Back or Escape in details makes no decision. Switching off approval for all referenced fields allows direct execution.
 
 They expire when the `codex-hosts` tray application exits, the user signs out, or the system restarts. Codex starting or stopping does not affect them.
 
@@ -400,6 +400,9 @@ Codex talks to `codex-hosts.exe --mcp` over stdio. Every tool returns the same J
 | `temporary_secrets_open`, `_status`, `_run`, `_clear` | Memory-only secrets held by the tray application |
 
 Parameters never contain a password, passphrase, or PIN; the editor collects those in masked fields. Timeouts (`connect_timeout_ms`, `command_timeout_ms`, `batch_timeout_ms`) are per call and default to 120 s to connect and 10 minutes per command, or to the host's own defaults from its Advanced card.
+
+**Approve each Codex call** in Advanced settings defaults off for SSH hosts. When enabled on a target or jump host, a blue dialog reviews the call's hosts and commands before connecting. One approval covers that Codex call from launch to completion, including all its batch hosts and commands; the next call asks again, even on a retained connection. Top **Allow all / Reject all** buttons decide only the currently displayed batch of waiting calls. Later requests wait for **View next batch**. Click a command for full details, with separate execution and jump hosts, exact commands, stdin, and sudo user when applicable; its top buttons decide that entire call. Long text supports paging and full-text copying. Back or Escape in details makes no decision. The dialog shows counts, an expiry countdown, and decision feedback. Allow buttons are red and reject buttons white.
+
 
 Authentication arguments to `open_host_editor` use stable names: `password`; `private-key` / `private_key` for an ordinary private-key file or a FIDO handle (`fido-handle` is also accepted); `ssh-agent` / `ssh_agent` for Windows OpenSSH Agent or Pageant.
 

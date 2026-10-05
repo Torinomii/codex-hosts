@@ -140,6 +140,8 @@ pub struct AdvancedSettings {
     pub remote_env: RemoteEnv,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub codex_hidden: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_call_approval: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telnet_prompts: Option<TelnetPrompts>,
 }
@@ -479,6 +481,31 @@ pub fn can_use_as_jump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn call_approval_defaults_off_and_persists_independently_of_auth_retention() {
+        let mut host: HostProfile =
+            serde_json::from_str(r#"{"alias":"old","address":"host","username":"alice"}"#).unwrap();
+        assert!(!host.advanced.require_call_approval);
+        assert!(host.advanced.is_default());
+        assert!(
+            serde_json::to_value(&host).unwrap()["advanced"]
+                .get("require_call_approval")
+                .is_none()
+        );
+        for retention in [
+            AuthPersistence::PerCall,
+            AuthPersistence::Session,
+            AuthPersistence::Idle { minutes: 5 },
+        ] {
+            host.auth_persistence = retention;
+            host.advanced.require_call_approval = true;
+            assert!(!host.advanced.is_default());
+            let json = serde_json::to_value(&host).unwrap();
+            assert_eq!(json["advanced"]["require_call_approval"], true);
+            assert_eq!(serde_json::from_value::<HostProfile>(json).unwrap(), host);
+        }
+    }
 
     #[test]
     fn auth_persistence_migrates_old_profiles_and_round_trips() {

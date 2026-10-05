@@ -28,11 +28,13 @@ Read this when you need exact parameters, result fields, limits, or an error cod
 - Aliases are 1–256 bytes and matched ignoring ASCII case and surrounding whitespace.
 - Tool annotations: `list_hosts`, `agent_identities`, `fido_identities`, `probe`, `batch_probe`, and `temporary_secrets_status` are read-only (`probe` still updates local trust metadata); every `exec*`, `batch_exec`, and `temporary_secrets_run` executes code; `disconnect` and `temporary_secrets_clear` are idempotent.
 
+- SSH call approval is a per-host Advanced switch, default off. If enabled on any target or jump host, one blue GUI review lists every participating SSH host and the exact call's commands (plus stdin or sudo user when supplied). Approval covers only that tool call from launch to completion, including its batch workers; the next call asks again even when authentication is retained. Cancel, Escape, expiry or unavailable GUI fails before any connection or remote command starts. Tools cannot change this policy.
+
 ## Results
 
 Every result is returned as `structuredContent` and as the same JSON in the text content. Every result carries `schema_version` (currently 1) and `status`; failures set `isError`.
 
-`list_hosts`: `hosts`, each with `alias`, `description`, `tags`, `address`, `port`, `username`, `protocol` (`ssh` or `telnet`), `ssh_auth` (SSH only), `agent_key_fingerprint` (only when set on an `ssh_agent` host), `jump_host` (alias, when set), `verified`, `auth_persistence` (`{"mode":"per_call"}`, `{"mode":"session"}`, or `{"mode":"idle","minutes":N}`), `max_channels`, `remote_env` (`auto`, `posix`, `windows`), `has_required_secret`, `has_host_fingerprint`, `host_key_algorithm`. Hosts hidden from Codex are omitted.
+`list_hosts`: `hosts`, each with `alias`, `description`, `tags`, `address`, `port`, `username`, `protocol` (`ssh` or `telnet`), `ssh_auth` (SSH only), `agent_key_fingerprint` (only when set on an `ssh_agent` host), `jump_host` (alias, when set), `verified`, `auth_persistence` (`{"mode":"per_call"}`, `{"mode":"session"}`, or `{"mode":"idle","minutes":N}`), `require_call_approval` (default false; false for Telnet), `max_channels`, `remote_env` (`auto`, `posix`, `windows`), `has_required_secret`, `has_host_fingerprint`, `host_key_algorithm`. Hosts hidden from Codex are omitted.
 
 - `has_required_secret` is true for `private_key` and `ssh_agent` hosts; for password and Telnet hosts it reflects Windows Credential Manager for the current user.
 - `verified` is true only after a successful probe, batch probe, or GUI test with the pinned key. A host accepted through the host-key prompt is pinned but not yet verified.
@@ -59,6 +61,8 @@ Failures are `{"status":"error","code":"...","message":"..."}` plus `host_alias`
 - Batches and `exec_many` on a jump chain: a hop keeps its session only when it and every hop before it keep sessions; a per-call hop makes everything behind it per-call, while a jump host that keeps sessions keeps its own even when the target is per-call.
 
 ## Error codes
+
+SSH call approval: `APPROVAL_CANCELLED`, `APPROVAL_EXPIRED` (five minutes without a decision), `APPROVAL_UNAVAILABLE` (GUI/IPC unavailable, incompatible holder, or review queue full). No remote command has started when these are returned.
 
 Request validation: `REQUEST_INVALID`, `ALIAS_INVALID`, `ALIAS_NOT_FOUND`, `HOST_HIDDEN` (hidden from Codex in its profile), `PROFILE_INVALID` (the saved host is incomplete; open the editor), `COMMANDS_REQUIRED`, `TOO_MANY_COMMANDS`, `COMMAND_INVALID`, `BATCH_ALIASES_REQUIRED`, `BATCH_TOO_LARGE`, `BATCH_ALIAS_INVALID`, `STDIN_TOO_LARGE`, `STDIN_UNSUPPORTED` (stdin on a Telnet host), `SSH_REQUIRED` (`exec_many` on a Telnet host), `STORE_READ_FAILED`, `STORE_WRITE_FAILED`.
 

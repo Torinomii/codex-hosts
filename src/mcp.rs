@@ -513,7 +513,7 @@ impl Server {
 
     #[tool(
         name = "temporary_secrets_run",
-        description = "Start a trusted local program with secret fields injected into its environment by name, after the user approves the exact program, arguments, directory and mappings in a popup. Returns an operation_id to poll with temporary_secrets_status; no child output is returned. This executes code and is reviewed like exec.",
+        description = "Start a trusted local program with secret fields injected into its environment by name. Fields require popup approval by default; the user may turn it off per field in the app. If any referenced field requires approval, the popup reviews the exact program, arguments, directory and mappings before launch. Returns an operation_id to poll with temporary_secrets_status; no child output is returned. This executes code and is reviewed like exec.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -639,6 +639,14 @@ async fn probe_host(
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
+    crate::approval::authorize(crate::approval::Review::new(
+        std::slice::from_ref(&host),
+        &store.hosts,
+        vec!["hostname".into()],
+        None,
+        None,
+    )?)
+    .await?;
     let _guard = gates.single_host(&host, &store.hosts, 1).await;
     let result = connection::probe_async(
         &host,
@@ -658,6 +666,15 @@ async fn exec_host(
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
+    ssh::validate_stdin(stdin.as_deref())?;
+    crate::approval::authorize(crate::approval::Review::new(
+        std::slice::from_ref(&host),
+        &store.hosts,
+        vec![params.command.clone()],
+        stdin.as_deref(),
+        None,
+    )?)
+    .await?;
     let _guard = gates.single_host(&host, &store.hosts, 1).await;
     connection::execute_with_input_async(
         &host,
@@ -677,6 +694,14 @@ async fn exec_many_host(
     let store = load_store()?;
     let host = tool::find_host(&store, &params.alias)?.clone();
     tool::validate_profile(&host)?;
+    crate::approval::authorize(crate::approval::Review::new(
+        std::slice::from_ref(&host),
+        &store.hosts,
+        params.commands.clone(),
+        None,
+        None,
+    )?)
+    .await?;
     let concurrency = params
         .max_concurrency
         .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
@@ -829,7 +854,11 @@ maximum for any timeout is {max_timeout} ms. Limits: {max_hosts} hosts per batch
 commands per exec_many, batch concurrency up to {max_conc}, batch output up to {max_out} bytes. \
 SSH hosts authenticate with a password, a private key (including OpenSSH FIDO handles), or an \
 SSH agent; Telnet hosts with a password. Every call authenticates again unless the host's profile \
-keeps the session; a hardware key may need a touch on each call. When a call fails with \
+keeps the session; a hardware key may need a touch on each call. A host's optional require_call_approval \
+setting (default false, changed only in the app) asks for one GUI approval before each SSH tool call, \
+covering all listed commands and hosts from call launch to completion; authorization never carries \
+over to another call, even on a kept connection. Temporary secret fields require approval by default, \
+unless the user has disabled it for every referenced field in the app. When a call fails with \
 CREDENTIAL_MISSING, HOSTKEY_UNKNOWN, HOSTKEY_MISMATCH, or PROFILE_INVALID, call open_host_editor \
 for that alias instead of asking for details in chat. Never retry a command automatically.",
         schema = SCHEMA_VERSION,

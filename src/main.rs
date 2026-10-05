@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod approval;
+mod approval_ui;
 mod connection;
 mod credentials;
 mod fido;
