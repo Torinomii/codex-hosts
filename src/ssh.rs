@@ -66,6 +66,10 @@ pub struct RemoteResult {
     pub stderr: String,
     pub output_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sudo_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub su_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub host_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_key_algorithm: Option<String>,
@@ -952,6 +956,68 @@ async fn execute_async(
     stdin: Option<&str>,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
+    execute_operation_async(profile, hosts, Command::Raw { command, stdin }, limits).await
+}
+
+enum Command<'a> {
+    Raw {
+        command: &'a str,
+        stdin: Option<&'a str>,
+    },
+    Sudo(crate::sudo::Launch),
+    Su(crate::sudo::Launch<crate::su::AuthProtocol>),
+}
+
+pub async fn execute_sudo_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    program: &str,
+    args: &[String],
+    user: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    let launch = crate::sudo::launch(profile, program, args, user)?;
+    run_with_optional_timeout(
+        limits.total_timeout,
+        TOTAL_TIMEOUT_CODE,
+        "The sudo operation timed out; remote execution may have started.",
+        execute_operation_async(profile, hosts, Command::Sudo(launch), limits),
+    )
+    .await
+}
+
+pub async fn execute_su_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    program: &str,
+    args: &[String],
+    user: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    let launch = crate::su::launch(profile, program, args, user)?;
+    run_with_optional_timeout(
+        limits.total_timeout,
+        TOTAL_TIMEOUT_CODE,
+        "The su operation timed out; remote execution may have started.",
+        execute_operation_async(profile, hosts, Command::Su(launch), limits),
+    )
+    .await
+}
+
+async fn execute_operation_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    operation: Command<'_>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    let sudo_user = match &operation {
+        Command::Sudo(launch) => Some(launch.user.clone()),
+        _ => None,
+    };
+    let su_user = match &operation {
+        Command::Su(launch) => Some(launch.user.clone()),
+        _ => None,
+    };
     let chain = resolve_ssh_chain(profile, hosts)
         .map_err(|_| RemoteFailure::new("INVALID_HOST_CHAIN", "The SSH host chain is invalid."))?;
     let (sessions, verified_host_keys, auth_key_fingerprints) =
@@ -965,7 +1031,29 @@ async fn execute_async(
             let target = sessions.last().ok_or_else(|| {
                 RemoteFailure::new("INVALID_HOST_CHAIN", "The SSH chain is empty.")
             })?;
-            run_command(target.handle.as_ref(), command, stdin, &capture_budget).await
+            match operation {
+                Command::Raw { command, stdin } => {
+                    run_command(target.handle.as_ref(), command, stdin, &capture_budget).await
+                }
+                Command::Sudo(launch) => {
+                    run_sudo(
+                        target.handle.as_ref(),
+                        launch,
+                        &capture_budget,
+                        |username| crate::sudo::password_for(profile, username),
+                    )
+                    .await
+                }
+                Command::Su(launch) => {
+                    run_sudo(
+                        target.handle.as_ref(),
+                        launch,
+                        &capture_budget,
+                        |username| crate::su::password_for(profile, username),
+                    )
+                    .await
+                }
+            }
         },
     )
     .await;
@@ -990,6 +1078,8 @@ async fn execute_async(
         stdout: command_result.stdout,
         stderr: command_result.stderr,
         output_truncated: command_result.output_truncated,
+        sudo_user,
+        su_user,
         host_fingerprint: profile.host_fingerprint.clone(),
         host_key_algorithm: verified_host_keys.last().map(|item| item.algorithm.clone()),
         auth_key_fingerprint: auth_key_fingerprints.last().cloned().flatten(),
@@ -1774,6 +1864,148 @@ async fn run_command(
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         output_truncated,
+    })
+}
+
+async fn run_sudo<P, F>(
+    session: &client::Handle<ServerKeyObserver>,
+    mut launch: crate::sudo::Launch<P>,
+    budget: &CaptureBudget,
+    mut password_for: F,
+) -> Result<CommandResult, RemoteFailure>
+where
+    P: crate::sudo::PasswordProtocol,
+    F: FnMut(&str) -> Result<zeroize::Zeroizing<String>, RemoteFailure>,
+{
+    use crate::sudo::{Frame, Redactor};
+    use std::pin::Pin;
+    let channel = session
+        .channel_open_session()
+        .await
+        .map_err(|error| RemoteFailure::new("CHANNEL_OPEN_FAILED", error.to_string()))?;
+    let (mut reader, writer) = channel.split();
+    let writer = Arc::new(writer);
+    let mut close_on_cancel = CloseCommandChannel(Some(Arc::clone(&writer)));
+    writer
+        .exec(true, launch.command.as_bytes())
+        .await
+        .map_err(|error| RemoteFailure::new("REMOTE_EXEC_FAILED", error.to_string()))?;
+    type Sender = Pin<Box<dyn Future<Output = Result<(), russh::Error>> + Send>>;
+    let mut sender: Option<Sender> = None;
+    let mut stdout_redactor = None::<Redactor>;
+    let mut stderr_redactor = None::<Redactor>;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut truncated = false;
+    let mut exit_code = None;
+    loop {
+        let message = tokio::select! {
+            result = async { sender.as_mut().expect("guarded sender").await }, if sender.is_some() => {
+                sender = None;
+                result.map_err(|_| RemoteFailure::new(P::INPUT_FAILED, format!("The {} input channel failed; remote execution may have started.", P::NAME)))?;
+                continue;
+            }
+            message = reader.wait() => message,
+        };
+        let Some(message) = message else {
+            break;
+        };
+        match message {
+            ChannelMsg::Data { data } => {
+                let filtered = match &mut stdout_redactor {
+                    Some(filter) => filter.feed(&data, false),
+                    None => data.to_vec(),
+                };
+                truncated |= append_limited(&mut stdout, &filtered, budget);
+            }
+            ChannelMsg::ExtendedData { data, ext: 1 } => {
+                // Parse protocol bytes even when the output budget is exhausted.
+                let frames = launch.protocol.feed(&data)?;
+                for frame in frames {
+                    match frame {
+                        Frame::Output(data) => {
+                            let filtered = match &mut stderr_redactor {
+                                Some(filter) => filter.feed(&data, false),
+                                None => data,
+                            };
+                            truncated |= append_limited(&mut stderr, &filtered, budget);
+                        }
+                        Frame::Authenticate(username) if !launch.protocol.ready_seen() => {
+                            let password = password_for(&username)?;
+                            crate::sudo::validate_password(&password).map_err(|e| {
+                                RemoteFailure::new(
+                                    P::INVALID_PASSWORD,
+                                    e.message.replace("sudo", P::NAME),
+                                )
+                            })?;
+                            stdout_redactor = Some(Redactor::new(&password));
+                            stderr_redactor = Some(Redactor::new(&password));
+                            let mut line = zeroize::Zeroizing::new(password.as_bytes().to_vec());
+                            line.push(b'\n');
+                            let writer = Arc::clone(&writer);
+                            sender =
+                                Some(Box::pin(async move { writer.data(line.as_slice()).await }));
+                        }
+                        Frame::Ready => {
+                            // Drop any pending password write permanently before sending EOF.
+                            // No caller stdin is accepted by this protocol.
+                            drop(sender.take());
+                            let writer = Arc::clone(&writer);
+                            let ack = launch.ack.clone();
+                            sender = Some(Box::pin(async move {
+                                writer.data(ack.as_slice()).await?;
+                                writer.eof().await
+                            }));
+                        }
+                        Frame::Authenticate(_) => {}
+                    }
+                }
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                exit_code = Some(i32::try_from(exit_status).unwrap_or(-1));
+            }
+            ChannelMsg::Failure => {
+                return Err(RemoteFailure::new(
+                    "REMOTE_EXEC_FAILED",
+                    format!("The server rejected the {} exec request.", P::NAME),
+                ));
+            }
+            ChannelMsg::Close => {
+                close_on_cancel.0 = None;
+                break;
+            }
+            _ => {}
+        }
+    }
+    drop(sender);
+    let tail = launch.protocol.finish();
+    let stderr_tail = match &mut stderr_redactor {
+        Some(filter) => filter.feed(&tail, true),
+        None => tail,
+    };
+    truncated |= append_limited(&mut stderr, &stderr_tail, budget);
+    if let Some(filter) = &mut stdout_redactor {
+        truncated |= append_limited(&mut stdout, &filter.feed(&[], true), budget);
+    }
+    if !launch.protocol.ready_seen() {
+        let detail: String = String::from_utf8_lossy(&stderr)
+            .chars()
+            .take(4096)
+            .collect();
+        return Err(RemoteFailure::new(
+            P::START_FAILED,
+            format!(
+                "The {} READY marker was not received (exit status {exit_code:?}); execution cannot be confirmed. {detail}",
+                P::NAME
+            ),
+        ));
+    }
+    let exit_code = exit_code.ok_or_else(|| RemoteFailure::new(P::CHANNEL_CLOSED, format!("The SSH channel closed after {} started without an exit status; execution may have completed.", P::NAME)))?;
+    Ok(CommandResult {
+        exit_code,
+        stdout: String::from_utf8_lossy(&stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        output_truncated: truncated,
     })
 }
 

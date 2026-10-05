@@ -56,6 +56,7 @@ struct PendingCallback {
 }
 
 struct HostEditor {
+    sudo: SudoDraft,
     tag_input: String,
     profile: HostProfile,
     original: HostProfile,
@@ -79,11 +80,43 @@ struct HostEditor {
 }
 
 /// The action that was waiting on the persistence-change confirmation.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 enum PendingAction {
     Save,
     Test,
     TestAll,
+    TestPrivilege { su: bool, target: String },
+}
+
+struct PrivilegeTestPrompt {
+    host_id: Uuid,
+    su: bool,
+    target: String,
+}
+
+#[derive(Default)]
+struct SudoDraft {
+    /// UI-only binding for the fixed current-login identity, never an execution target.
+    current_user: Option<(String, Uuid)>,
+    passwords: HashMap<Uuid, Zeroizing<String>>,
+    stored: HashMap<Uuid, Result<bool, String>>,
+    cleared: HashSet<Uuid>,
+}
+
+impl SudoDraft {
+    fn load(profile: &HostProfile) -> Self {
+        let mut draft = Self::default();
+        if let Some(sudo) = &profile.advanced.sudo {
+            for credential in &sudo.credentials {
+                draft.stored.insert(
+                    credential.id,
+                    credentials::has(profile.id, CredentialKind::SudoPassword(credential.id))
+                        .map_err(|error| error.to_string()),
+                );
+            }
+        }
+        draft
+    }
 }
 
 struct PersistencePrompt {
@@ -121,6 +154,7 @@ impl HostEditor {
                 Err(error) => (false, Some(error.to_string())),
             };
         Self {
+            sudo: SudoDraft::load(&profile),
             original: profile.clone(),
             tag_input: String::new(),
             profile,
@@ -207,6 +241,12 @@ impl HostEditor {
             || !self.tag_input.trim().is_empty()
             || !self.password.is_empty()
             || !self.key_passphrase.is_empty()
+            || self
+                .sudo
+                .passwords
+                .values()
+                .any(|password| !password.is_empty())
+            || !self.sudo.cleared.is_empty()
             || self.password_mode != self.saved_password_mode.unwrap_or(PasswordMode::Password)
     }
 
@@ -218,13 +258,26 @@ impl HostEditor {
         self.profile.protocol == Protocol::Telnet || self.profile.ssh_auth == SshAuth::Password
     }
 
+    fn login_user_changed(&self) -> bool {
+        self.profile.username.trim() != self.original.username.trim()
+    }
+
+    fn should_clear_login_password(&self) -> bool {
+        // A key/Agent login must not retain the previous account's password
+        // for a later password login or sudo fallback under the new username.
+        self.login_user_changed() && !self.needs_password()
+    }
+
     fn should_store_password(&self) -> bool {
         if !self.needs_password() {
             return false;
         }
         match self.password_mode {
             PasswordMode::Password => !self.password.is_empty(),
-            PasswordMode::NoPassword => self.saved_password_mode != Some(PasswordMode::NoPassword),
+            PasswordMode::NoPassword => {
+                self.saved_password_mode != Some(PasswordMode::NoPassword)
+                    || self.login_user_changed()
+            }
         }
     }
 
@@ -238,13 +291,88 @@ impl HostEditor {
         self.needs_password()
             && self.password_mode == PasswordMode::Password
             && self.password.is_empty()
-            && self.saved_password_mode != Some(PasswordMode::Password)
+            && (self.saved_password_mode != Some(PasswordMode::Password)
+                || self.login_user_changed())
     }
 
     fn test_result_is_stale(&self) -> bool {
         self.connection_changed()
             || self.should_store_password()
             || self.should_store_key_passphrase()
+    }
+
+    fn sudo_updates(&self) -> Result<Vec<credentials::CredentialUpdate>, &'static str> {
+        let mut updates = Vec::new();
+        let current = self
+            .profile
+            .advanced
+            .sudo
+            .as_ref()
+            .map(|sudo| sudo.credentials.as_slice())
+            .unwrap_or(&[]);
+        let original = self
+            .original
+            .advanced
+            .sudo
+            .as_ref()
+            .map(|sudo| sudo.credentials.as_slice())
+            .unwrap_or(&[]);
+        for credential in current {
+            let password = self
+                .sudo
+                .passwords
+                .get(&credential.id)
+                .filter(|password| !password.is_empty());
+            if let Some(password) = password {
+                if crate::sudo::validate_password(password).is_err() {
+                    return Err("sudo_invalid_password");
+                }
+                updates.push((
+                    CredentialKind::SudoPassword(credential.id),
+                    Some(password.clone()),
+                ));
+            } else if self.sudo.cleared.contains(&credential.id) {
+                updates.push((CredentialKind::SudoPassword(credential.id), None));
+            }
+        }
+        for credential in original {
+            if !current.iter().any(|new| new.id == credential.id) {
+                updates.push((CredentialKind::SudoPassword(credential.id), None));
+            }
+        }
+        Ok(updates)
+    }
+
+    fn sudo_changes(
+        &self,
+    ) -> Result<
+        (
+            Option<crate::model::SudoSettings>,
+            Vec<credentials::CredentialUpdate>,
+        ),
+        &'static str,
+    > {
+        let mut updates = self.sudo_updates()?;
+        let mut settings = self.profile.advanced.sudo.clone();
+        if let Some(settings) = &mut settings {
+            for credential in &mut settings.credentials {
+                if self.original.advanced.sudo.as_ref().is_some_and(|old| {
+                    old.credentials.iter().any(|old| {
+                        old.id == credential.id && old.username.trim() != credential.username.trim()
+                    })
+                }) {
+                    // A call using an older profile snapshot must never read a
+                    // newly renamed user's password from the previous account's slot.
+                    let old = CredentialKind::SudoPassword(credential.id);
+                    credential.id = Uuid::new_v4();
+                    if let Some((kind, _)) = updates.iter_mut().find(|(kind, _)| *kind == old) {
+                        *kind = CredentialKind::SudoPassword(credential.id);
+                    }
+                    updates.push((old, None));
+                }
+            }
+        }
+        Ok((settings, updates))
     }
 }
 
@@ -285,6 +413,8 @@ struct ImportCleanupPrompt {
 enum EditorAction {
     Save,
     Test,
+    TestSudo,
+    TestSu,
     CancelCodex,
     BrowsePrivateKey,
     DiscoverFido,
@@ -318,6 +448,8 @@ pub struct HostsApp {
     editor: Option<HostEditor>,
     status: StatusMessage,
     test_operations: HashMap<Uuid, TestOperation>,
+    sudo_test: Option<(Uuid, TestOperation)>,
+    privilege_test_prompt: Option<PrivilegeTestPrompt>,
     pending_tests: VecDeque<Uuid>,
     test_hosts_snapshot: Option<Arc<Vec<HostProfile>>>,
     test_states: HashMap<Uuid, HostTestState>,
@@ -487,6 +619,8 @@ impl HostsApp {
             editor,
             status,
             test_operations: HashMap::new(),
+            sudo_test: None,
+            privilege_test_prompt: None,
             pending_tests: VecDeque::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
@@ -597,6 +731,7 @@ impl HostsApp {
         let invalidate_test_state = editor.test_result_is_stale();
         let store_password = editor.should_store_password();
         let store_key_passphrase = editor.should_store_key_passphrase();
+        let clear_login_password = editor.should_clear_login_password();
         let credential_update = if store_password {
             Some((
                 CredentialKind::Password,
@@ -610,8 +745,15 @@ impl HostsApp {
         } else {
             None
         };
+        let (sudo_settings, mut sudo_updates) = editor
+            .sudo_changes()
+            .map_err(|key| self.catalog.text(key).to_owned())?;
+        if clear_login_password {
+            sudo_updates.push((CredentialKind::Password, None));
+        }
         let id = editor.profile.id;
         let mut profile = editor.profile.clone();
+        profile.advanced.sudo = sudo_settings;
         profile.tags = normalize_tags(
             profile
                 .tags
@@ -623,6 +765,25 @@ impl HostsApp {
         profile.username = profile.username.trim().to_owned();
         profile.private_key_path = profile.private_key_path.trim().to_owned();
         profile.agent_key_fingerprint = profile.agent_key_fingerprint.trim().to_owned();
+        if let Some(sudo) = &mut profile.advanced.sudo {
+            for credential in &mut sudo.credentials {
+                credential.username = credential.username.trim().to_owned();
+            }
+            if profile.protocol == Protocol::Telnet {
+                sudo.enabled = false;
+            }
+            if *sudo == crate::model::SudoSettings::default() {
+                profile.advanced.sudo = None;
+            }
+        }
+        if let Some(su) = &mut profile.advanced.su {
+            if profile.protocol == Protocol::Telnet {
+                su.enabled = false;
+            }
+            if *su == crate::model::SuSettings::default() {
+                profile.advanced.su = None;
+            }
+        }
         if invalidate_test_state {
             profile.verified = false;
         }
@@ -645,7 +806,18 @@ impl HostsApp {
             .ok_or_else(|| "HOST_NOT_FOUND".to_owned())?;
         stored.clone_from(&profile);
 
-        if let Some((kind, secret)) = credential_update.as_ref() {
+        if !sudo_updates.is_empty() {
+            if let Some((kind, secret)) = &credential_update {
+                sudo_updates.push((*kind, Some(secret.clone())));
+            }
+            credentials::save_transaction(id, &sudo_updates, || {
+                updated_store.save().map_err(|error| error.to_string())
+            })
+            .map_err(|error| {
+                self.catalog
+                    .format("credential_error", &[("error", &error)])
+            })?;
+        } else if let Some((kind, secret)) = credential_update.as_ref() {
             match credentials::snapshot_kind(id, *kind) {
                 Ok(snapshot) => {
                     if let Err(error) = credentials::store(id, *kind, secret.as_str()) {
@@ -696,11 +868,17 @@ impl HostsApp {
         let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
         editor.profile = profile.clone();
         editor.original = profile;
+        editor.sudo = SudoDraft::load(&editor.profile);
         editor.first_save = false;
         editor.confirmed_persistence = None;
         editor.tag_input.clear();
         if store_password {
             editor.saved_password_mode = Some(editor.password_mode);
+            editor.password_read_error = None;
+            editor.password.clear();
+        }
+        if clear_login_password {
+            editor.saved_password_mode = None;
             editor.password_read_error = None;
             editor.password.clear();
         }
@@ -750,6 +928,7 @@ impl HostsApp {
             PendingAction::Save => self.save(context),
             PendingAction::Test => self.start_test(),
             PendingAction::TestAll => self.start_all_tests(),
+            PendingAction::TestPrivilege { su, target } => self.start_privilege_test(su, target),
         }
     }
 
@@ -793,8 +972,88 @@ impl HostsApp {
         self.set_status_key("testing");
     }
 
+    fn open_privilege_test(&mut self, su: bool) {
+        if !self.tests_idle() {
+            return;
+        }
+        if let Some(editor) = &self.editor {
+            self.privilege_test_prompt = Some(PrivilegeTestPrompt {
+                host_id: editor.profile.id,
+                su,
+                target: if su { String::new() } else { "root".into() },
+            });
+        }
+    }
+
+    fn start_privilege_test(&mut self, su: bool, target: String) {
+        if self.sudo_test.is_some() || !self.tests_idle() {
+            return;
+        }
+        let Some(editor) = &self.editor else {
+            return;
+        };
+        let validate = if su {
+            crate::su::validate
+        } else {
+            crate::sudo::validate
+        };
+        let target = match validate(&editor.profile, "/usr/bin/id", &[], Some(&target)) {
+            Ok(target) => target,
+            Err(error) => {
+                self.set_status(StatusKind::Error, error.message);
+                return;
+            }
+        };
+        if self.ask_persistence_confirmation(PendingAction::TestPrivilege {
+            su,
+            target: target.clone(),
+        }) {
+            return;
+        }
+        if let Err(error) = self.persist_editor() {
+            self.set_status(StatusKind::Error, error);
+            return;
+        }
+        let Some(profile) = self.editor.as_ref().map(|editor| editor.profile.clone()) else {
+            return;
+        };
+        let hosts = self.store.hosts.clone();
+        let timeout = GUI_INTERACTIVE_TEST_TIMEOUT;
+        let (sender, receiver) = mpsc::channel();
+        let repaint = self.repaint_context.clone();
+        self.sudo_test = Some((
+            profile.id,
+            TestOperation {
+                receiver,
+                started_at: Instant::now(),
+                timeout,
+            },
+        ));
+        self.repaint_context.request_repaint_after(timeout);
+        self.set_status_key(if su { "su_testing" } else { "sudo_testing" });
+        thread::spawn(move || {
+            let execute = if su {
+                connection::execute_su
+            } else {
+                connection::execute_sudo
+            };
+            let result = execute(
+                &profile,
+                &hosts,
+                "/usr/bin/id",
+                &[],
+                Some(&target),
+                gui_test_limits(timeout),
+            );
+            if sender.send((Instant::now(), result)).is_ok() {
+                repaint.request_repaint();
+            }
+        });
+    }
+
     fn start_test_host(&mut self, id: Uuid) {
         if self.testing_all
+            || self.sudo_test.is_some()
             || self.test_operations.contains_key(&id)
             || self.pending_tests.contains(&id)
         {
@@ -842,7 +1101,7 @@ impl HostsApp {
     }
 
     fn tests_idle(&self) -> bool {
-        self.test_operations.is_empty() && self.pending_tests.is_empty()
+        self.test_operations.is_empty() && self.pending_tests.is_empty() && self.sudo_test.is_none()
     }
 
     fn start_all_tests(&mut self) {
@@ -883,6 +1142,64 @@ impl HostsApp {
     }
 
     fn poll_tests(&mut self) {
+        if let Some((id, operation)) = &self.sudo_test {
+            let id = *id;
+            let outcome = match operation.receiver.try_recv() {
+                Ok((_, result)) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(RemoteFailure::new(
+                    "TEST_WORKER_STOPPED",
+                    "The user-switch test worker stopped unexpectedly.",
+                ))),
+                Err(mpsc::TryRecvError::Empty)
+                    if operation.started_at.elapsed() >= operation.timeout =>
+                {
+                    Some(Err(RemoteFailure::new(
+                        "TEST_TIMEOUT",
+                        "The user-switch test timed out; remote execution may have started.",
+                    )))
+                }
+                Err(mpsc::TryRecvError::Empty) => None,
+            };
+            if let Some(outcome) = outcome {
+                self.sudo_test = None;
+                match outcome {
+                    Ok(result) if result.exit_code == 0 => {
+                        let text = self.catalog.format(
+                            if result.su_user.is_some() {
+                                "su_test_ok"
+                            } else {
+                                "sudo_test_ok"
+                            },
+                            &[("result", result.stdout.trim())],
+                        );
+                        self.set_status(StatusKind::Success, text);
+                    }
+                    Ok(result) => self.set_status(
+                        StatusKind::Error,
+                        format!(
+                            "{}: exit {} — {}",
+                            if result.su_user.is_some() {
+                                "su"
+                            } else {
+                                "sudo"
+                            },
+                            result.exit_code,
+                            result.stderr
+                        ),
+                    ),
+                    Err(error) if matches!(error.code, "HOSTKEY_UNKNOWN" | "HOSTKEY_MISMATCH") => {
+                        self.finish_test(id, Err(error));
+                        if let Some(prompt) = &mut self.fingerprint_prompt {
+                            prompt.retry_test = false;
+                        }
+                    }
+                    Err(error) => self.set_status(
+                        StatusKind::Error,
+                        format!("{}: {}", error.code, error.message),
+                    ),
+                }
+            }
+        }
         let mut completed = Vec::new();
         for (&id, operation) in &self.test_operations {
             match operation.receiver.try_recv() {
@@ -1155,7 +1472,10 @@ impl HostsApp {
             self.set_status_key("chain_in_use");
             return;
         }
-        let credential_snapshot = match credentials::snapshot(id) {
+        let Some(profile) = self.store.hosts.iter().find(|host| host.id == id).cloned() else {
+            return;
+        };
+        let credential_snapshot = match credentials::snapshot_host(&profile) {
             Ok(snapshot) => snapshot,
             Err(error) => {
                 self.set_status_format("credential_error", &[("error", &error.to_string())]);
@@ -1163,7 +1483,7 @@ impl HostsApp {
             }
         };
         let credential_snapshots = vec![(id, credential_snapshot)];
-        if let Err(error) = credentials::delete_all(id) {
+        if let Err(error) = credentials::delete_host(&profile) {
             let error = with_rollback_error(
                 error.to_string(),
                 restore_credential_snapshots(&credential_snapshots).err(),
@@ -1237,9 +1557,16 @@ impl HostsApp {
 
     fn remove_batch(&mut self) {
         let ids = self.batch_selected.iter().copied().collect::<Vec<_>>();
-        let credential_snapshots = match ids
+        let profiles = self
+            .store
+            .hosts
             .iter()
-            .map(|id| credentials::snapshot(*id).map(|snapshot| (*id, snapshot)))
+            .filter(|host| ids.contains(&host.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let credential_snapshots = match profiles
+            .iter()
+            .map(|host| credentials::snapshot_host(host).map(|snapshot| (host.id, snapshot)))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(snapshots) => snapshots,
@@ -1248,8 +1575,8 @@ impl HostsApp {
                 return;
             }
         };
-        for id in &ids {
-            if let Err(error) = credentials::delete_all(*id) {
+        for profile in &profiles {
+            if let Err(error) = credentials::delete_host(profile) {
                 let error = with_rollback_error(
                     error.to_string(),
                     restore_credential_snapshots(&credential_snapshots).err(),
@@ -1716,6 +2043,7 @@ impl HostsApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(panel_fill))
             .show(ui, |ui| self.editor_panel(ui, &context));
+        self.privilege_test_dialog(&context);
         self.show_dialogs(&context);
         self.toasts(&context);
         if let Some(temporary) = &mut self.temporary {
@@ -1965,6 +2293,7 @@ mod tests {
         profile: HostProfile,
     ) -> HostsApp {
         let editor = HostEditor {
+            sudo: SudoDraft::default(),
             tag_input: String::new(),
             profile: profile.clone(),
             original: profile.clone(),
@@ -1995,6 +2324,8 @@ mod tests {
             editor: Some(editor),
             status: StatusMessage::info(""),
             test_operations: HashMap::new(),
+            sudo_test: None,
+            privilege_test_prompt: None,
             pending_tests: VecDeque::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
@@ -2464,6 +2795,7 @@ mod tests {
         };
         let mut editor = HostEditor {
             tag_input: String::new(),
+            sudo: SudoDraft::default(),
             profile: profile.clone(),
             original: profile,
             password: Zeroizing::new(String::new()),
@@ -2499,6 +2831,105 @@ mod tests {
         editor.password.clear();
         editor.profile.address = "127.0.0.2".to_owned();
         assert!(editor.test_result_is_stale());
+    }
+
+    #[test]
+    fn changing_login_user_requires_its_password_or_clears_the_old_password_for_key_login() {
+        let context = egui::Context::default();
+        let profile = HostProfile {
+            username: "alice".into(),
+            ..Default::default()
+        };
+        let mut app = metadata_test_app(&context, "en", profile);
+        let editor = app.editor.as_mut().unwrap();
+        editor.saved_password_mode = Some(PasswordMode::Password);
+        assert!(!editor.password_value_missing());
+        editor.profile.username = " alice ".into();
+        assert!(!editor.password_value_missing());
+        editor.profile.username = "bob".into();
+        assert!(editor.password_value_missing());
+        editor.password.push_str("bob login token");
+        assert!(!editor.password_value_missing());
+        assert!(editor.should_store_password());
+        assert!(!editor.should_clear_login_password());
+        editor.password.clear();
+        for auth in [SshAuth::PrivateKey, SshAuth::SshAgent] {
+            editor.profile.ssh_auth = auth;
+            assert!(!editor.password_value_missing());
+            assert!(editor.should_clear_login_password());
+            editor.profile.username = "alice".into();
+            assert!(!editor.should_clear_login_password());
+            editor.profile.username = "bob".into();
+        }
+        editor.profile.ssh_auth = SshAuth::Password;
+        editor.password_mode = PasswordMode::NoPassword;
+        editor.saved_password_mode = Some(PasswordMode::NoPassword);
+        assert!(!editor.password_value_missing());
+        assert!(editor.should_store_password());
+        assert!(!editor.should_clear_login_password());
+    }
+
+    #[test]
+    fn user_password_drafts_allow_passwordless_rename_without_reusing_old_secrets() {
+        let context = egui::Context::default();
+        let id = Uuid::new_v4();
+        let mut profile = HostProfile::default();
+        profile.advanced.sudo = Some(crate::model::SudoSettings {
+            enabled: true,
+            credentials: vec![crate::model::SudoCredential {
+                id,
+                username: "alice".into(),
+            }],
+        });
+        let mut app = metadata_test_app(&context, "en", profile);
+        let editor = app.editor.as_mut().unwrap();
+        assert!(editor.sudo_updates().unwrap().is_empty());
+        editor.profile.advanced.sudo.as_mut().unwrap().credentials[0].username = "bob".into();
+        assert!(editor.sudo_updates().unwrap().is_empty());
+        let (passwordless, updates) = editor.sudo_changes().unwrap();
+        assert_ne!(passwordless.unwrap().credentials[0].id, id);
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(updates[0], (CredentialKind::SudoPassword(record), None) if record == id));
+        editor
+            .sudo
+            .passwords
+            .insert(id, Zeroizing::new("  ".into()));
+        assert_eq!(
+            editor.sudo_updates().unwrap()[0]
+                .1
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "  "
+        );
+        assert!(editor.has_unsaved_changes());
+        let (renamed, updates) = editor.sudo_changes().unwrap();
+        let replacement = renamed.unwrap().credentials[0].id;
+        assert_ne!(replacement, id);
+        assert!(
+            updates
+                .iter()
+                .any(|(kind, value)| *kind == CredentialKind::SudoPassword(id) && value.is_none())
+        );
+        assert!(updates.iter().any(|(kind, value)| *kind
+            == CredentialKind::SudoPassword(replacement)
+            && value.as_ref().is_some_and(|value| value.as_str() == "  ")));
+        editor.profile.advanced.sudo.as_mut().unwrap().credentials[0].username = "alice".into();
+        editor.sudo.passwords.clear();
+        editor.sudo.cleared.insert(id);
+        assert!(editor.sudo_updates().unwrap()[0].1.is_none());
+        editor.sudo.cleared.clear();
+        editor
+            .profile
+            .advanced
+            .sudo
+            .as_mut()
+            .unwrap()
+            .credentials
+            .clear();
+        let updates = editor.sudo_updates().unwrap();
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(updates[0], (CredentialKind::SudoPassword(record), None) if record == id));
     }
 
     #[test]

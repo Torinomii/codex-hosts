@@ -11,6 +11,8 @@ mod mcp;
 mod model;
 mod ssh;
 mod storage;
+mod su;
+mod sudo;
 mod telnet;
 mod temporary_secrets;
 mod tool;
@@ -127,6 +129,12 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
                 )
             }
             "--user" => options.prefill.username = Some(next_value(&args, &mut index, flag)?),
+            "--sudo-enabled" => options.prefill.sudo_enabled = Some(next_value(&args, &mut index, flag)?.parse().map_err(|_| "--sudo-enabled needs true or false".to_owned())?),
+            "--sudo-user" => return Err("Execution targets belong in exec_sudo.user for each call, not host settings.".into()),
+            "--su-enabled" => options.prefill.su_enabled = Some(next_value(&args, &mut index, flag)?.parse().map_err(|_| "--su-enabled needs true or false".to_owned())?),
+            "--su-user" => return Err("Execution targets belong in exec_su.user for each call, not host settings.".into()),
+            "--sudo-auth-user" => options.prefill.sudo_users.get_or_insert_with(Vec::new).push(next_value(&args, &mut index, flag)?),
+            "--sudo-auth-users" => options.prefill.sudo_users = Some(serde_json::from_str(&next_value(&args, &mut index, flag)?).map_err(|_| "--sudo-auth-users needs a JSON username array".to_owned())?),
             "--protocol" => {
                 options.prefill.protocol =
                     Some(match next_value(&args, &mut index, flag)?.as_str() {

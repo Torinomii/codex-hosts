@@ -78,7 +78,7 @@ Read this when you need exact request fields, result fields, limits, or an error
 
 ### Requests
 
-Every request is a JSON object with `action`. Unknown fields are ignored except in temporary-secret requests, which reject them.
+Every request is a JSON object with `action`. Unknown fields are ignored except in temporary-secret and sudo/su requests, which reject them.
 
 | action | required | optional |
 |---|---|---|
@@ -88,6 +88,8 @@ Every request is a JSON object with `action`. Unknown fields are ignored except 
 | `fido_identities` | | |
 | `probe` | `alias` | `connect_timeout_ms`, `command_timeout_ms` |
 | `exec` | `alias`, `command` | `stdin`, `connect_timeout_ms`, `command_timeout_ms` |
+| `exec_sudo` | `alias`, `program` (absolute path, SSH only), `user` | `args`, `connect_timeout_ms`, `command_timeout_ms` |
+| `exec_su` | `alias`, `program` (absolute path, SSH only), `user` | `args`, `connect_timeout_ms`, `command_timeout_ms` |
 | `exec_many` | `alias`, `commands` (1–64, none empty) | `max_concurrency`, `connect_timeout_ms`, `command_timeout_ms` |
 | `batch_probe` | `aliases` (1–256, unique) | `max_concurrency`, `connect_timeout_ms`, `command_timeout_ms`, `batch_timeout_ms`, `continue_on_error` (default true) |
 | `batch_exec` | `aliases`, `command` | same as `batch_probe` |
@@ -102,6 +104,8 @@ Every request is a JSON object with `action`. Unknown fields are ignored except 
 ### Results
 
 Every result carries `schema_version` (currently 1) and `status`.
+
+`exec_sudo` uses the same parameters and authentication protocol as the MCP tool, requires an explicit `user` for each call, and uses the Advanced sudo switch to authorize saved-password supply only. Passwordless or cached authentication works with the switch off; if authentication requests a password while it is off, the result is `SUDO_AUTO_AUTH_DISABLED` without reading a password for that request. It rejects `command`, `stdin` and password fields. The remote must provide `/usr/bin/sudo` and `/bin/sh`, with sudoers allowing the fixed shell launcher; command-only whitelists and TTY requirements can fail. Ordinary sudo reuses the current password-authenticated SSH user's saved login password. Optional saved user passwords override the matching user's password; empty or cleared matching overrides fall back to that same user's login password. The actual authentication username selects the source, and the password is sent at most once. Key passphrases, Agent credentials and other users' login passwords are never substituted. NOPASSWD or a timestamp hit sends none. Both execution results and sudo failures include `schema_version: 1`; failures also produce a nonzero CLI exit status. The single-host execution result additionally includes `sudo_user`; a nonzero exit after READY is `remote_error`, while missing READY is `SUDO_START_FAILED` and does not prove no execution occurred. Never retry automatically. `capabilities` adds `exec_sudo: true` and the `exec_sudo` action. `list_hosts` adds `sudo_enabled`, `sudo_login_password_available` and optional `sudo_credentials` (username and `has_password` only). An empty override list does not block login-password reuse or passwordless sudo. Sudo-specific errors are documented in [tool-protocol.md](../skill/codex-hosts/references/tool-protocol.md).
 
 `capabilities`: `app_version`, `actions`, `ssh_auth` (`password`, `private_key`, `ssh_agent`), `max_batch_hosts`, `max_batch_concurrency`, `default_batch_concurrency`, `max_batch_output_bytes`, `max_exec_many_commands`, `max_timeout_ms`, `default_retained_connections`, `max_retained_connections`, `connection_idle_timeout_ms`, `host_key_hash` (`sha256`), `agent_forwarding` (false), `host_metadata_fields`, `list_hosts_tag_filter`, `exec_stdin`, `exec_stdin_protocols`, `max_stdin_bytes`.
 
@@ -137,3 +141,7 @@ Authentication: `AUTH_TIMEOUT`, `CREDENTIAL_MISSING`, `CREDENTIAL_READ_FAILED`, 
 Execution: `CHANNEL_OPEN_FAILED`, `REMOTE_EXEC_FAILED` (the server rejected the exec request), `STDIN_WRITE_FAILED` (the channel closed before all input was sent and no exit status arrived; the command may have partly run), `COMMAND_TIMEOUT`, `OPERATION_TIMEOUT`, `COMMAND_CANCELLED`, `COMMAND_WORKER_FAILED`, `BATCH_TIMEOUT`, `BATCH_CANCELLED`, `BATCH_INTERNAL_FAILED`, `BATCH_RESULT_TOO_LARGE`, `EXEC_MANY_RESULT_TOO_LARGE`, `SERIALIZE_FAILED`.
 
 Telnet: `TELNET_CLOSED`, `TELNET_READ_FAILED`, `TELNET_WRITE_FAILED`, `OUTPUT_LIMIT`, `RUNTIME_CREATE_FAILED`.
+
+`exec_su` uses the same structured parameters as `exec_sudo`, with independent Advanced permissions for password supply and a required per-call `user`. With su supply off, passwordless execution still works; password requests fail before reading a password for that authentication request. It authenticates the target user, using the shared `sudo_credentials` account list; only that same target's password-authenticated SSH password may be reused. Passwordless su, including root-to-user when remotely permitted, reads and sends no password and requires no record. `list_hosts` adds `su_enabled`; results add `su_user`. Legacy results and failures retain `schema_version: 1`. Missing READY is `SU_START_FAILED`; caller exit status after READY remains `remote_error`. Capabilities include `exec_su`. Requires util-linux `/usr/bin/su`, `/usr/bin/env`, `/bin/sh` and a standard Linux-PAM C-locale password prompt; no PTY or business stdin. Errors: `SU_AUTO_AUTH_DISABLED`, `SU_INVALID_INPUT`, `SU_INVALID_PASSWORD`, `SU_CREDENTIAL_MISSING`, `SU_CREDENTIAL_READ_FAILED`, `SU_AUTH_REPEATED`, `SU_INPUT_FAILED`, `SU_START_FAILED`, `SU_CHANNEL_CLOSED`. Never retry automatically.
+
+Execution targets are not host settings. Old `default_user` JSON values are ignored and no longer saved; existing credential IDs and secret slots remain. Missing or null `user` is rejected before execution (MCP invalid arguments, file protocol `REQUEST_INVALID`). Empty/invalid targets return `SUDO_INVALID_INPUT` / `SU_INVALID_INPUT`; internal launches without a target fail with `SUDO_USER_REQUIRED` / `SU_USER_REQUIRED`. `list_hosts` no longer reports `sudo_default_user` / `su_default_user`. The results' `sudo_user` / `su_user` still identify the explicit target. GUI tests ask for a temporary target and never save it as a default.

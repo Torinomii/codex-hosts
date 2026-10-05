@@ -515,9 +515,13 @@ fn auth_section(
             });
             let password_hint = if editor.password_mode == PasswordMode::NoPassword {
                 catalog.text("no_password_hint").to_owned()
+            } else if editor.login_user_changed() {
+                catalog.text("login_password_user_changed").to_owned()
             } else if let Some(error) = editor.password_read_error.as_deref() {
                 catalog.format("credential_error", &[("error", error)])
-            } else if editor.saved_password_mode == Some(PasswordMode::Password) {
+            } else if editor.saved_password_mode == Some(PasswordMode::Password)
+                && !editor.login_user_changed()
+            {
                 catalog.text("password_saved").to_owned()
             } else {
                 catalog.text("password_required").to_owned()
@@ -654,7 +658,12 @@ fn persistence_rows(
 
 /// Collapsed by default; the header summarises anything set away from its default so a
 /// tuned host is recognisable without expanding the card.
-fn advanced_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) {
+fn advanced_section(
+    ui: &mut egui::Ui,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+    action: &mut Option<EditorAction>,
+) {
     let summary = advanced_summary(&editor.profile, catalog);
     let customised = !editor.profile.advanced.is_default();
     egui::Frame::new()
@@ -675,6 +684,7 @@ fn advanced_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalo
                     ui.separator();
                     ui.add_space(4.0);
                     advanced_rows(ui, editor, catalog);
+                    sudo_rows(ui, editor, catalog, action);
                 });
             let summary_text = if customised {
                 RichText::new(summary).small().strong()
@@ -719,11 +729,389 @@ fn advanced_summary(profile: &HostProfile, catalog: &Catalog) -> String {
     if advanced.telnet_prompts.is_some() {
         parts.push(catalog.text("telnet_prompts").to_owned());
     }
+    if advanced
+        .sudo
+        .as_ref()
+        .is_some_and(|settings| settings.enabled)
+    {
+        parts.push("sudo".into());
+    }
+    if advanced
+        .su
+        .as_ref()
+        .is_some_and(|settings| settings.enabled)
+    {
+        parts.push("su".into());
+    }
+    let count = advanced
+        .sudo
+        .as_ref()
+        .map_or(0, |settings| settings.credentials.len());
+    if count != 0 {
+        parts.push(catalog.format("privilege_user_count", &[("count", &count.to_string())]));
+    }
     if parts.is_empty() {
         catalog.text("advanced_default_summary").to_owned()
     } else {
         parts.join(" · ")
     }
+}
+
+fn sudo_rows(
+    ui: &mut egui::Ui,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+    action: &mut Option<EditorAction>,
+) {
+    let ssh = editor.profile.protocol == Protocol::Ssh;
+    if !ssh && editor.profile.advanced.sudo.is_none() && editor.profile.advanced.su.is_none() {
+        return;
+    }
+    let current_id = sudo_auth_section(ui, editor, catalog, action, ssh);
+    su_auth_section(ui, editor, catalog, action, ssh, current_id);
+}
+
+fn sudo_auth_section(
+    ui: &mut egui::Ui,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+    action: &mut Option<EditorAction>,
+    ssh: bool,
+) -> uuid::Uuid {
+    ui.separator();
+    ui.label(RichText::new(catalog.text("sudo_settings")).strong());
+    let mut enabled = ssh
+        && editor
+            .profile
+            .advanced
+            .sudo
+            .as_ref()
+            .is_some_and(|s| s.enabled);
+    if ui
+        .add_enabled(
+            ssh,
+            egui::Checkbox::new(&mut enabled, catalog.text("sudo_enabled")),
+        )
+        .on_hover_text(catalog.text("sudo_hint"))
+        .changed()
+    {
+        editor
+            .profile
+            .advanced
+            .sudo
+            .get_or_insert_with(Default::default)
+            .enabled = enabled;
+    }
+    ui.add(
+        egui::Label::new(
+            RichText::new(catalog.text("sudo_current_hint"))
+                .small()
+                .weak(),
+        )
+        .wrap(),
+    );
+    let current_id = current_user_password(ui, editor, catalog, ssh);
+    if ui
+        .add_enabled(ssh, egui::Button::new(catalog.text("sudo_test")))
+        .clicked()
+    {
+        *action = Some(EditorAction::TestSudo);
+    }
+    current_id
+}
+
+fn su_auth_section(
+    ui: &mut egui::Ui,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+    action: &mut Option<EditorAction>,
+    ssh: bool,
+    current_id: uuid::Uuid,
+) {
+    ui.separator();
+    ui.label(RichText::new(catalog.text("su_settings")).strong());
+    let mut enabled = ssh
+        && editor
+            .profile
+            .advanced
+            .su
+            .as_ref()
+            .is_some_and(|s| s.enabled);
+    if ui
+        .add_enabled(
+            ssh,
+            egui::Checkbox::new(&mut enabled, catalog.text("su_enabled")),
+        )
+        .on_hover_text(catalog.text("su_hint"))
+        .changed()
+    {
+        editor
+            .profile
+            .advanced
+            .su
+            .get_or_insert_with(Default::default)
+            .enabled = enabled;
+    }
+    ui.add(
+        egui::Label::new(
+            RichText::new(catalog.text("su_accounts_hint"))
+                .small()
+                .weak(),
+        )
+        .wrap(),
+    );
+    let Some(sudo) = &mut editor.profile.advanced.sudo else {
+        ui.horizontal_wrapped(|ui| {
+            if ui.button(catalog.text("sudo_add_user")).clicked() {
+                editor
+                    .profile
+                    .advanced
+                    .sudo
+                    .get_or_insert_with(Default::default)
+                    .credentials
+                    .push(crate::model::SudoCredential {
+                        id: uuid::Uuid::new_v4(),
+                        username: String::new(),
+                    });
+            }
+            if ui
+                .add_enabled(ssh, egui::Button::new(catalog.text("su_test")))
+                .clicked()
+            {
+                *action = Some(EditorAction::TestSu);
+            }
+        });
+        return;
+    };
+    let mut removed = None;
+    for (index, credential) in sudo.credentials.iter_mut().enumerate() {
+        if credential.id == current_id {
+            continue;
+        }
+        ui.push_id(credential.id, |ui| {
+            let renamed = editor.original.advanced.sudo.as_ref().is_some_and(|old| {
+                old.credentials.iter().any(|old| {
+                    old.id == credential.id && old.username.trim() != credential.username.trim()
+                })
+            });
+            let hint = if renamed {
+                catalog.text("privilege_password_renamed").to_owned()
+            } else if editor.sudo.cleared.contains(&credential.id) {
+                catalog.text("sudo_password_cleared").to_owned()
+            } else {
+                match editor.sudo.stored.get(&credential.id) {
+                    Some(Ok(true)) => catalog.text("password_saved").to_owned(),
+                    Some(Err(error)) => catalog.format("credential_error", &[("error", error)]),
+                    _ => catalog.text("sudo_password_missing").to_owned(),
+                }
+            };
+            let placeholder = if renamed {
+                catalog.text("privilege_password_optional")
+            } else if editor.sudo.cleared.contains(&credential.id) {
+                catalog.text("sudo_password_cleared")
+            } else if editor
+                .sudo
+                .stored
+                .get(&credential.id)
+                .is_some_and(|value| matches!(value, Ok(true)))
+            {
+                catalog.text("sudo_password_saved")
+            } else {
+                catalog.text("privilege_password_optional")
+            };
+            egui::Frame::new()
+                .fill(if index % 2 == 1 {
+                    ui.visuals().faint_bg_color
+                } else {
+                    egui::Color32::TRANSPARENT
+                })
+                .corner_radius(4.0)
+                .inner_margin(egui::Margin::symmetric(8, 6))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    let height = control_height(ui);
+                    let gap = 6.0;
+                    let fields_width = (ui.available_width() - height - 2.0 * gap).max(100.0);
+                    let username_width = (fields_width * 0.36).clamp(48.0, 220.0);
+                    let password_width = fields_width - username_width;
+                    let password = editor
+                        .sudo
+                        .passwords
+                        .entry(credential.id)
+                        .or_insert_with(|| zeroize::Zeroizing::new(String::new()));
+                    ui.horizontal_top(|ui| {
+                        ui.spacing_mut().item_spacing.x = gap;
+                        ui.spacing_mut().button_padding.x = 4.0;
+                        ui.spacing_mut().interact_size.x = height;
+                        ui.add_sized(
+                            [username_width, height],
+                            single_line(ui, &mut credential.username, username_width)
+                                .id(sudo_field_id(credential.id, "username"))
+                                .hint_text(catalog.text("su_target_user")),
+                        )
+                        .on_hover_text(catalog.text("su_target_user"));
+                        ui.add_sized(
+                            [password_width, height],
+                            single_line(ui, password, password_width)
+                                .id(sudo_field_id(credential.id, "password"))
+                                .password(true)
+                                .hint_text(placeholder),
+                        )
+                        .on_hover_text(hint);
+                        ui.menu_button("⋯", |ui| {
+                            if ui.button(catalog.text("sudo_clear_password")).clicked() {
+                                password.clear();
+                                editor.sudo.cleared.insert(credential.id);
+                                ui.close();
+                            }
+                            if ui.button(catalog.text("sudo_delete_user")).clicked() {
+                                removed = Some(credential.id);
+                                ui.close();
+                            }
+                        })
+                        .response
+                        .on_hover_text(catalog.text("sudo_user_actions"));
+                    });
+                });
+        });
+    }
+    if let Some(id) = removed {
+        sudo.credentials.retain(|credential| credential.id != id);
+        editor.sudo.passwords.remove(&id);
+        editor.sudo.cleared.remove(&id);
+        editor.sudo.stored.remove(&id);
+    }
+    ui.horizontal_wrapped(|ui| {
+        if ui.button(catalog.text("sudo_add_user")).clicked() {
+            sudo.credentials.push(crate::model::SudoCredential {
+                id: uuid::Uuid::new_v4(),
+                username: String::new(),
+            });
+        }
+        if ui
+            .add_enabled(ssh, egui::Button::new(catalog.text("su_test")))
+            .clicked()
+        {
+            *action = Some(EditorAction::TestSu);
+        }
+    });
+}
+
+/// The fixed SSH login identity supplies sudo's ordinary authentication. No
+/// authentication-user selector or persistent execution target is offered.
+fn current_user_password(
+    ui: &mut egui::Ui,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+    ssh: bool,
+) -> uuid::Uuid {
+    let username = editor.profile.username.trim().to_owned();
+    let existing = editor.profile.advanced.sudo.as_ref().and_then(|s| {
+        s.credentials
+            .iter()
+            .find(|c| c.username.trim() == username)
+            .map(|c| c.id)
+    });
+    let id = existing
+        .or_else(|| {
+            editor
+                .sudo
+                .current_user
+                .as_ref()
+                .filter(|(name, _)| name == &username)
+                .map(|(_, id)| *id)
+        })
+        .unwrap_or_else(uuid::Uuid::new_v4);
+    editor.sudo.current_user = Some((username.clone(), id));
+    let renamed = editor.original.advanced.sudo.as_ref().is_some_and(|s| {
+        s.credentials
+            .iter()
+            .any(|c| c.id == id && c.username.trim() != username)
+    });
+    let can_reuse = editor.profile.ssh_auth == SshAuth::Password
+        && editor.password_mode == PasswordMode::Password
+        && (!editor.login_user_changed() || !editor.password.is_empty());
+    let placeholder = if renamed {
+        catalog.text("current_user_password")
+    } else if editor.sudo.cleared.contains(&id) {
+        catalog.text("sudo_password_cleared")
+    } else if editor
+        .sudo
+        .stored
+        .get(&id)
+        .is_some_and(|v| matches!(v, Ok(true)))
+    {
+        catalog.text("sudo_password_saved")
+    } else if can_reuse {
+        catalog.text("sudo_password_login")
+    } else {
+        catalog.text("current_user_password")
+    };
+    let hint = if renamed {
+        catalog.text("privilege_password_renamed").to_owned()
+    } else if let Some(Err(error)) = editor.sudo.stored.get(&id) {
+        catalog.format("credential_error", &[("error", error)])
+    } else {
+        placeholder.to_owned()
+    };
+    let mut changed = false;
+    let password = editor
+        .sudo
+        .passwords
+        .entry(id)
+        .or_insert_with(|| zeroize::Zeroizing::new(String::new()));
+    let margin = input_margin(ui);
+    let height = control_height(ui)
+        .max(ui.text_style_height(&egui::TextStyle::Body) + f32::from(margin.top + margin.bottom));
+    let width = (ui.available_width() - height - 12.0).max(100.0);
+    let username_width = (width * 0.36).clamp(48.0, 220.0);
+    let password_width = width - username_width;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().button_padding.x = 4.0;
+        ui.spacing_mut().interact_size.x = height;
+        let identity = ui.add_sized(
+            [username_width, height],
+            egui::Label::new(&username).truncate(),
+        );
+        ui.interact(
+            identity.rect,
+            sudo_field_id(id, "login_identity"),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(catalog.format("sudo_login_identity", &[("user", &username)]));
+        changed = ui
+            .add_enabled(
+                ssh && crate::model::valid_sudo_username(&username),
+                single_line(ui, password, password_width)
+                    .id(sudo_field_id(id, "password"))
+                    .password(true)
+                    .hint_text(placeholder),
+            )
+            .on_hover_text(hint)
+            .changed();
+        ui.menu_button("⋯", |ui| {
+            if ui.button(catalog.text("sudo_clear_password")).clicked() {
+                password.clear();
+                editor.sudo.cleared.insert(id);
+                ui.close();
+            }
+        });
+    });
+    if changed && !password.is_empty() && existing.is_none() {
+        editor
+            .profile
+            .advanced
+            .sudo
+            .get_or_insert_with(Default::default)
+            .credentials
+            .push(crate::model::SudoCredential { id, username });
+    }
+    id
+}
+
+fn sudo_field_id(record: uuid::Uuid, field: &str) -> egui::Id {
+    egui::Id::new(("sudo_account", record, field))
 }
 
 fn remote_env_key(value: RemoteEnv) -> &'static str {
@@ -926,10 +1314,69 @@ fn warning_callout(ui: &mut egui::Ui, text: &str) {
 }
 
 impl HostsApp {
+    pub(super) fn privilege_test_dialog(&mut self, context: &egui::Context) {
+        let Some(prompt) = &mut self.privilege_test_prompt else {
+            return;
+        };
+        let Some(editor) = &self.editor else {
+            self.privilege_test_prompt = None;
+            return;
+        };
+        if editor.profile.id != prompt.host_id {
+            self.privilege_test_prompt = None;
+            return;
+        }
+        let catalog = self.catalog.clone();
+        let validate = if prompt.su {
+            crate::su::validate
+        } else {
+            crate::sudo::validate
+        };
+        let mut choice = None;
+        let response =
+            egui::Modal::new(egui::Id::new("privilege_test_target_dialog")).show(context, |ui| {
+                ui.set_width((context.content_rect().width() - 64.0).clamp(180.0, 440.0));
+                ui.heading(catalog.text(if prompt.su { "su_test" } else { "sudo_test" }));
+                ui.label(catalog.text("privilege_test_hint"));
+                ui.add_space(8.0);
+                ui.label(catalog.text("privilege_test_target"));
+                ui.add_sized(
+                    [ui.available_width(), control_height(ui)],
+                    egui::TextEdit::singleline(&mut prompt.target)
+                        .id(egui::Id::new("privilege_test_target"))
+                        .hint_text(catalog.text("privilege_test_target")),
+                );
+                let valid =
+                    validate(&editor.profile, "/usr/bin/id", &[], Some(&prompt.target)).is_ok();
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(valid, egui::Button::new(catalog.text("privilege_test_run")))
+                        .clicked()
+                    {
+                        choice = Some(true);
+                    }
+                    if ui.button(catalog.text("cancel")).clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+        if response.should_close() {
+            choice = Some(false);
+        }
+        if let Some(run) = choice {
+            let prompt = self.privilege_test_prompt.take().unwrap();
+            if run {
+                self.start_privilege_test(prompt.su, prompt.target);
+            }
+        }
+    }
+
     pub(super) fn editor_panel(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let catalog = self.catalog.clone();
         let hosts = self.store.hosts.clone();
         let testing = self.testing_all
+            || self.sudo_test.is_some()
             || self.selected.is_some_and(|id| {
                 self.test_operations.contains_key(&id) || self.pending_tests.contains(&id)
             });
@@ -995,6 +1442,8 @@ impl HostsApp {
         match action {
             Some(EditorAction::Save) => self.save(context),
             Some(EditorAction::Test) => self.start_test(),
+            Some(EditorAction::TestSudo) => self.open_privilege_test(false),
+            Some(EditorAction::TestSu) => self.open_privilege_test(true),
             Some(EditorAction::CancelCodex) => {
                 let alias = self
                     .editor
@@ -1106,7 +1555,7 @@ impl HostsApp {
         } else {
             warning_callout(ui, catalog.text("telnet_warning"));
         }
-        advanced_section(ui, editor, catalog);
+        advanced_section(ui, editor, catalog, action);
     }
 }
 
@@ -1144,6 +1593,27 @@ mod tests {
             tags: vec!["prod".into(), "web".into()],
             ..Default::default()
         }
+    }
+
+    fn auth_frame(
+        app: &mut HostsApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1040.0, 2400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                ui.set_max_width(690.0);
+                sudo_rows(ui, app.editor.as_mut().unwrap(), &app.catalog, &mut None);
+            },
+        )
     }
 
     #[test]
@@ -1305,6 +1775,729 @@ mod tests {
                 assert!(field_width > 400.0);
             }
             other => panic!("expected two columns, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sudo_controls_fit_narrow_and_wide_forms_in_every_locale() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            for width in [260.0, 360.0, 690.0, 1030.0] {
+                let context = egui::Context::default();
+                theme::configure_fonts(&context, locale);
+                let mut profile = metadata_profile();
+                profile.username = "alice".into();
+                let mut app = metadata_test_app(&context, locale, profile);
+                let editor = app.editor.as_mut().unwrap();
+                let accounts: Vec<_> = ["alice", "bob", "root"]
+                    .into_iter()
+                    .map(|username| crate::model::SudoCredential {
+                        id: uuid::Uuid::new_v4(),
+                        username: username.into(),
+                    })
+                    .collect();
+                editor.profile.advanced.sudo = Some(crate::model::SudoSettings {
+                    enabled: true,
+                    credentials: accounts.clone(),
+                });
+                editor.profile.advanced.su = Some(crate::model::SuSettings { enabled: true });
+                let mut output = None;
+                for frame in 0..3 {
+                    output = Some(context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(1040.0, 2400.0),
+                            )),
+                            time: Some(frame as f64 * 0.1),
+                            ..Default::default()
+                        },
+                        |ui| {
+                            ui.set_max_width(width);
+                            sudo_rows(ui, app.editor.as_mut().unwrap(), &app.catalog, &mut None);
+                        },
+                    ));
+                }
+                let output = output.unwrap();
+                for key in [
+                    "sudo_settings",
+                    "su_settings",
+                    "sudo_add_user",
+                    "sudo_test",
+                    "su_test",
+                ] {
+                    let rect = find_text_rect(&output.shapes, app.catalog.text(key))
+                        .unwrap_or_else(|| panic!("missing {locale} {key}"));
+                    assert!(
+                        rect.right() <= width + 1.0,
+                        "{locale} {key} overflows width {width}: {rect:?}"
+                    );
+                }
+                for retired_label in [
+                    "Sudo execution user",
+                    "Su target user",
+                    "sudo 执行用户",
+                    "sudo 執行使用者",
+                    "sudo 実行ユーザー",
+                    "su の対象ユーザー",
+                ] {
+                    assert!(find_text_rect(&output.shapes, retired_label).is_none());
+                }
+                let sudo_header =
+                    find_text_rect(&output.shapes, app.catalog.text("sudo_settings")).unwrap();
+                let su_header =
+                    find_text_rect(&output.shapes, app.catalog.text("su_settings")).unwrap();
+                let login_label = context
+                    .read_response(sudo_field_id(accounts[0].id, "login_identity"))
+                    .unwrap()
+                    .rect;
+                let login_password = context
+                    .read_response(sudo_field_id(accounts[0].id, "password"))
+                    .unwrap()
+                    .rect;
+                assert!(
+                    context
+                        .read_response(sudo_field_id(accounts[0].id, "username"))
+                        .is_none(),
+                    "sudo identity must not be an editable account selector"
+                );
+                assert!(
+                    sudo_header.bottom() < login_label.top()
+                        && login_password.bottom() < su_header.top()
+                );
+                assert!(
+                    (login_label.center().y - login_password.center().y).abs() < 1.0,
+                    "{locale} at {width}: current-user row is not aligned: {login_label:?}, {login_password:?}"
+                );
+                assert!(
+                    login_label.right() <= login_password.left()
+                        && login_password.right() <= width + 1.0
+                );
+                let mut previous = Some(su_header);
+                for account in &accounts[1..] {
+                    let username = context
+                        .read_response(sudo_field_id(account.id, "username"))
+                        .unwrap()
+                        .rect;
+                    let password = context
+                        .read_response(sudo_field_id(account.id, "password"))
+                        .unwrap()
+                        .rect;
+                    assert!(
+                        (username.center().y - password.center().y).abs() < 1.0,
+                        "{locale} at {width}: an account must occupy one line: {username:?}, {password:?}"
+                    );
+                    assert!(
+                        username.right() <= password.left() && password.right() <= width + 1.0,
+                        "{locale} at {width}: account inputs overlap or overflow: {username:?}, {password:?}"
+                    );
+                    if let Some(previous) = previous {
+                        assert!(
+                            previous.bottom() < username.top(),
+                            "{locale}: different accounts overlap"
+                        );
+                    }
+                    previous = Some(username.union(password));
+                }
+                let add =
+                    find_text_rect(&output.shapes, app.catalog.text("sudo_add_user")).unwrap();
+                assert!(
+                    previous.unwrap().bottom() < add.top(),
+                    "{locale}: buttons overlap accounts"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_system_password_follows_the_login_account_without_rebinding_secrets() {
+        let context = egui::Context::default();
+        let mut profile = metadata_profile();
+        profile.username = "alice".into();
+        profile.ssh_auth = SshAuth::PrivateKey;
+        let mut app = metadata_test_app(&context, "en", profile);
+        auth_frame(&mut app, &context, vec![]);
+        let editor = app.editor.as_ref().unwrap();
+        assert!(editor.profile.advanced.sudo.is_none());
+        assert!(editor.profile.advanced.su.is_none());
+        assert!(!editor.has_unsaved_changes());
+        let alice_id = editor.sudo.current_user.as_ref().unwrap().1;
+        assert!(
+            context
+                .read_response(sudo_field_id(alice_id, "username"))
+                .is_none()
+        );
+
+        context.memory_mut(|m| m.request_focus(sudo_field_id(alice_id, "password")));
+        auth_frame(
+            &mut app,
+            &context,
+            vec![egui::Event::Text("alice test token".into())],
+        );
+        let editor = app.editor.as_ref().unwrap();
+        let (settings, updates) = editor.sudo_changes().unwrap();
+        let settings = settings.unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.credentials.len(), 1);
+        assert_eq!(settings.credentials[0].username, "alice");
+        assert_eq!(settings.credentials[0].id, alice_id);
+        assert!(
+            matches!(&updates[..], [(crate::credentials::CredentialKind::SudoPassword(id), Some(value))]
+            if *id == alice_id && value.as_str() == "alice test token")
+        );
+        assert!(
+            !serde_json::to_string(&editor.profile)
+                .unwrap()
+                .contains("alice test token")
+        );
+        assert!(editor.profile.advanced.su.is_none());
+
+        app.editor.as_mut().unwrap().profile.username = "bob".into();
+        auth_frame(&mut app, &context, vec![]);
+        let editor = app.editor.as_ref().unwrap();
+        let bob_id = editor.sudo.current_user.as_ref().unwrap().1;
+        assert_ne!(alice_id, bob_id);
+        assert!(editor.sudo.passwords[&bob_id].is_empty());
+        assert_eq!(
+            editor.sudo.passwords[&alice_id].as_str(),
+            "alice test token"
+        );
+        assert_eq!(
+            editor
+                .profile
+                .advanced
+                .sudo
+                .as_ref()
+                .unwrap()
+                .credentials
+                .len(),
+            1
+        );
+        assert!(
+            context
+                .read_response(sudo_field_id(alice_id, "username"))
+                .is_some()
+        );
+
+        context.memory_mut(|m| m.request_focus(sudo_field_id(bob_id, "password")));
+        auth_frame(
+            &mut app,
+            &context,
+            vec![egui::Event::Text("bob test token".into())],
+        );
+        let editor = app.editor.as_ref().unwrap();
+        let records = &editor.profile.advanced.sudo.as_ref().unwrap().credentials;
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].username, "alice");
+        assert_eq!(records[1].username, "bob");
+        assert_eq!(
+            editor.sudo.passwords[&alice_id].as_str(),
+            "alice test token"
+        );
+        assert_eq!(editor.sudo.passwords[&bob_id].as_str(), "bob test token");
+        assert!(
+            context
+                .read_response(sudo_field_id(bob_id, "username"))
+                .is_none()
+        );
+
+        app.editor.as_mut().unwrap().profile.username = "alice".into();
+        auth_frame(&mut app, &context, vec![]);
+        auth_frame(&mut app, &context, vec![]);
+        assert_eq!(
+            app.editor
+                .as_ref()
+                .unwrap()
+                .sudo
+                .current_user
+                .as_ref()
+                .unwrap()
+                .1,
+            alice_id
+        );
+        assert!(
+            context
+                .read_response(sudo_field_id(alice_id, "username"))
+                .is_none()
+        );
+        assert!(
+            context
+                .read_response(sudo_field_id(bob_id, "username"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn renamed_record_cannot_advertise_the_previous_accounts_password_for_sudo() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            theme::configure_fonts(&context, locale);
+            let id = uuid::Uuid::new_v4();
+            let mut profile = metadata_profile();
+            profile.username = "alice".into();
+            profile.ssh_auth = SshAuth::PrivateKey;
+            profile.advanced.sudo = Some(crate::model::SudoSettings {
+                enabled: true,
+                credentials: vec![crate::model::SudoCredential {
+                    id,
+                    username: "bob".into(),
+                }],
+            });
+            let mut app = metadata_test_app(&context, locale, profile);
+            let editor = app.editor.as_mut().unwrap();
+            editor.sudo.stored.insert(id, Ok(true));
+            editor.profile.advanced.sudo.as_mut().unwrap().credentials[0].username = "alice".into();
+            let output = auth_frame(&mut app, &context, vec![]);
+            assert!(
+                find_text_rect(&output.shapes, app.catalog.text("current_user_password")).is_some()
+            );
+            assert!(
+                find_text_rect(&output.shapes, app.catalog.text("sudo_password_saved")).is_none()
+            );
+            let (settings, updates) = app.editor.as_ref().unwrap().sudo_changes().unwrap();
+            assert_ne!(settings.unwrap().credentials[0].id, id);
+            assert!(
+                matches!(&updates[..], [(crate::credentials::CredentialKind::SudoPassword(old), None)] if *old == id)
+            );
+        }
+    }
+
+    #[test]
+    fn saved_current_password_tracks_actual_accounts_across_login_changes() {
+        use crate::credentials::{self, CredentialKind};
+        use crate::storage::HostStore;
+        use std::{env, fs, process::Command};
+
+        // Run the real editor save path in a child so no process-wide test
+        // environment or user's actual host list is modified.
+        if env::var("CODEX_HOSTS_AUTH_FLOW_TEST_CHILD").as_deref() != Ok("1") {
+            let directory =
+                env::temp_dir().join(format!("codex-hosts-auth-flow-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&directory).unwrap();
+            let output = Command::new(env::current_exe().unwrap())
+                .args(["--exact", "ui::host_form::tests::saved_current_password_tracks_actual_accounts_across_login_changes", "--test-threads=1"])
+                .env("CODEX_HOSTS_AUTH_FLOW_TEST_CHILD", "1")
+                .env("CODEX_HOSTS_DATA_DIR", &directory)
+                .output().unwrap();
+            let fixture_path = directory.join("hosts.json");
+            if fixture_path.exists() {
+                let store: HostStore =
+                    serde_json::from_slice(&fs::read(&fixture_path).unwrap()).unwrap();
+                for host in &store.hosts {
+                    assert!(!credentials::has(host.id, CredentialKind::Password).unwrap());
+                    for record in &host.advanced.sudo.as_ref().unwrap().credentials {
+                        assert!(
+                            !credentials::has(host.id, CredentialKind::SudoPassword(record.id))
+                                .unwrap()
+                        );
+                    }
+                }
+            }
+            for name in ["hosts.json", "hosts.json.bak", "hosts.lock"] {
+                let path = directory.join(name);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+            fs::remove_dir(&directory).unwrap();
+            assert!(
+                output.status.success(),
+                "isolated editor save failed: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let directory = std::path::PathBuf::from(
+            env::var_os("CODEX_HOSTS_DATA_DIR").expect("isolated data directory"),
+        );
+        let directory = directory.canonicalize().unwrap();
+        assert_eq!(
+            directory.parent().unwrap(),
+            env::temp_dir().canonicalize().unwrap()
+        );
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("codex-hosts-auth-flow-")
+        );
+        struct FixtureCredentials(HostProfile);
+        impl Drop for FixtureCredentials {
+            fn drop(&mut self) {
+                credentials::delete_host(&self.0).unwrap();
+            }
+        }
+        let context = egui::Context::default();
+        let alice = uuid::Uuid::new_v4();
+        let bob = uuid::Uuid::new_v4();
+        let mut profile = metadata_profile();
+        profile.username = "alice".into();
+        profile.address = "127.0.0.1".into();
+        profile.advanced.sudo = Some(crate::model::SudoSettings {
+            enabled: true,
+            credentials: vec![
+                crate::model::SudoCredential {
+                    id: alice,
+                    username: "alice".into(),
+                },
+                crate::model::SudoCredential {
+                    id: bob,
+                    username: "bob".into(),
+                },
+            ],
+        });
+        profile.advanced.su = Some(crate::model::SuSettings { enabled: true });
+        let cleanup = FixtureCredentials(profile.clone());
+        credentials::store(
+            profile.id,
+            CredentialKind::Password,
+            "alice login test token",
+        )
+        .unwrap();
+        credentials::store(
+            profile.id,
+            CredentialKind::SudoPassword(bob),
+            "bob system test token",
+        )
+        .unwrap();
+        let mut app = metadata_test_app(&context, "en", profile);
+        app.store.save().unwrap();
+        app.editor.as_mut().unwrap().saved_password_mode = Some(PasswordMode::Password);
+        assert_eq!(
+            crate::sudo::password_for(&app.editor.as_ref().unwrap().profile, "alice")
+                .unwrap()
+                .as_str(),
+            "alice login test token"
+        );
+        auth_frame(&mut app, &context, vec![]);
+        context.memory_mut(|m| m.request_focus(sudo_field_id(alice, "password")));
+        auth_frame(
+            &mut app,
+            &context,
+            vec![egui::Event::Text("alice system test token".into())],
+        );
+        app.persist_editor().unwrap();
+        let saved = HostStore::load().unwrap().hosts[0].clone();
+        assert_eq!(
+            crate::sudo::password_for(&saved, "alice").unwrap().as_str(),
+            "alice system test token"
+        );
+        assert_eq!(
+            crate::su::password_for(&saved, "bob").unwrap().as_str(),
+            "bob system test token"
+        );
+
+        app.editor.as_mut().unwrap().profile.username = "bob".into();
+        assert!(app.persist_editor().is_err());
+        assert_eq!(HostStore::load().unwrap().hosts[0].username, "alice");
+        assert_eq!(
+            credentials::load(saved.id, CredentialKind::Password)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "alice login test token"
+        );
+        app.editor
+            .as_mut()
+            .unwrap()
+            .password
+            .push_str("bob login test token");
+        app.persist_editor().unwrap();
+        let saved = HostStore::load().unwrap().hosts[0].clone();
+        assert_eq!(saved.username, "bob");
+        assert_eq!(
+            credentials::load(saved.id, CredentialKind::Password)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "bob login test token"
+        );
+        assert_eq!(
+            crate::sudo::password_for(&saved, "bob").unwrap().as_str(),
+            "bob system test token"
+        );
+        assert_eq!(
+            crate::su::password_for(&saved, "alice").unwrap().as_str(),
+            "alice system test token"
+        );
+
+        let editor = app.editor.as_mut().unwrap();
+        editor.profile.username = "carol".into();
+        editor.profile.ssh_auth = SshAuth::PrivateKey;
+        editor.profile.private_key_path = "fixture-key-not-used-for-connection".into();
+        app.persist_editor().unwrap();
+        let saved = HostStore::load().unwrap().hosts[0].clone();
+        assert!(
+            credentials::load(saved.id, CredentialKind::Password)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::sudo::password_for(&saved, "carol")
+                .err()
+                .unwrap()
+                .code,
+            "SUDO_CREDENTIAL_MISSING"
+        );
+        assert_eq!(
+            crate::su::password_for(&saved, "bob").unwrap().as_str(),
+            "bob system test token"
+        );
+        assert_eq!(
+            crate::su::password_for(&saved, "alice").unwrap().as_str(),
+            "alice system test token"
+        );
+        let metadata = fs::read_to_string(directory.join("hosts.json")).unwrap();
+        assert!(!metadata.contains("test token"));
+        drop(cleanup);
+    }
+
+    #[test]
+    fn test_target_is_transient_and_cancellation_does_not_save_or_execute() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            theme::configure_fonts(&context, locale);
+            let mut profile = metadata_profile();
+            profile.advanced.sudo = Some(crate::model::SudoSettings {
+                enabled: true,
+                ..Default::default()
+            });
+            profile.advanced.su = Some(crate::model::SuSettings { enabled: true });
+            let mut app = metadata_test_app(&context, locale, profile);
+            let before = serde_json::to_value(&app.editor.as_ref().unwrap().profile).unwrap();
+            for su in [false, true] {
+                app.open_privilege_test(su);
+                let prompt = app.privilege_test_prompt.as_mut().unwrap();
+                assert_eq!(prompt.target, if su { "" } else { "root" });
+                prompt.target = "unlisted-user".into();
+                let mut output = None;
+                for _ in 0..3 {
+                    output = Some(context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(820.0, 720.0),
+                            )),
+                            ..Default::default()
+                        },
+                        |_| app.privilege_test_dialog(&context),
+                    ));
+                }
+                let output = output.unwrap();
+                assert!(
+                    find_text_rect(&output.shapes, app.catalog.text("privilege_test_target"))
+                        .is_some()
+                );
+                let cancel = find_text_rect(&output.shapes, app.catalog.text("cancel"))
+                    .unwrap()
+                    .center();
+                let _ = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(820.0, 720.0),
+                        )),
+                        events: vec![
+                            egui::Event::PointerMoved(cancel),
+                            egui::Event::PointerButton {
+                                pos: cancel,
+                                button: egui::PointerButton::Primary,
+                                pressed: true,
+                                modifiers: Default::default(),
+                            },
+                            egui::Event::PointerButton {
+                                pos: cancel,
+                                button: egui::PointerButton::Primary,
+                                pressed: false,
+                                modifiers: Default::default(),
+                            },
+                        ],
+                        ..Default::default()
+                    },
+                    |_| app.privilege_test_dialog(&context),
+                );
+                assert!(app.privilege_test_prompt.is_none());
+                assert!(app.sudo_test.is_none());
+                assert!(app.persistence_prompt.is_none());
+                assert_eq!(
+                    serde_json::to_value(&app.editor.as_ref().unwrap().profile).unwrap(),
+                    before
+                );
+            }
+            app.start_privilege_test(true, String::new());
+            assert!(app.sudo_test.is_none());
+            assert!(app.persistence_prompt.is_none());
+            assert_eq!(
+                serde_json::to_value(&app.editor.as_ref().unwrap().profile).unwrap(),
+                before
+            );
+            app.editor.as_mut().unwrap().first_save = true;
+            app.start_privilege_test(true, " unlisted-user ".into());
+            assert!(matches!(&app.persistence_prompt.as_ref().unwrap().then,
+                super::super::PendingAction::TestPrivilege{su:true,target} if target=="unlisted-user"));
+            assert!(app.sudo_test.is_none());
+            assert_eq!(
+                serde_json::to_value(&app.editor.as_ref().unwrap().profile).unwrap(),
+                before
+            );
+            app.apply_persistence_choice(false, &context);
+            assert!(app.sudo_test.is_none());
+            assert!(app.persistence_prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn renamed_user_shows_optional_password_instead_of_previous_saved_status() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            theme::configure_fonts(&context, locale);
+            let mut profile = metadata_profile();
+            let id = uuid::Uuid::new_v4();
+            profile.advanced.sudo = Some(crate::model::SudoSettings {
+                enabled: true,
+                credentials: vec![crate::model::SudoCredential {
+                    id,
+                    username: "alice".into(),
+                }],
+            });
+            let mut app = metadata_test_app(&context, locale, profile);
+            let editor = app.editor.as_mut().unwrap();
+            editor.sudo.stored.insert(id, Ok(true));
+            editor.profile.advanced.sudo.as_mut().unwrap().credentials[0].username = "bob".into();
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1040.0, 2400.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    ui.set_max_width(690.0);
+                    sudo_rows(ui, app.editor.as_mut().unwrap(), &app.catalog, &mut None);
+                },
+            );
+            assert!(
+                find_text_rect(
+                    &output.shapes,
+                    app.catalog.text("privilege_password_optional")
+                )
+                .is_some()
+            );
+            assert!(
+                find_text_rect(&output.shapes, app.catalog.text("sudo_password_saved")).is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn privilege_tests_work_with_supply_off_without_changing_settings() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            for width in [260.0, 690.0] {
+                for with_metadata in [false, true] {
+                    for test_key in ["sudo_test", "su_test"] {
+                        let context = egui::Context::default();
+                        theme::configure_fonts(&context, locale);
+                        let mut profile = metadata_profile();
+                        if with_metadata {
+                            profile.advanced.su = Some(crate::model::SuSettings::default());
+                            profile.advanced.sudo = Some(crate::model::SudoSettings::default());
+                        }
+                        let mut app = metadata_test_app(&context, locale, profile);
+                        let mut output = None;
+                        for _ in 0..3 {
+                            output = Some(context.run_ui(
+                                egui::RawInput {
+                                    screen_rect: Some(egui::Rect::from_min_size(
+                                        egui::Pos2::ZERO,
+                                        egui::vec2(1040.0, 2400.0),
+                                    )),
+                                    ..Default::default()
+                                },
+                                |ui| {
+                                    ui.set_max_width(width);
+                                    sudo_rows(
+                                        ui,
+                                        app.editor.as_mut().unwrap(),
+                                        &app.catalog,
+                                        &mut None,
+                                    );
+                                },
+                            ));
+                        }
+                        let output = output.unwrap();
+                        let button =
+                            find_text_rect(&output.shapes, app.catalog.text(test_key)).unwrap();
+                        for key in [
+                            "sudo_settings",
+                            "su_settings",
+                            "sudo_enabled",
+                            "su_enabled",
+                            "sudo_test",
+                            "su_test",
+                            "sudo_add_user",
+                        ] {
+                            let rect =
+                                find_text_rect(&output.shapes, app.catalog.text(key)).unwrap();
+                            assert!(
+                                rect.right() <= width + 1.0,
+                                "{locale} {key} at {width}: {rect:?}"
+                            );
+                        }
+                        let pos = button.center();
+                        let mut action = None;
+                        let _ = context.run_ui(
+                            egui::RawInput {
+                                screen_rect: Some(egui::Rect::from_min_size(
+                                    egui::Pos2::ZERO,
+                                    egui::vec2(1040.0, 2400.0),
+                                )),
+                                events: vec![
+                                    egui::Event::PointerMoved(pos),
+                                    egui::Event::PointerButton {
+                                        pos,
+                                        button: egui::PointerButton::Primary,
+                                        pressed: true,
+                                        modifiers: Default::default(),
+                                    },
+                                    egui::Event::PointerButton {
+                                        pos,
+                                        button: egui::PointerButton::Primary,
+                                        pressed: false,
+                                        modifiers: Default::default(),
+                                    },
+                                ],
+                                ..Default::default()
+                            },
+                            |ui| {
+                                ui.set_max_width(width);
+                                sudo_rows(
+                                    ui,
+                                    app.editor.as_mut().unwrap(),
+                                    &app.catalog,
+                                    &mut action,
+                                );
+                            },
+                        );
+                        if test_key == "sudo_test" {
+                            assert!(matches!(action, Some(EditorAction::TestSudo)));
+                        } else {
+                            assert!(matches!(action, Some(EditorAction::TestSu)));
+                        }
+                        let settings = &app.editor.as_ref().unwrap().profile.advanced;
+                        assert_eq!(settings.sudo.is_some(), with_metadata);
+                        assert_eq!(settings.su.is_some(), with_metadata);
+                        assert!(
+                            settings
+                                .sudo
+                                .as_ref()
+                                .is_none_or(|s| !s.enabled && s.credentials.is_empty())
+                        );
+                        assert!(settings.su.as_ref().is_none_or(|s| !s.enabled));
+                    }
+                }
+            }
         }
     }
 }

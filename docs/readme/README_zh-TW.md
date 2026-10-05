@@ -399,6 +399,8 @@ Codex 透過 stdio 與 `codex-hosts.exe --mcp` 通訊。每個工具都同時以
 | `agent_identities`、`fido_identities` | 已載入 Agent 身分與 FIDO Handle 的公開資訊 |
 | `probe`、`batch_probe` | 認證並執行 `hostname`；揭露未知或變更的主機金鑰 |
 | `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 執行命令；`exec_stdin` 單獨成工具，因為 stdin 中的程式內容對審查不透明 |
+| `exec_sudo` | 在 SSH 主機上以 root 或其他使用者執行絕對路徑程式及 argv；預設重用目前使用者的 SSH 登入密碼 |
+| `exec_su` | 透過 su 以目標使用者執行絕對路徑程式；遠端原則允許時無需密碼 |
 | `disconnect` | 斷開為已選擇保持工作階段的主機保留的連線 |
 | `open_host_editor` | 開啟預填非敏感資訊的編輯器視窗，或確認回報的主機金鑰 |
 | `temporary_secrets_open`、`_status`、`_run`、`_clear` | 由系統匣程式持有的僅記憶體秘密 |
@@ -406,6 +408,10 @@ Codex 透過 stdio 與 `codex-hosts.exe --mcp` 通訊。每個工具都同時以
 參數中永不包含密碼、密碼片語或 PIN；編輯器在遮罩輸入框中收集它們。逾時（`connect_timeout_ms`、`command_timeout_ms`、`batch_timeout_ms`）按呼叫傳入，省略時預設連線 120 秒、單一命令 10 分鐘，或取主機「進階」卡片中的預設值。
 
 SSH 主機的「進階」中有「每次 Codex 呼叫前審批」，預設關閉。目標或跳板主機開啟後，連線前以藍色對話框審批本次呼叫涉及的全部主機與命令。授權涵蓋這次 Codex 呼叫從啟動到結束的生命週期；下次呼叫須重新審批，保持連線不會延長授權。頂部「全部允許 / 全部拒絕」只處理目前展示的這批等待呼叫，後來到達的請求須點擊「查看下一批」。點擊命令可開啟完整詳情，區分實際執行主機和跳板，並展示完整命令、標準輸入及 sudo 使用者；詳情頂部按鈕決定整次呼叫。長文字可分頁查看和複製全文，詳情中的返回或 Esc 不作決定。介面顯示數量、到期倒數及審批回饋；允許按鈕為紅色，拒絕按鈕為白色。
+
+「進階」中的「允許 sudo 自動供密」僅授權使用儲存的密碼。關閉時仍可使用免密或既有認證快取；實際要求密碼時回傳 `SUDO_AUTO_AUTH_DISABLED`，不為該認證請求讀取或傳送密碼。執行使用者由 Codex 每次選擇：`exec_sudo` 必填 `alias`、絕對路徑 `program`、`user`，可選原樣 `args` 和逾時參數；需要 root 時明確傳入 `"user":"root"`，不再儲存預設目標。進階頁將 sudo 與 su 分為兩個獨立區域。sudo 固定顯示目前 SSH 登入使用者，名稱唯讀：密碼登入沿用其登入密碼，金鑰或 Agent 登入可在同一行補充該使用者的系統密碼；沒有 sudo 認證使用者選擇器。其他帳號在 su 區域每使用者一行；不使用其他使用者的登入密碼、金鑰口令或 Agent 憑據。`rootpw`、`targetpw`、`runaspw` 依實際認證提示選擇密碼。空白保留已有密碼，清除或刪除須明確操作；改名刪除舊密碼，可输入替換密碼或留空。「儲存並測試 sudo」臨時選擇目標（初始 root）後執行 `/usr/bin/id`，取消不儲存也不執行。不接受原始命令、密碼或業務 stdin，不自動重試。shell 啟動器及 TTY/PAM 限制見 [sudo.md](../../skill/codex-hosts/references/sudo.md)。
+
+「進階」中的「允許 su 自動供密」獨立授權 su 使用儲存的密碼；關閉時仍可免密執行，實際要求密碼時回傳 `SU_AUTO_AUTH_DISABLED`。`exec_su` 同樣要求每次填寫 `user`、絕對路徑 `program`，可選原樣 `args` 和逾時參數；su 區域管理目標使用者的可選密碼，每使用者一行。目前登入使用者的密碼只在上方輸入一次，su 供密授權允許時可沿用同一帳號密碼。遠端允許的 root 到一般使用者等免密路徑無需記錄，完全不讀取或傳送密碼。「儲存並測試 su」臨時輸入目標（初始空白），允許無密碼記錄的合法使用者名稱，目標不寫入主機設定。遠端須提供 util-linux `/usr/bin/su`、`/usr/bin/env`、`/bin/sh` 及標準 Linux-PAM 提示；無 PTY 或業務 stdin。舊 JSON 預設目標會被忽略，已存密碼槽保留；舊呼叫省略 `user` 會失敗且不執行。詳見 [su.md](../../skill/codex-hosts/references/su.md)。
 
 `open_host_editor` 的驗證參數使用穩定名稱：`password`；`private-key` / `private_key` 表示一般私鑰檔案或 FIDO Handle（也接受 `fido-handle`）；`ssh-agent` / `ssh_agent` 表示 Windows OpenSSH Agent 或 Pageant。
 

@@ -127,6 +127,8 @@ async fn execute_async(
         stdout: output,
         stderr: String::new(),
         output_truncated,
+        sudo_user: None,
+        su_user: None,
         host_fingerprint: None,
         host_key_algorithm: None,
         auth_key_fingerprint: None,

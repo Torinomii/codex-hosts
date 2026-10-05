@@ -76,6 +76,8 @@ enum ToolRequest {
         #[serde(default)]
         command_timeout_ms: Option<u64>,
     },
+    ExecSudo(crate::sudo::Request),
+    ExecSu(crate::su::Request),
     BatchProbe {
         aliases: Vec<String>,
         #[serde(default)]
@@ -131,10 +133,22 @@ pub(crate) struct HostSummary {
     pub(crate) require_call_approval: bool,
     pub(crate) max_channels: usize,
     pub(crate) remote_env: RemoteEnv,
+    /// Compatibility name: permission to supply passwords, not tool availability.
+    pub(crate) sudo_enabled: bool,
+    pub(crate) sudo_login_password_available: bool,
+    pub(crate) sudo_credentials: Vec<SudoCredentialSummary>,
+    /// Compatibility name: permission to supply passwords, not tool availability.
+    pub(crate) su_enabled: bool,
     pub(crate) has_required_secret: bool,
     pub(crate) has_host_fingerprint: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) host_key_algorithm: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct SudoCredentialSummary {
+    pub(crate) username: String,
+    pub(crate) has_password: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,11 +179,13 @@ struct CapabilitiesResult {
     list_hosts_tag_filter: bool,
     exec_stdin: bool,
     exec_stdin_protocols: [&'static str; 1],
+    exec_sudo: bool,
+    exec_su: bool,
     max_stdin_bytes: usize,
     schema_version: u32,
     status: &'static str,
     app_version: &'static str,
-    actions: [&'static str; 10],
+    actions: [&'static str; 12],
     ssh_auth: [&'static str; 3],
     max_batch_concurrency: usize,
     max_batch_hosts: usize,
@@ -239,14 +255,36 @@ enum ToolResponse {
     FidoIdentities(FidoIdentitiesResult),
     List(ListResult),
     Remote(crate::ssh::RemoteResult),
+    Sudo(SudoResponse),
     RemoteMany(crate::ssh::RemoteManyResult),
     Batch(BatchResult),
+    Failure(RemoteFailure),
+}
+
+#[derive(Serialize)]
+struct SudoResponse {
+    schema_version: u32,
+    #[serde(flatten)]
+    result: SudoOutcome,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SudoOutcome {
+    Remote(crate::ssh::RemoteResult),
     Failure(RemoteFailure),
 }
 
 impl ToolResponse {
     fn is_failure(&self) -> bool {
         matches!(self, Self::Failure(_))
+            || matches!(
+                self,
+                Self::Sudo(SudoResponse {
+                    result: SudoOutcome::Failure(_),
+                    ..
+                })
+            )
             || matches!(self, Self::TemporarySecrets(response) if response.status == "error")
     }
 }
@@ -290,6 +328,8 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             list_hosts_tag_filter: true,
             exec_stdin: true,
             exec_stdin_protocols: ["ssh"],
+            exec_sudo: true,
+            exec_su: true,
             max_stdin_bytes: ssh::MAX_STDIN_BYTES,
             schema_version: SCHEMA_VERSION,
             status: "ok",
@@ -303,6 +343,8 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
                 "probe",
                 "exec",
                 "exec_many",
+                "exec_sudo",
+                "exec_su",
                 "batch_probe",
                 "batch_exec",
             ],
@@ -358,6 +400,20 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
                 });
         }
         _ => {}
+    }
+    let privileged_outcome = match &request {
+        ToolRequest::ExecSudo(params) => Some(execute_sudo_request(params)),
+        ToolRequest::ExecSu(params) => Some(execute_su_request(params)),
+        _ => None,
+    };
+    if let Some(outcome) = privileged_outcome {
+        return Ok(ToolResponse::Sudo(SudoResponse {
+            schema_version: SCHEMA_VERSION,
+            result: match outcome {
+                Ok(result) => SudoOutcome::Remote(result),
+                Err(error) => SudoOutcome::Failure(error),
+            },
+        }));
     }
     let store = HostStore::load()
         .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
@@ -415,6 +471,9 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
                 stdin.as_deref(),
                 limits(connect_timeout_ms, command_timeout_ms, None),
             )?))
+        }
+        ToolRequest::ExecSudo(_) | ToolRequest::ExecSu(_) => {
+            unreachable!("privileged exec handled before the shared legacy store load")
         }
         ToolRequest::ExecMany {
             alias,
@@ -492,6 +551,64 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
     }
 }
 
+fn execute_sudo_request(
+    params: &crate::sudo::Request,
+) -> Result<crate::ssh::RemoteResult, RemoteFailure> {
+    let store = HostStore::load()
+        .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
+    let host = find_host(&store, &params.alias)?;
+    validate_profile(host)?;
+    let target = crate::sudo::validate(host, &params.program, &params.args, Some(&params.user))?;
+    crate::approval::authorize_sync(crate::approval::Review::new(
+        std::slice::from_ref(host),
+        &store.hosts,
+        vec![format!(
+            "{} {}",
+            params.program,
+            serde_json::to_string(&params.args).unwrap_or_default()
+        )],
+        None,
+        Some(target.clone()),
+    )?)?;
+    connection::execute_sudo(
+        host,
+        &store.hosts,
+        &params.program,
+        &params.args,
+        Some(&target),
+        limits(params.connect_timeout_ms, params.command_timeout_ms, None),
+    )
+}
+
+fn execute_su_request(
+    params: &crate::su::Request,
+) -> Result<crate::ssh::RemoteResult, RemoteFailure> {
+    let store = HostStore::load()
+        .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
+    let host = find_host(&store, &params.alias)?;
+    validate_profile(host)?;
+    let target = crate::su::validate(host, &params.program, &params.args, Some(&params.user))?;
+    crate::approval::authorize_sync(crate::approval::Review::new(
+        std::slice::from_ref(host),
+        &store.hosts,
+        vec![format!(
+            "su → {target}: {} {}",
+            params.program,
+            serde_json::to_string(&params.args).unwrap_or_default()
+        )],
+        None,
+        None,
+    )?)?;
+    connection::execute_su(
+        host,
+        &store.hosts,
+        &params.program,
+        &params.args,
+        Some(&target),
+        limits(params.connect_timeout_ms, params.command_timeout_ms, None),
+    )
+}
+
 fn validate_request_input(request: &ToolRequest) -> Result<(), RemoteFailure> {
     match request {
         ToolRequest::Exec { stdin, .. } => ssh::validate_stdin(stdin.as_deref()),
@@ -547,6 +664,29 @@ pub(crate) fn list_hosts(
                 && host.advanced.require_call_approval,
             max_channels: host.advanced.max_channels(),
             remote_env: host.advanced.remote_env,
+            sudo_enabled: host.protocol == Protocol::Ssh
+                && host.advanced.sudo.as_ref().is_some_and(|sudo| sudo.enabled),
+            sudo_login_password_available: crate::sudo::login_password_available(host),
+            su_enabled: host.protocol == Protocol::Ssh
+                && host.advanced.su.as_ref().is_some_and(|su| su.enabled),
+            sudo_credentials: host
+                .advanced
+                .sudo
+                .as_ref()
+                .map(|sudo| {
+                    sudo.credentials
+                        .iter()
+                        .map(|credential| SudoCredentialSummary {
+                            username: credential.username.clone(),
+                            has_password: credentials::has(
+                                host.id,
+                                CredentialKind::SudoPassword(credential.id),
+                            )
+                            .unwrap_or(false),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             has_required_secret,
             has_host_fingerprint: host.host_fingerprint.is_some(),
             host_key_algorithm: host.host_key_algorithm.clone(),
@@ -1202,6 +1342,8 @@ mod tests {
             alias: "host-1".to_owned(),
             exit_code: 0,
             stdout: "测试-output".repeat(4),
+            sudo_user: None,
+            su_user: None,
             stderr: "error".repeat(4),
             output_truncated: false,
             host_fingerprint: None,
@@ -1214,6 +1356,32 @@ mod tests {
         assert!(result.stdout.len() + result.stderr.len() <= 17);
         assert!(std::str::from_utf8(result.stdout.as_bytes()).is_ok());
         assert!(std::str::from_utf8(result.stderr.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn legacy_sudo_uses_the_same_strict_parameters_as_mcp() {
+        let request = serde_json::json!({"action":"exec_sudo", "alias":"test", "program":"/usr/bin/id", "user":"root", "args":["-u"]});
+        assert!(matches!(
+            serde_json::from_value::<ToolRequest>(request.clone()).unwrap(),
+            ToolRequest::ExecSudo(_)
+        ));
+        for field in ["stdin", "command", "password"] {
+            let mut invalid = request.clone();
+            invalid[field] = serde_json::json!("rejected");
+            assert!(
+                serde_json::from_value::<ToolRequest>(invalid).is_err(),
+                "{field}"
+            );
+        }
+        let mut missing = request.clone();
+        missing.as_object_mut().unwrap().remove("user");
+        assert!(serde_json::from_value::<ToolRequest>(missing).is_err());
+        let mut su = request;
+        su["action"] = serde_json::json!("exec_su");
+        assert!(matches!(
+            serde_json::from_value::<ToolRequest>(su).unwrap(),
+            ToolRequest::ExecSu(_)
+        ));
     }
 
     #[test]
@@ -1230,6 +1398,8 @@ mod tests {
             alias: alias.to_owned(),
             exit_code: 0,
             stdout: "\\\"\n".repeat(2048),
+            sudo_user: None,
+            su_user: None,
             stderr: "测试".repeat(1024),
             output_truncated: false,
             host_fingerprint: Some("SHA256:example".to_owned()),

@@ -17,6 +17,7 @@ use crate::tool::SCHEMA_VERSION;
 const EDITOR_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct OpenHostEditorParams {
     /// Alias to create or edit; the editor is prefilled with every field given here.
     pub alias: String,
@@ -47,6 +48,15 @@ pub(super) struct OpenHostEditorParams {
     pub description: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    /// Allow saved-password supply for sudo; false still permits passwordless execution. No password can be supplied here.
+    #[serde(default)]
+    pub sudo_enabled: Option<bool>,
+    /// Compatibility name for replacing account-password records. It does not select sudo's authentication identity or execution user. Ordinary sudo uses the login user; other account records appear in the su section. Matching names keep their IDs; passwords are entered only in the app.
+    #[serde(default)]
+    pub sudo_users: Option<Vec<String>>,
+    /// Allow saved-password supply for su independently; false still permits passwordless execution.
+    #[serde(default)]
+    pub su_enabled: Option<bool>,
     /// Fingerprint reported by a HOSTKEY_UNKNOWN or HOSTKEY_MISMATCH failure; the user must confirm it.
     #[serde(default)]
     pub observed_fingerprint: Option<String>,
@@ -148,8 +158,21 @@ fn push_args(command: &mut tokio::process::Command, params: &OpenHostEditorParam
     flag("--description", &params.description);
     flag("--observed-fingerprint", &params.observed_fingerprint);
     flag("--observed-algorithm", &params.observed_algorithm);
+    flag(
+        "--sudo-enabled",
+        &params.sudo_enabled.map(|enabled| enabled.to_string()),
+    );
+    flag(
+        "--su-enabled",
+        &params.su_enabled.map(|enabled| enabled.to_string()),
+    );
     for tag in params.tags.iter().flatten() {
         command.arg("--tag").arg(tag);
+    }
+    if let Some(users) = &params.sudo_users {
+        command
+            .arg("--sudo-auth-users")
+            .arg(serde_json::to_string(users).expect("username list"));
     }
 }
 
@@ -222,6 +245,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn editor_rejects_retired_target_fields_instead_of_saving_a_hidden_default() {
+        for name in ["sudo_user", "su_user", "password"] {
+            let mut value = serde_json::json!({"alias":"host"});
+            value[name] = serde_json::json!("root");
+            assert!(serde_json::from_value::<OpenHostEditorParams>(value).is_err());
+        }
+    }
+
+    #[test]
     fn prefill_becomes_editor_flags_without_a_shell() {
         let params = OpenHostEditorParams {
             alias: "web 1".into(),
@@ -235,6 +267,9 @@ mod tests {
             jump_host: None,
             description: Some("a \"quoted\" note".into()),
             tags: Some(vec!["prod".into(), "web".into()]),
+            sudo_enabled: None,
+            su_enabled: None,
+            sudo_users: None,
             observed_fingerprint: Some("SHA256:abc".into()),
             observed_algorithm: None,
         };

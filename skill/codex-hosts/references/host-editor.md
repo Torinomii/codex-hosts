@@ -17,6 +17,12 @@ Read this when a host must be created, completed, corrected, or its host key con
 
 - **Approve each Codex call** is an SSH-only Advanced setting, default off. The user changes it in the app; `open_host_editor` has no parameter for it. One approval covers one call's hosts and commands from launch to completion, independent of authentication retention.
 
+- **Advanced** has separate sudo and su sections with independent password-supply permissions (`sudo_enabled` and `su_enabled`). Passwordless execution works with permission off. The sudo section shows the SSH login user as a read-only identity, reuses its password login, or accepts the same user's system password for key/Agent login. Do not ask the user to select a sudo authentication account. The su section lists other target accounts, one row each, with an optional masked password and clear/delete menu; the login account's password is entered only once above.
+
+- `sudo_users` is the compatibility name for the account-password records (`[]` removes those records; ordinary sudo can still reuse the SSH login password). It is not an authentication selector or target allowlist. Matching names keep their IDs and saved passwords. Blank keeps a saved password; renaming rotates its ID and deletes the old secret, with an optional replacement. Changing the SSH login username requires that new user's login password, or clears the old login password when saving a key/Agent login. Other named system-password records stay with their original accounts. There are no `sudo_user` / `su_user` editor fields or saved default execution targets. The editor's `user` means the SSH/Telnet login user.
+
+- **Save and test sudo/su** opens a temporary target dialog (sudo initially root; su initially blank) before saving. It accepts any valid username, including one without a saved password. Confirming saves the authentication settings and runs `/usr/bin/id`; cancelling or an empty target saves and executes nothing. This target is never stored as a host default. For actual operations Codex must supply `user` to `exec_sudo` / `exec_su` each time. See [sudo.md](sudo.md) and [su.md](su.md).
+
 For host-key confirmation, call the same alias with the values from the `HOSTKEY_UNKNOWN` or `HOSTKEY_MISMATCH` failure:
 
 ```json

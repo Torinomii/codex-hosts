@@ -71,5 +71,9 @@ Completion requires a structured tool result plus confirmation that no credentia
 
 ## Other modes
 
+- Sudo (SSH only): use `exec_sudo` with required per-call `user`, an absolute `program` and separate `args`; read [references/sudo.md](references/sudo.md). Enable it in Advanced. Ordinary sudo reuses the current SSH user's saved login password; optional user passwords override it, and Codex chooses the execution target on each call (root must be explicit). An empty `sudo_credentials` list does not block login-password reuse or passwordless sudo; check `sudo_login_password_available` and the actual tool result. No password or business stdin parameter is accepted. Treat it as code execution and never retry automatically.
+
+- Su (SSH only): use `exec_su` with required per-call `user`, an absolute `program` and exact `args`; read [references/su.md](references/su.md). Enable it separately in Advanced. Su authenticates the target user, with optional passwords from the shared user list. Root-to-user and other remote passwordless policies need no saved record or password. Empty `sudo_credentials` does not block su. No password or business stdin parameter is accepted; never retry automatically.
+
 - Hardware keys and Agents: read [references/hardware-keys.md](references/hardware-keys.md) when a host uses `private_key` with a `*_sk` handle or `ssh_agent`, when a FIDO SSH credential must be created or recovered, or when choosing between `fido_identities` and `agent_identities`.
 - Memory-only project secrets (API keys and tokens unrelated to host login; no host profile needed): read [references/temporary-secrets.md](references/temporary-secrets.md). Only field references leave the vault: never read or export a value. Approval defaults on for each field; `temporary_secrets_run` requires the app's approval if any referenced field has it enabled. Only the user changes field approval switches in the app.

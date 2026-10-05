@@ -47,6 +47,54 @@ pub fn execute_many(
     }
 }
 
+pub fn execute_sudo(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    program: &str,
+    args: &[String],
+    user: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    ssh::runtime().block_on(ssh::execute_sudo_async(
+        profile, hosts, program, args, user, limits,
+    ))
+}
+
+pub async fn execute_sudo_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    program: &str,
+    args: &[String],
+    user: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    ssh::execute_sudo_async(profile, hosts, program, args, user, limits).await
+}
+
+pub fn execute_su(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    program: &str,
+    args: &[String],
+    user: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    ssh::runtime().block_on(ssh::execute_su_async(
+        profile, hosts, program, args, user, limits,
+    ))
+}
+
+pub async fn execute_su_async(
+    profile: &HostProfile,
+    hosts: &[HostProfile],
+    program: &str,
+    args: &[String],
+    user: Option<&str>,
+    limits: OperationLimits,
+) -> Result<RemoteResult, RemoteFailure> {
+    ssh::execute_su_async(profile, hosts, program, args, user, limits).await
+}
+
 pub async fn probe_async(
     profile: &HostProfile,
     hosts: &[HostProfile],

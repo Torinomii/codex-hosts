@@ -123,6 +123,47 @@ pub struct TelnetPrompts {
     pub password: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SudoCredential {
+    pub id: Uuid,
+    pub username: String,
+}
+
+/// Secret values live only in Credential Manager, keyed by host and record ID.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SudoSettings {
+    /// Allow saved-password supply for sudo; passwordless calls remain available.
+    pub enabled: bool,
+    /// Account passwords at the legacy storage location, not selectable sudo
+    /// identities. The UI binds the login account read-only and edits other su
+    /// target accounts. Runtime supply follows the actual authentication request.
+    pub credentials: Vec<SudoCredential>,
+}
+
+pub fn valid_sudo_username(value: &str) -> bool {
+    !value.trim().is_empty() && !value.contains(['\r', '\n', '\0'])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SuSettings {
+    /// Allow saved-password supply for su; passwordless calls remain available.
+    pub enabled: bool,
+}
+
+fn no_su_settings(value: &Option<SuSettings>) -> bool {
+    value
+        .as_ref()
+        .is_none_or(|settings| *settings == SuSettings::default())
+}
+
+fn no_sudo_settings(value: &Option<SudoSettings>) -> bool {
+    value
+        .as_ref()
+        .is_none_or(|settings| *settings == SudoSettings::default())
+}
+
 /// Optional per-host tuning; every field left at its default means "use the
 /// global value", and profiles saved before these existed read back unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -144,6 +185,10 @@ pub struct AdvancedSettings {
     pub require_call_approval: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telnet_prompts: Option<TelnetPrompts>,
+    #[serde(skip_serializing_if = "no_sudo_settings")]
+    pub sudo: Option<SudoSettings>,
+    #[serde(skip_serializing_if = "no_su_settings")]
+    pub su: Option<SuSettings>,
 }
 
 fn is_auto(value: &RemoteEnv) -> bool {
@@ -152,7 +197,14 @@ fn is_auto(value: &RemoteEnv) -> bool {
 
 impl AdvancedSettings {
     pub fn is_default(&self) -> bool {
-        *self == Self::default()
+        let mut settings = self.clone();
+        if no_sudo_settings(&settings.sudo) {
+            settings.sudo = None;
+        }
+        if no_su_settings(&settings.su) {
+            settings.su = None;
+        }
+        settings == Self::default()
     }
 
     pub fn max_channels(&self) -> usize {
@@ -166,6 +218,17 @@ impl AdvancedSettings {
     }
 
     fn validation_issue(&self) -> Option<ValidationIssue> {
+        if let Some(sudo) = &self.sudo {
+            let mut users = HashSet::new();
+            let mut ids = HashSet::new();
+            if sudo.credentials.iter().any(|credential| {
+                !valid_sudo_username(&credential.username)
+                    || !users.insert(credential.username.trim())
+                    || !ids.insert(credential.id)
+            }) {
+                return Some(ValidationIssue::Sudo);
+            }
+        }
         let channels_ok = self
             .max_channels
             .is_none_or(|value| (1..=MAX_CHANNELS_PER_HOST).contains(&value));
@@ -319,6 +382,34 @@ impl HostProfile {
         if let Some(fingerprint) = &prefill.agent_key_fingerprint {
             self.agent_key_fingerprint.clone_from(fingerprint);
         }
+        if prefill.su_enabled.is_some() {
+            let settings = self.advanced.su.get_or_insert_with(Default::default);
+            if let Some(enabled) = prefill.su_enabled {
+                settings.enabled = enabled;
+            }
+        }
+        if prefill.sudo_enabled.is_some() || prefill.sudo_users.is_some() {
+            let settings = self.advanced.sudo.get_or_insert_with(Default::default);
+            if let Some(enabled) = prefill.sudo_enabled {
+                settings.enabled = enabled;
+            }
+            if let Some(users) = &prefill.sudo_users {
+                settings.credentials = users
+                    .iter()
+                    .map(|username| {
+                        settings
+                            .credentials
+                            .iter()
+                            .find(|credential| credential.username.trim() == username.trim())
+                            .cloned()
+                            .unwrap_or_else(|| SudoCredential {
+                                id: Uuid::new_v4(),
+                                username: username.trim().to_owned(),
+                            })
+                    })
+                    .collect();
+            }
+        }
     }
 }
 
@@ -333,6 +424,7 @@ pub enum ValidationIssue {
     TelnetChain,
     AuthPersistence,
     Advanced,
+    Sudo,
 }
 
 impl ValidationIssue {
@@ -348,6 +440,7 @@ impl ValidationIssue {
             Self::TelnetChain => "a Telnet host cannot use a jump host",
             Self::AuthPersistence => "idle minutes are out of range",
             Self::Advanced => "advanced settings are out of range",
+            Self::Sudo => "sudo usernames must be nonempty, unique and contain no CR, LF or NUL",
         }
     }
 
@@ -362,6 +455,7 @@ impl ValidationIssue {
             Self::TelnetChain => "validation_telnet_chain",
             Self::AuthPersistence => "validation_auth_persistence",
             Self::Advanced => "validation_advanced",
+            Self::Sudo => "validation_sudo",
         }
     }
 }
@@ -379,6 +473,9 @@ pub struct Prefill {
     pub private_key_path: Option<String>,
     pub agent_key_fingerprint: Option<String>,
     pub jump_alias: Option<String>,
+    pub sudo_enabled: Option<bool>,
+    pub sudo_users: Option<Vec<String>>,
+    pub su_enabled: Option<bool>,
 }
 
 /// Alias lookup shared by the GUI store and the tools: ASCII case and
@@ -481,6 +578,126 @@ pub fn can_use_as_jump(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sudo_metadata_is_optional_secret_free_and_validates_unique_accounts() {
+        let mut host: HostProfile =
+            serde_json::from_str(r#"{"alias":"old","address":"host","username":"alice"}"#).unwrap();
+        assert!(host.advanced.sudo.is_none());
+        host.advanced.sudo = Some(SudoSettings::default());
+        assert!(host.advanced.is_default());
+        assert!(
+            serde_json::to_value(&host).unwrap()["advanced"]
+                .get("sudo")
+                .is_none()
+        );
+        let id = Uuid::new_v4();
+        host.advanced.sudo = Some(SudoSettings {
+            enabled: true,
+            credentials: vec![SudoCredential {
+                id,
+                username: "alice".into(),
+            }],
+        });
+        assert!(host.validation_issue().is_none());
+        let json = serde_json::to_value(&host).unwrap();
+        assert_eq!(
+            json["advanced"]["sudo"]["credentials"][0]["username"],
+            "alice"
+        );
+        assert!(
+            json["advanced"]["sudo"]["credentials"][0]
+                .get("password")
+                .is_none()
+        );
+        let mut prefill = Prefill {
+            sudo_users: Some(vec!["alice".into(), "bob".into()]),
+            ..Default::default()
+        };
+        host.apply_prefill(&prefill);
+        assert_eq!(host.advanced.sudo.as_ref().unwrap().credentials[0].id, id);
+        prefill.sudo_users = Some(vec!["alice".into(), " alice ".into()]);
+        host.apply_prefill(&prefill);
+        assert_eq!(host.validation_issue(), Some(ValidationIssue::Sudo));
+        prefill.sudo_users = Some(vec![]);
+        host.apply_prefill(&prefill);
+        assert!(host.advanced.sudo.as_ref().unwrap().credentials.is_empty());
+    }
+
+    #[test]
+    fn su_defaults_remain_off_and_can_be_enabled_without_password_records() {
+        let mut host: HostProfile =
+            serde_json::from_str(r#"{"alias":"old","address":"host","username":"root"}"#).unwrap();
+        assert!(host.advanced.su.is_none());
+        host.advanced.su = Some(SuSettings::default());
+        assert!(host.advanced.is_default());
+        assert!(
+            serde_json::to_value(&host).unwrap()["advanced"]
+                .get("su")
+                .is_none()
+        );
+        host.apply_prefill(&Prefill {
+            su_enabled: Some(true),
+            ..Default::default()
+        });
+        assert!(host.advanced.sudo.is_none());
+        assert!(host.validation_issue().is_none());
+        let encoded = serde_json::to_value(&host).unwrap();
+        assert_eq!(encoded["advanced"]["su"]["enabled"], true);
+        assert!(encoded["advanced"]["su"].get("password").is_none());
+        assert!(encoded["advanced"]["su"].get("default_user").is_none());
+    }
+
+    #[test]
+    fn retired_target_defaults_preserve_credentials_but_never_select_an_identity() {
+        for old_target in ["root", "bob", "alice", ""] {
+            let id = Uuid::new_v4();
+            let mut host: HostProfile = serde_json::from_value(serde_json::json!({
+                "alias":"legacy", "address":"host", "username":"alice",
+                "advanced": {
+                    "sudo": {"enabled":true,"default_user":old_target,
+                        "credentials":[{"id":id,"username":"bob"}]},
+                    "su": {"enabled":true,"default_user":old_target}
+                }
+            }))
+            .unwrap();
+            host.apply_prefill(&Prefill {
+                sudo_enabled: Some(true),
+                su_enabled: Some(true),
+                ..Default::default()
+            });
+            assert_eq!(host.advanced.sudo.as_ref().unwrap().credentials[0].id, id);
+            assert_eq!(
+                crate::sudo::validate(&host, "/usr/bin/id", &[], None)
+                    .unwrap_err()
+                    .code,
+                "SUDO_USER_REQUIRED"
+            );
+            assert_eq!(
+                crate::su::validate(&host, "/usr/bin/id", &[], None)
+                    .unwrap_err()
+                    .code,
+                "SU_USER_REQUIRED"
+            );
+            assert_eq!(
+                crate::sudo::validate(&host, "/usr/bin/id", &[], Some(" carol ")).unwrap(),
+                "carol"
+            );
+            assert_eq!(
+                crate::su::validate(&host, "/usr/bin/id", &[], Some(" carol ")).unwrap(),
+                "carol"
+            );
+            let encoded = serde_json::to_value(&host).unwrap();
+            for mechanism in ["sudo", "su"] {
+                assert!(encoded["advanced"][mechanism].get("default_user").is_none());
+                assert_eq!(encoded["advanced"][mechanism]["enabled"], true);
+            }
+            let roundtrip: HostProfile = serde_json::from_value(encoded).unwrap();
+            assert_eq!(roundtrip.advanced, host.advanced);
+            assert!(crate::sudo::validate(&roundtrip, "/usr/bin/id", &[], None).is_err());
+            assert!(crate::su::validate(&roundtrip, "/usr/bin/id", &[], None).is_err());
+        }
+    }
 
     #[test]
     fn call_approval_defaults_off_and_persists_independently_of_auth_retention() {

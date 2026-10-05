@@ -450,6 +450,40 @@ impl Server {
     }
 
     #[tool(
+        name = "exec_sudo",
+        description = "Run an absolute program path with exact args as the explicit required user for this call on an SSH host. Advanced settings authorize automatic password supply; passwordless or cached authentication works when it is off. When allowed, ordinary sudo reuses the current SSH user's saved login password; optional Advanced user passwords override it. Passwords are matched to the actual sudo authentication username, sent at most once, and never exposed. An empty sudo_credentials list does not block login-password reuse or passwordless sudo. Requires /usr/bin/sudo and /bin/sh; sudoers must permit the fixed shell launcher. No PTY, business stdin or batch support. For scripts explicitly use /bin/sh with args [\"-c\", \"visible script\"]. Never retry automatically.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn exec_sudo(
+        &self,
+        Parameters(params): Parameters<crate::sudo::Request>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(cancellable(ct, exec_sudo_host(&self.gates, params)).await)
+    }
+
+    #[tool(
+        name = "exec_su",
+        description = "Run an absolute program with exact args as another user on an SSH host. Advanced settings authorize automatic password supply; passwordless execution works when it is off. An explicit user is required for each call. su authenticates the target user, using the shared Advanced user-password list when su password supply is allowed; never substitutes another user's SSH password. Passwords are optional: root-to-user or another remote passwordless policy executes without loading or sending a password. Requires util-linux /usr/bin/su, /usr/bin/env and /bin/sh, and a standard Linux-PAM C-locale Password: prompt when authentication is needed. No PTY, business stdin, batch or automatic retry. For scripts explicitly use /bin/sh with args [\"-c\", \"visible script\"].",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = true
+        )
+    )]
+    async fn exec_su(
+        &self,
+        Parameters(params): Parameters<crate::su::Request>,
+        ct: CancellationToken,
+    ) -> CallToolResult {
+        finish(cancellable(ct, exec_su_host(&self.gates, params)).await)
+    }
+
+    #[tool(
         name = "exec_many",
         description = "Run 1 to 64 independent short commands concurrently on one saved SSH host over a single authenticated connection (one hardware touch for the whole set). Results keep input order. Use it to bundle status checks instead of separate calls.",
         annotations(
@@ -719,6 +753,70 @@ async fn exec_many_host(
     Ok(result)
 }
 
+async fn exec_sudo_host(
+    gates: &CallGates,
+    params: crate::sudo::Request,
+) -> Result<ssh::RemoteResult, RemoteFailure> {
+    let store = load_store()?;
+    let host = tool::find_host(&store, &params.alias)?.clone();
+    tool::validate_profile(&host)?;
+    let target = crate::sudo::validate(&host, &params.program, &params.args, Some(&params.user))?;
+    crate::approval::authorize(crate::approval::Review::new(
+        std::slice::from_ref(&host),
+        &store.hosts,
+        vec![format!(
+            "{} {}",
+            params.program,
+            serde_json::to_string(&params.args).unwrap_or_default()
+        )],
+        None,
+        Some(target.clone()),
+    )?)
+    .await?;
+    let _guard = gates.single_host(&host, &store.hosts, 1).await;
+    connection::execute_sudo_async(
+        &host,
+        &store.hosts,
+        &params.program,
+        &params.args,
+        Some(&target),
+        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
+    )
+    .await
+}
+
+async fn exec_su_host(
+    gates: &CallGates,
+    params: crate::su::Request,
+) -> Result<ssh::RemoteResult, RemoteFailure> {
+    let store = load_store()?;
+    let host = tool::find_host(&store, &params.alias)?.clone();
+    tool::validate_profile(&host)?;
+    let target = crate::su::validate(&host, &params.program, &params.args, Some(&params.user))?;
+    crate::approval::authorize(crate::approval::Review::new(
+        std::slice::from_ref(&host),
+        &store.hosts,
+        vec![format!(
+            "su → {target}: {} {}",
+            params.program,
+            serde_json::to_string(&params.args).unwrap_or_default()
+        )],
+        None,
+        None,
+    )?)
+    .await?;
+    let _guard = gates.single_host(&host, &store.hosts, 1).await;
+    connection::execute_su_async(
+        &host,
+        &store.hosts,
+        &params.program,
+        &params.args,
+        Some(&target),
+        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
+    )
+    .await
+}
+
 /// Dropping the operation future on cancellation releases its channel, pooled
 /// session, and hardware lock; a remote command that already started may keep
 /// running, which the result says explicitly.
@@ -860,7 +958,16 @@ covering all listed commands and hosts from call launch to completion; authoriza
 over to another call, even on a kept connection. Temporary secret fields require approval by default, \
 unless the user has disabled it for every referenced field in the app. When a call fails with \
 CREDENTIAL_MISSING, HOSTKEY_UNKNOWN, HOSTKEY_MISMATCH, or PROFILE_INVALID, call open_host_editor \
-for that alias instead of asking for details in chat. Never retry a command automatically.",
+for that alias instead of asking for details in chat. exec_sudo accepts an absolute program and argv, \
+requires an explicit user on every call (choose root explicitly), and normally reuses the saved login password of the current SSH user when that user \
+is requested for sudo authentication. Each Advanced switch authorizes saved-password supply for its own purpose; false never rules out passwordless execution. Optional saved account passwords override it. An empty sudo_credentials \
+list does not mean sudo is unavailable; sudo_login_password_available reports login-password availability. \
+It requires the fixed /bin/sh launcher to be allowed by sudoers and accepts no stdin or passwords. \
+For SUDO_AUTO_AUTH_DISABLED or SUDO_CREDENTIAL_MISSING, use open_host_editor. \
+For su use exec_su with required per-call user, an absolute program and exact argv with independent Advanced permission for password supply. \
+Su authenticates the target user; passwords from the shared sudo_credentials list are optional for \
+remote passwordless policies, including root-to-user. No record is required on that path. Results \
+include su_user. For SU_AUTO_AUTH_DISABLED or SU_CREDENTIAL_MISSING, use open_host_editor. Never retry a command automatically.",
         schema = SCHEMA_VERSION,
         connect = DEFAULT_CONNECT_TIMEOUT.as_millis(),
         command = DEFAULT_COMMAND_TIMEOUT.as_millis(),
@@ -895,6 +1002,8 @@ mod tests {
                 "exec",
                 "exec_many",
                 "exec_stdin",
+                "exec_su",
+                "exec_sudo",
                 "fido_identities",
                 "list_hosts",
                 "open_host_editor",
@@ -908,6 +1017,21 @@ mod tests {
         for tool in &tools {
             let annotations = tool.annotations.as_ref().expect("annotations");
             let name = tool.name.as_ref();
+            if matches!(name, "exec_sudo" | "exec_su") {
+                let required = tool
+                    .input_schema
+                    .get("required")
+                    .unwrap()
+                    .as_array()
+                    .unwrap();
+                assert!(required.iter().any(|field| field == "user"), "{name}");
+                let description = tool.description.as_deref().unwrap();
+                assert!(description.contains("explicit"), "{name}");
+                assert!(
+                    !description.to_lowercase().contains("defaults to root"),
+                    "{name}"
+                );
+            }
             let executes =
                 name.starts_with("exec") || name == "batch_exec" || name == "temporary_secrets_run";
             let connects = executes || name == "probe" || name == "batch_probe";
