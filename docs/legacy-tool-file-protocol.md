@@ -28,7 +28,7 @@ Write a UTF-8 JSON request without secrets, run the executable with `--tool-requ
 - Never retry a command automatically. It may not be idempotent, and a timeout or `STDIN_WRITE_FAILED` can mean it partly ran. Report the failure and let the user decide.
 - Every tool process starts with no connections and authenticates again, which repeats hardware prompts; `exec_many` authenticates once and runs its commands on one connection. Batches keep input order, never trust host keys, and share one authenticated jump-host session. On `SSH_BATCH_RECONNECT_BLOCKED` report the affected hosts instead of restarting. Use `continue_on_error:false` only when later hosts must not start after a failure.
 
-Read [references/tool-protocol.md](references/tool-protocol.md) for the complete request and result fields, limits, and error codes.
+Read [references/tool-protocol.md](../skill/codex-hosts/references/tool-protocol.md) for the complete request and result fields, limits, and error codes.
 
 ## Host editor launch
 
@@ -93,8 +93,8 @@ Every request is a JSON object with `action`. Unknown fields are ignored except 
 | `exec_many` | `alias`, `commands` (1–64, none empty) | `max_concurrency`, `connect_timeout_ms`, `command_timeout_ms` |
 | `batch_probe` | `aliases` (1–256, unique) | `max_concurrency`, `connect_timeout_ms`, `command_timeout_ms`, `batch_timeout_ms`, `continue_on_error` (default true) |
 | `batch_exec` | `aliases`, `command` | same as `batch_probe` |
-| `temporary_secrets_open` | `fields` | see [temporary-secrets.md](temporary-secrets.md) |
-| `temporary_secrets` | `session`, `request` | see [temporary-secrets.md](temporary-secrets.md) |
+| `temporary_secrets_open` | `fields` | see [temporary-secrets.md](../skill/codex-hosts/references/temporary-secrets.md) |
+| `temporary_secrets` | `session`, `request` | see [temporary-secrets.md](../skill/codex-hosts/references/temporary-secrets.md) |
 
 - Timeouts are milliseconds and capped at 24 hours. `connect_timeout_ms` bounds the TCP connection, handshake, and authentication of each hop separately; `command_timeout_ms` bounds the remote command; `batch_timeout_ms` bounds the whole batch and hosts that have not started when it expires fail with `BATCH_TIMEOUT`.
 - `max_concurrency` defaults to 8 and is clamped to 1–16.
@@ -144,4 +144,4 @@ Telnet: `TELNET_CLOSED`, `TELNET_READ_FAILED`, `TELNET_WRITE_FAILED`, `OUTPUT_LI
 
 `exec_su` uses the same structured parameters as `exec_sudo`, with independent Advanced permissions for password supply and a required per-call `user`. With su supply off, passwordless execution still works; password requests fail before reading a password for that authentication request. It authenticates the target user, using the shared `sudo_credentials` account list; only that same target's password-authenticated SSH password may be reused. Passwordless su, including root-to-user when remotely permitted, reads and sends no password and requires no record. `list_hosts` adds `su_enabled`; results add `su_user`. Legacy results and failures retain `schema_version: 1`. Missing READY is `SU_START_FAILED`; caller exit status after READY remains `remote_error`. Capabilities include `exec_su`. Requires util-linux `/usr/bin/su`, `/usr/bin/env`, `/bin/sh` and a standard Linux-PAM C-locale password prompt; no PTY or business stdin. Errors: `SU_AUTO_AUTH_DISABLED`, `SU_INVALID_INPUT`, `SU_INVALID_PASSWORD`, `SU_CREDENTIAL_MISSING`, `SU_CREDENTIAL_READ_FAILED`, `SU_AUTH_REPEATED`, `SU_INPUT_FAILED`, `SU_START_FAILED`, `SU_CHANNEL_CLOSED`. Never retry automatically.
 
-Execution targets are not host settings. Old `default_user` JSON values are ignored and no longer saved; existing credential IDs and secret slots remain. Missing or null `user` is rejected before execution (MCP invalid arguments, file protocol `REQUEST_INVALID`). Empty/invalid targets return `SUDO_INVALID_INPUT` / `SU_INVALID_INPUT`; internal launches without a target fail with `SUDO_USER_REQUIRED` / `SU_USER_REQUIRED`. `list_hosts` no longer reports `sudo_default_user` / `su_default_user`. The results' `sudo_user` / `su_user` still identify the explicit target. GUI tests ask for a temporary target and never save it as a default.
+Execution targets are not host settings. Old `default_user` JSON values are ignored and no longer saved; existing credential IDs and secret slots remain. Missing or null `user` is rejected before execution (MCP invalid arguments, file protocol `REQUEST_INVALID`). Empty/invalid targets return `SUDO_INVALID_INPUT` / `SU_INVALID_INPUT`; internal launches without a target fail with `SUDO_USER_REQUIRED` / `SU_USER_REQUIRED`. `list_hosts` no longer reports `sudo_default_user` / `su_default_user`. The results' `sudo_user` / `su_user` still identify the explicit target. The GUI has no dedicated sudo/su test or target dialog.

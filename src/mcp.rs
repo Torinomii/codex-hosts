@@ -238,7 +238,7 @@ struct ExecParams {
     /// Bounds connection and authentication; leave room for a hardware touch or PIN.
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
-    /// Bounds the remote command; defaults to 10 minutes.
+    /// Bounds the remote command; when omitted, the host profile's default, else 10 minutes.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
 }
@@ -254,7 +254,7 @@ struct ExecStdinParams {
     /// Bounds connection and authentication.
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
-    /// Bounds the remote command; defaults to 10 minutes.
+    /// Bounds the remote command; when omitted, the host profile's default, else 10 minutes.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
 }
@@ -271,7 +271,7 @@ struct ExecManyParams {
     /// Bounds connection and authentication.
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
-    /// Bounds each command; defaults to 10 minutes.
+    /// Bounds each command; when omitted, the host profile's default, else 10 minutes.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
 }
@@ -950,7 +950,8 @@ fn instructions() -> String {
 Passwords, key passphrases, and FIDO PINs are entered only in the app's own windows and never \
 appear in tool parameters or results. Results use tool-protocol schema_version {schema}: status is \
 ok, remote_error (non-zero exit_code), or error with a code. \
-Defaults when omitted: connect_timeout_ms {connect} ms, command_timeout_ms {command} ms; the \
+When omitted, timeouts use the host profile's defaults, else connect_timeout_ms {connect} ms and \
+command_timeout_ms {command} ms; the \
 maximum for any timeout is {max_timeout} ms. Limits: {max_hosts} hosts per batch, {max_many} \
 commands per exec_many, batch concurrency up to {max_conc}, batch output up to {max_out} bytes. \
 SSH hosts authenticate with a password, a private key (including OpenSSH FIDO handles), or an \
@@ -1235,6 +1236,7 @@ mod tests {
     fn instructions_state_defaults_and_limits() {
         let text = instructions();
         assert!(text.contains(&SCHEMA_VERSION.to_string()));
+        assert!(text.contains("host profile's defaults"));
         assert!(text.contains("120000"));
         assert!(text.contains("600000"));
         assert!(text.contains("256 hosts"));

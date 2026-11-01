@@ -8,7 +8,7 @@ Read this when an SSH call awaits app authorization, a temporary-secret run is p
 |---|---|---|
 | Codex/client tool approval | Client configuration | The client invoking a tool; separate from the app's dialog |
 | **Approve each Codex call** / `require_call_approval` | Off; user changes it in the host's Advanced settings | One complete SSH tool call, including its listed hosts and commands |
-| **Allow sudo passwords** / **Allow su passwords** | Off; independently confirmed in the host editor | Use of saved account passwords for that mechanism, not remote execution permission |
+| **Allow saved passwords for sudo** / **Allow saved passwords for su** | Off; independently confirmed in the host editor | Use of saved account passwords for that mechanism, not remote execution permission |
 | Temporary field **Call approval** / `requires_approval` | On for a new field; user changes it in the app | One local run that references this field |
 | Host-key trust and remote sudoers/PAM policy | User-confirmed pin and remote host policy | Which host is trusted, and whether native authentication/execution is allowed |
 
