@@ -209,7 +209,7 @@ struct Pending {
     id: Uuid,
     review: Option<Review>,
     status: &'static str,
-    requested: Instant,
+    expires: Instant,
 }
 
 #[derive(Default)]
@@ -247,14 +247,15 @@ impl Queue {
         self.calls.iter().any(|call| call.status == "pending")
     }
     pub(crate) fn expire(&mut self) {
+        let now = Instant::now();
         for call in &mut self.calls {
-            if call.status == "pending" && call.requested.elapsed() >= LIFETIME {
+            if call.status == "pending" && now >= call.expires {
                 call.status = "expired";
                 self.expired_notices += 1;
             }
         }
         self.calls
-            .retain(|call| call.requested.elapsed() < LIFETIME + Duration::from_secs(30));
+            .retain(|call| now < call.expires + Duration::from_secs(30));
     }
     fn room(&mut self) -> bool {
         self.expire();
@@ -277,7 +278,7 @@ impl Queue {
             id,
             review: Some(review),
             status: "pending",
-            requested: Instant::now(),
+            expires: Instant::now() + LIFETIME,
         });
         "pending"
     }
@@ -300,7 +301,7 @@ impl Queue {
                 id,
                 review: None,
                 status: "cancelled",
-                requested: Instant::now(),
+                expires: Instant::now() + LIFETIME,
             });
         }
     }
@@ -488,10 +489,7 @@ impl Queue {
                                     &[("number", &(index + 1).to_string())],
                                 ));
                                 ui.add(egui::Label::new(review.summary(catalog)).wrap());
-                                ui.label(crate::approval_ui::countdown(
-                                    catalog,
-                                    call.requested.elapsed(),
-                                ));
+                                ui.label(crate::approval_ui::countdown(catalog, call.expires));
                                 let targets = review
                                     .hosts
                                     .iter()
@@ -645,10 +643,7 @@ impl Queue {
                 context.data_mut(|data| {
                     data.insert_temp(egui::Id::new(("ssh_detail_back", detail.id)), response.rect)
                 });
-                ui.label(crate::approval_ui::countdown(
-                    catalog,
-                    call.requested.elapsed(),
-                ));
+                ui.label(crate::approval_ui::countdown(catalog, call.expires));
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt(("ssh_full_details", detail.id))
@@ -773,7 +768,7 @@ mod tests {
         assert_eq!(queue.take(first), "approved");
         assert_eq!(queue.take(first), "unavailable");
         assert_eq!(queue.take(second), "pending");
-        queue.calls[0].requested = Instant::now() - LIFETIME;
+        queue.calls[0].expires = Instant::now();
         assert_eq!(queue.take(second), "expired");
         let cancelled = Uuid::new_v4();
         queue.cancel(cancelled);
@@ -976,7 +971,7 @@ mod tests {
                 )))
             })
             .unwrap();
-        queue.calls[0].requested = Instant::now() - LIFETIME;
+        queue.calls[0].expires = Instant::now();
         click(&mut queue, &context, confirm.center());
         assert!(queue.detail.is_none());
         assert_eq!(queue.take(first), "expired");
@@ -1080,7 +1075,7 @@ mod tests {
             if cancelled {
                 queue.cancel(first);
             } else {
-                queue.calls[0].requested = Instant::now() - LIFETIME;
+                queue.calls[0].expires = Instant::now();
             }
             frame(
                 &mut queue,

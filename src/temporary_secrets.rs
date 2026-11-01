@@ -22,6 +22,7 @@ mod ipc;
 const MAX_FIELDS: usize = 64;
 const MAX_VALUE_BYTES: usize = 32 * 1024;
 const MAX_OPERATIONS: usize = 16;
+const APPROVAL_LIFETIME: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -286,7 +287,7 @@ impl Execution {
 struct Operation {
     result: OperationStatus,
     execution: Execution,
-    requested: Instant,
+    expires: Instant,
 }
 
 pub(super) struct Envelope {
@@ -495,7 +496,7 @@ impl SecretsApp {
                             exit_code: None,
                         },
                         execution,
-                        requested: Instant::now(),
+                        expires: Instant::now() + APPROVAL_LIFETIME,
                     });
                     operation_id = Some(id);
                     self.start_queued();
@@ -557,9 +558,7 @@ impl SecretsApp {
     fn expire_pending(&mut self) {
         let mut count = 0;
         for operation in &mut self.operations {
-            if operation.result.status == "pending"
-                && operation.requested.elapsed() >= Duration::from_secs(300)
-            {
+            if operation.result.status == "pending" && Instant::now() >= operation.expires {
                 operation.result.status = "expired".into();
                 count += 1;
             }
@@ -906,7 +905,7 @@ impl SecretsApp {
                 ui.horizontal_wrapped(|ui| {
                     ui.label(crate::approval_ui::countdown(
                         &self.catalog,
-                        operation.requested.elapsed(),
+                        operation.expires,
                     ));
                     if ui
                         .small_button(self.catalog.text("approval_view_details"))
@@ -1065,7 +1064,7 @@ impl SecretsApp {
                 });
                 ui.label(crate::approval_ui::countdown(
                     &self.catalog,
-                    operation.requested.elapsed(),
+                    operation.expires,
                 ));
                 if let Some(running) = &self.running {
                     ui.add(
@@ -1844,7 +1843,7 @@ mod tests {
             app.handle(Request::Execute(execution())).code.as_deref(),
             Some("OPERATION_LIMIT")
         );
-        app.operations[0].requested = Instant::now() - Duration::from_secs(301);
+        app.operations[0].expires = Instant::now();
         app.poll();
         assert_eq!(app.operations[0].result.status, "expired");
         assert_eq!(app.handle(Request::Execute(execution())).status, "ok");
@@ -2217,7 +2216,7 @@ mod tests {
                 )))
             })
             .unwrap();
-        app.operations[0].requested = Instant::now() - Duration::from_secs(300);
+        app.operations[0].expires = Instant::now();
         approval_click(&mut app, &context, &catalog, confirm.center());
         assert!(app.detail.is_none());
         assert_eq!(app.operations[0].result.status, "expired");
@@ -2379,7 +2378,7 @@ mod tests {
                 )))
             })
             .unwrap();
-        app.operations[0].requested = Instant::now() - Duration::from_secs(300);
+        app.operations[0].expires = Instant::now();
         approval_click(&mut app, &context, &catalog, old_confirm.center());
         assert_eq!(app.operations[0].result.status, "expired");
         assert_eq!(app.operations[1].result.status, "pending");
@@ -2419,7 +2418,7 @@ mod tests {
             .unwrap();
         app.detail = Some(second);
         warm_approval(&mut app, &context, &catalog);
-        app.operations[1].requested = Instant::now() - Duration::from_secs(300);
+        app.operations[1].expires = Instant::now();
         approval_frame(
             &mut app,
             &context,
@@ -2490,7 +2489,7 @@ mod tests {
         // Model a run queued behind an existing worker; the checkbox must revoke it.
         app.operations.push_back(Operation {
             execution: execution(),
-            requested: Instant::now(),
+            expires: Instant::now() + APPROVAL_LIFETIME,
             result: OperationStatus {
                 id: Uuid::new_v4(),
                 status: "queued".into(),
@@ -2527,7 +2526,7 @@ mod tests {
         ] {
             app.operations.push_back(Operation {
                 execution: execution(),
-                requested: Instant::now(),
+                expires: Instant::now() + APPROVAL_LIFETIME,
                 result: OperationStatus {
                     id,
                     status: status.into(),

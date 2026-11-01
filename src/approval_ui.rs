@@ -103,8 +103,11 @@ pub(crate) fn preview(text: &str) -> String {
     value
 }
 
-pub(crate) fn countdown(catalog: &Catalog, age: Duration) -> String {
-    let seconds = 300_u64.saturating_sub(age.as_secs());
+pub(crate) fn countdown(catalog: &Catalog, expires: Instant) -> String {
+    let seconds = expires
+        .saturating_duration_since(Instant::now())
+        .as_millis()
+        .div_ceil(1000);
     catalog.format(
         "approval_expires_in",
         &[("time", &format!("{}:{:02}", seconds / 60, seconds % 60))],
