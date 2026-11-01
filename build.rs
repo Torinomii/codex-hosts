@@ -5,6 +5,14 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=languages");
+    println!("cargo:rerun-if-changed=assets/icon.ico");
+
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        winresource::WindowsResource::new()
+            .set_icon("assets/icon.ico")
+            .compile()
+            .expect("cannot embed Windows application icon");
+    }
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let language_dir = manifest.join("languages");

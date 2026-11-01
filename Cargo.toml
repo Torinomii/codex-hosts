@@ -11,6 +11,7 @@ build = "build.rs"
 [dependencies]
 csv = "1"
 eframe = { version = "0.35.0", default-features = false, features = ["wgpu"] }
+raw-window-handle = "0.6"
 keyring = "4.1.6"
 rfd = "0.17.2"
 rmcp = { version = "3.4", default-features = false, features = ["server", "macros", "schemars", "transport-io"] }

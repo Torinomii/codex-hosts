@@ -1,6 +1,7 @@
 //! Runtime-only notification-area icon. No startup registration or persistent state.
 use crate::i18n::Catalog;
 use eframe::egui;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::io;
 use std::sync::{Arc, Mutex, mpsc};
@@ -27,65 +28,60 @@ fn action(id: usize) -> Option<Event> {
     }
 }
 const CALLBACK: u32 = WM_APP + 1;
-const ICON_SIZE: usize = 32;
-const MASK_STRIDE: usize = 4;
+/// `build.rs` embeds `assets/icon.ico` under this resource ID.
+const APP_ICON_RESOURCE: u16 = 1;
 
-fn pixel_offset(x: usize, y: usize) -> usize {
-    ((ICON_SIZE - 1 - y) * ICON_SIZE + x) * 4
-}
-
-fn set_pixel(pixels: &mut [u8], x: usize, y: usize, bgra: [u8; 4]) {
-    let offset = pixel_offset(x, y);
-    pixels[offset..offset + 4].copy_from_slice(&bgra);
-}
-
-fn tray_icon_bitmaps() -> (Vec<u8>, Vec<u8>) {
-    let mut pixels = vec![0_u8; ICON_SIZE * ICON_SIZE * 4];
-    let mut mask = vec![0xff_u8; ICON_SIZE * MASK_STRIDE];
-
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
-            let dx = x as i32 * 2 + 1 - ICON_SIZE as i32;
-            let dy = y as i32 * 2 + 1 - ICON_SIZE as i32;
-            if dx * dx + dy * dy <= 28 * 28 {
-                set_pixel(&mut pixels, x, y, [216, 114, 37, 255]);
-                let row = ICON_SIZE - 1 - y;
-                mask[row * MASK_STRIDE + x / 8] &= !(1 << (7 - x % 8));
-            }
-        }
-    }
-
-    for step in 0..8 {
-        for thickness in 0..2 {
-            set_pixel(&mut pixels, 8 + step, 8 + step + thickness, [255; 4]);
-            set_pixel(&mut pixels, 15 - step, 16 + step + thickness, [255; 4]);
-        }
-    }
-    for y in 22..24 {
-        for x in 17..25 {
-            set_pixel(&mut pixels, x, y, [255; 4]);
-        }
-    }
-    (pixels, mask)
-}
-
-fn create_tray_icon() -> io::Result<HICON> {
-    let (pixels, mask) = tray_icon_bitmaps();
+/// Loads the embedded application icon at one system icon size, so Windows
+/// picks the matching frame instead of scaling one bitmap.
+fn load_app_icon(
+    width_metric: SYSTEM_METRICS_INDEX,
+    height_metric: SYSTEM_METRICS_INDEX,
+) -> io::Result<HICON> {
     let handle = unsafe {
-        CreateIcon(
-            std::ptr::null_mut(),
-            ICON_SIZE as i32,
-            ICON_SIZE as i32,
-            1,
-            32,
-            mask.as_ptr(),
-            pixels.as_ptr(),
+        LoadImageW(
+            GetModuleHandleW(std::ptr::null()),
+            APP_ICON_RESOURCE as usize as *const u16,
+            IMAGE_ICON,
+            GetSystemMetrics(width_metric),
+            GetSystemMetrics(height_metric),
+            LR_DEFAULTCOLOR,
         )
     };
     if handle.is_null() {
         Err(io::Error::last_os_error())
     } else {
-        Ok(handle)
+        Ok(handle as HICON)
+    }
+}
+
+fn create_tray_icon() -> io::Result<HICON> {
+    load_app_icon(SM_CXSMICON, SM_CYSMICON)
+}
+
+/// Gives the window the icon's own frames for its title bar and taskbar button, which
+/// would otherwise be scaled down from the 256-pixel window icon and lose their sharpness.
+/// The handles stay valid for the window's life, which ends with the process.
+pub fn use_embedded_window_icon(window: &impl HasWindowHandle) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    for (kind, width, height) in [
+        (ICON_SMALL, SM_CXSMICON, SM_CYSMICON),
+        (ICON_BIG, SM_CXICON, SM_CYICON),
+    ] {
+        if let Ok(icon) = load_app_icon(width, height) {
+            unsafe {
+                SendMessageW(
+                    handle.hwnd.get() as HWND,
+                    WM_SETICON,
+                    kind as usize,
+                    icon as isize,
+                );
+            }
+        }
     }
 }
 
@@ -339,34 +335,86 @@ impl Drop for Tray {
 mod tests {
     use super::*;
     #[test]
-    fn tray_icon_has_transparent_exterior_and_visible_terminal_mark() {
-        let (pixels, mask) = tray_icon_bitmaps();
-        assert_eq!(pixels.len(), 32 * 32 * 4);
-        assert_eq!(mask.len(), 32 * 4);
-        assert_eq!(
-            &pixels[pixel_offset(0, 0)..pixel_offset(0, 0) + 4],
-            &[0, 0, 0, 0]
-        );
-        assert_ne!(
-            &pixels[pixel_offset(16, 16)..pixel_offset(16, 16) + 3],
-            &[0, 0, 0]
-        );
-        assert_eq!(
-            &pixels[pixel_offset(20, 22)..pixel_offset(20, 22) + 3],
-            &[255, 255, 255]
-        );
-        assert_ne!(mask.iter().copied().fold(0_u8, |all, byte| all | byte), 0);
-        assert_ne!(
-            mask.iter().copied().fold(0xff_u8, |all, byte| all & byte),
-            0xff
+    fn tray_icon_is_the_embedded_colour_icon_at_small_icon_size() {
+        use windows_sys::Win32::Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW};
+        let icon = create_tray_icon().unwrap();
+        unsafe {
+            let mut info = ICONINFO::default();
+            assert_ne!(GetIconInfo(icon, &mut info), 0);
+            assert!(!info.hbmColor.is_null(), "a colour icon, not a mask only");
+            let mut bitmap = BITMAP::default();
+            assert_ne!(
+                GetObjectW(
+                    info.hbmColor,
+                    std::mem::size_of::<BITMAP>() as i32,
+                    (&mut bitmap as *mut BITMAP).cast(),
+                ),
+                0
+            );
+            assert_eq!(bitmap.bmWidth, GetSystemMetrics(SM_CXSMICON));
+            assert_eq!(bitmap.bmHeight, GetSystemMetrics(SM_CYSMICON));
+            DeleteObject(info.hbmColor);
+            DeleteObject(info.hbmMask);
+            assert_ne!(DestroyIcon(icon), 0);
+        }
+    }
+
+    /// Every frame reaches all four canvas edges and its light racks span most of the width,
+    /// because the dark hexagon alone nearly disappears on a dark taskbar.
+    #[test]
+    fn every_icon_frame_fills_its_canvas() {
+        let ico = include_bytes!("../assets/icon.ico");
+        let field = |at: usize, len: usize| {
+            ico[at..at + len]
+                .iter()
+                .rev()
+                .fold(0_usize, |value, byte| value << 8 | usize::from(*byte))
+        };
+        let count = field(4, 2);
+        let mut sizes = Vec::new();
+        for entry in 0..count {
+            let entry = 6 + 16 * entry;
+            let (length, offset) = (field(entry + 8, 4), field(entry + 12, 4));
+            let frame = eframe::icon_data::from_png_bytes(&ico[offset..offset + length]).unwrap();
+            sizes.push(frame.width);
+            assert_eq!(frame.width, frame.height);
+            assert_frame_fills_canvas(&frame);
+        }
+        for size in [16, 20, 24, 32, 256] {
+            assert!(sizes.contains(&size), "missing the {size}-pixel frame");
+        }
+        assert_frame_fills_canvas(
+            &eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png")).unwrap(),
         );
     }
 
-    #[test]
-    fn owned_tray_icon_is_a_valid_windows_handle() {
-        let icon = create_tray_icon().unwrap();
-        assert!(!icon.is_null());
-        assert_ne!(unsafe { DestroyIcon(icon) }, 0);
+    fn assert_frame_fills_canvas(frame: &egui::IconData) {
+        let size = frame.width as usize;
+        let pixel = |x: usize, y: usize| &frame.rgba[(y * size + x) * 4..(y * size + x) * 4 + 4];
+        let last = size - 1;
+        for (x, y) in [(0, 0), (last, 0), (0, last), (last, last)] {
+            assert_eq!(
+                pixel(x, y)[3],
+                0,
+                "{size}px corner {x},{y} stays transparent"
+            );
+        }
+        let middle = size / 2;
+        for (x, y) in [(middle, 0), (middle, last), (0, middle), (last, middle)] {
+            assert!(
+                pixel(x, y)[3] >= 128,
+                "{size}px does not reach edge {x},{y}"
+            );
+        }
+        let light = |x: usize, y: usize| pixel(x, y)[1] > 180;
+        let columns = (0..size)
+            .filter(|&x| (0..size).any(|y| light(x, y)))
+            .collect::<Vec<_>>();
+        let span = columns[columns.len() - 1] - columns[0] + 1;
+        assert!(
+            span as f32 >= 0.65 * size as f32,
+            "{size}px racks span only {span} pixels"
+        );
     }
 
     #[test]

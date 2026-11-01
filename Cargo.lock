@@ -733,6 +733,7 @@ dependencies = [
  "eframe",
  "keyring",
  "p256",
+ "raw-window-handle",
  "rfd",
  "rmcp",
  "russh",

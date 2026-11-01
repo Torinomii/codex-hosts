@@ -61,9 +61,12 @@ fn launch_gui(options: ui::LaunchOptions) {
     let title = i18n::Catalog::for_locale(preferred_locale.as_deref())
         .text("app_title")
         .to_owned();
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
+        .expect("embedded application icon is valid");
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title)
+            .with_icon(icon)
             .with_inner_size([1040.0, 760.0])
             .with_min_inner_size([820.0, 620.0]),
         ..Default::default()
@@ -72,6 +75,7 @@ fn launch_gui(options: ui::LaunchOptions) {
         "Codex Hosts",
         native_options,
         Box::new(move |creation_context| {
+            tray::use_embedded_window_icon(creation_context);
             Ok(Box::new(ui::HostsApp::new(creation_context, options)?))
         }),
     );
