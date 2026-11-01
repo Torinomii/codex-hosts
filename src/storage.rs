@@ -175,12 +175,11 @@ fn save_store_to_path(store: &HostStore, path: &Path) -> Result<(), StorageError
         normalized.write_blocked = None;
         let bytes = serde_json::to_vec_pretty(&normalized)?;
         write_synced_file(&temporary, &bytes)?;
-        if path.exists() {
-            if read_store(path).is_ok() {
-                refresh_backup(path, &backup)?;
-            }
-            fs::remove_file(path)?;
+        if path.exists() && read_store(path).is_ok() {
+            refresh_backup(path, &backup)?;
         }
+        // Rename replaces the primary in one step, so a concurrent reader never
+        // finds it missing and mistakes the moment for a backup recovery.
         if let Err(error) = fs::rename(&temporary, path) {
             if !path.exists()
                 && backup.exists()
@@ -242,9 +241,6 @@ fn refresh_backup(primary: &Path, backup: &Path) -> Result<(), StorageError> {
     let bytes = fs::read(primary)?;
     let result = (|| {
         write_synced_file(&temporary, &bytes)?;
-        if backup.exists() {
-            fs::remove_file(backup)?;
-        }
         fs::rename(&temporary, backup)?;
         Ok(())
     })();

@@ -255,6 +255,13 @@ impl HostEditor {
         self.profile.username.trim() != self.original.username.trim()
     }
 
+    /// True while leaving the password field empty keeps a password already saved for this login.
+    fn login_password_saved(&self) -> bool {
+        self.password_mode == PasswordMode::Password
+            && self.saved_password_mode == Some(PasswordMode::Password)
+            && !self.login_user_changed()
+    }
+
     fn should_clear_login_password(&self) -> bool {
         // A key/Agent login must not retain the previous account's password
         // for a later password login or sudo fallback under the new username.
@@ -405,6 +412,7 @@ struct ImportCleanupPrompt {
 
 enum EditorAction {
     Save,
+    SaveTags,
     Test,
     CancelCodex,
     BrowsePrivateKey,
@@ -884,6 +892,45 @@ impl HostsApp {
         Ok(())
     }
 
+    /// Writes only the tag list; every other field in the form stays a draft until Save.
+    fn persist_tags(&mut self) -> Result<(), String> {
+        self.refresh_hosts()?;
+        let editor = self.editor.as_ref().ok_or_else(|| "NO_EDITOR".to_owned())?;
+        if !editor.matches_stored_original(&self.store) {
+            return Err(self.catalog.text("host_changed").to_owned());
+        }
+        let id = editor.profile.id;
+        let tags = editor.profile.tags.clone();
+        let mut updated_store = self.store.clone();
+        updated_store
+            .hosts
+            .iter_mut()
+            .find(|host| host.id == id)
+            .ok_or_else(|| "HOST_NOT_FOUND".to_owned())?
+            .tags
+            .clone_from(&tags);
+        updated_store.save().map_err(|error| {
+            self.catalog
+                .format("storage_error", &[("error", &error.to_string())])
+        })?;
+        self.store = updated_store;
+        if let Some(editor) = &mut self.editor {
+            editor.original.tags = tags;
+        }
+        Ok(())
+    }
+
+    fn save_tags(&mut self) {
+        // A Codex draft is written only by its Save, so Cancel leaves the store untouched.
+        if self.launch.codex_edit {
+            return;
+        }
+        match self.persist_tags() {
+            Ok(()) => self.set_status_key("status_tags_saved"),
+            Err(error) => self.set_status(StatusKind::Error, error),
+        }
+    }
+
     /// Opens the confirmation for a changed persistence value and remembers
     /// what to run once the user has answered; false means nothing to confirm.
     fn ask_persistence_confirmation(&mut self, then: PendingAction) -> bool {
@@ -965,11 +1012,12 @@ impl HostsApp {
         self.set_status_key("testing");
     }
 
+    fn host_test_running(&self, id: Uuid) -> bool {
+        self.test_operations.contains_key(&id) || self.pending_tests.contains(&id)
+    }
+
     fn start_test_host(&mut self, id: Uuid) {
-        if self.testing_all
-            || self.test_operations.contains_key(&id)
-            || self.pending_tests.contains(&id)
-        {
+        if self.testing_all || self.host_test_running(id) {
             return;
         }
         self.start_test_worker(id, Arc::new(self.store.hosts.clone()));
@@ -2142,6 +2190,31 @@ mod tests {
             }
         }
         shapes.iter().find_map(|shape| find(&shape.shape, text))
+    }
+
+    /// Re-runs the named test in a child process with its own data directory, so the real
+    /// save path never touches this user's host list. Only the child gets `true`.
+    pub(super) fn in_isolated_store(test: &str) -> bool {
+        if std::env::var_os("CODEX_HOSTS_ISOLATED_TEST").is_some() {
+            return true;
+        }
+        let directory =
+            std::env::temp_dir().join(format!("codex-hosts-isolated-{}", Uuid::new_v4()));
+        fs::create_dir(&directory).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1"])
+            .env("CODEX_HOSTS_ISOLATED_TEST", "1")
+            .env("CODEX_HOSTS_DATA_DIR", &directory)
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&directory).unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test failed: {stdout} {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
     }
 
     pub(super) fn metadata_test_app(

@@ -16,13 +16,34 @@ const WILL: u8 = 251;
 const SB: u8 = 250;
 const SE: u8 = 240;
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
-const BEGIN_MARKER: &str = "__CODEX_HOSTS_BEGIN__";
-const END_MARKER: &str = "__CODEX_HOSTS_END__";
-/// The markers are sent split by an empty shell quote so a terminal that echoes
-/// typed input never reproduces the contiguous marker; only the command's own
-/// output contains it.
-const BEGIN_MARKER_SOURCE: &str = "__CODEX_HOSTS_BEG''IN__";
-const END_MARKER_SOURCE: &str = "__CODEX_HOSTS_E''ND__";
+
+/// The markers that frame one call's output. The random tag keeps output that
+/// merely contains a marker (a log of an earlier call, this program's source)
+/// from ending the capture. Each is sent split by an empty shell quote so a
+/// terminal that echoes typed input never reproduces the contiguous marker;
+/// only the shell's `echo` prints it.
+struct Markers {
+    begin: String,
+    end: String,
+    begin_source: String,
+    end_source: String,
+}
+
+impl Markers {
+    fn new() -> Self {
+        Self::with_tag(&uuid::Uuid::new_v4().simple().to_string())
+    }
+
+    fn with_tag(tag: &str) -> Self {
+        Self {
+            begin: format!("__CODEX_HOSTS_BEGIN_{tag}__"),
+            end: format!("__CODEX_HOSTS_END_{tag}__"),
+            begin_source: format!("__CODEX_HOSTS_BEG''IN_{tag}__"),
+            end_source: format!("__CODEX_HOSTS_E''ND_{tag}__"),
+        }
+    }
+}
+
 /// Text a login program prints when it rejects the credentials; `login`
 /// delays it by a few seconds, so it can arrive after the command was sent.
 const LOGIN_FAILURE_TEXTS: [&str; 3] =
@@ -106,7 +127,7 @@ async fn execute_async(
     .await?;
     let _ = stream.set_nodelay(true);
 
-    let output = bounded(
+    let (output, exit_status) = bounded(
         limits.command_timeout,
         "COMMAND_TIMEOUT",
         "Telnet authentication or remote command execution timed out.",
@@ -119,14 +140,16 @@ async fn execute_async(
         ),
     )
     .await?;
-    let output_truncated = output.len() >= MAX_CAPTURE_BYTES;
+    // A shell that prints no status after the end marker keeps the old 0.
+    let exit_code = exit_status.unwrap_or(0);
     Ok(RemoteResult {
-        status: "ok",
+        status: if exit_code == 0 { "ok" } else { "remote_error" },
         alias: profile.alias.clone(),
-        exit_code: 0,
+        exit_code,
         stdout: output,
         stderr: String::new(),
-        output_truncated,
+        // Output over the capture limit fails with OUTPUT_LIMIT instead.
+        output_truncated: false,
         sudo_user: None,
         su_user: None,
         host_fingerprint: None,
@@ -169,7 +192,7 @@ async fn run_session(
     password: &str,
     command: &str,
     prompts: &LoginPrompts,
-) -> Result<String, RemoteFailure> {
+) -> Result<(String, Option<i32>), RemoteFailure> {
     let mut parser = TelnetParser::default();
     let mut transcript = Vec::new();
     let login = prompts.login.iter().map(String::as_str).collect::<Vec<_>>();
@@ -192,17 +215,29 @@ async fn run_session(
     transcript.clear();
     wait_for_shell(stream, &mut parser, &mut transcript).await?;
 
-    let request = request_line(command);
+    let markers = Markers::new();
+    let request = request_line(command, &markers);
     stream
         .write_all(request.as_bytes())
         .await
         .map_err(|error| RemoteFailure::new("TELNET_WRITE_FAILED", error.to_string()))?;
     transcript.clear();
-    read_until_output(stream, &mut parser, &mut transcript, request.trim_end()).await?;
-    Ok(extract_output(&String::from_utf8_lossy(&transcript)))
+    let exit_status = read_until_output(
+        stream,
+        &mut parser,
+        &mut transcript,
+        request.trim_end(),
+        &markers,
+    )
+    .await?;
+    Ok((
+        extract_output(&String::from_utf8_lossy(&transcript), &markers),
+        exit_status,
+    ))
 }
 
-/// Reads until the end marker is printed. Anything the server says before the
+/// Reads until the line carrying the end marker is complete and returns the
+/// exit status printed after it, if any. Anything the server says before the
 /// begin marker is printed, other than the echo of our own request line, came
 /// from the login program, so a login-failure message there ends the call.
 async fn read_until_output(
@@ -210,10 +245,15 @@ async fn read_until_output(
     parser: &mut TelnetParser,
     transcript: &mut Vec<u8>,
     request: &str,
-) -> Result<(), RemoteFailure> {
+    markers: &Markers,
+) -> Result<Option<i32>, RemoteFailure> {
     let request = request.to_ascii_lowercase();
-    let begin = BEGIN_MARKER.to_ascii_lowercase();
-    let end = END_MARKER.to_ascii_lowercase();
+    let begin = markers.begin.to_ascii_lowercase();
+    let mut begin_seen = false;
+    // Only the unsearched tail (plus a marker's length of overlap) is scanned
+    // per read, so a large output costs linear time.
+    let mut end_search_from = 0;
+    let mut end_at = None;
     let mut raw = [0_u8; 4096];
     loop {
         let count = stream
@@ -221,6 +261,10 @@ async fn read_until_output(
             .await
             .map_err(|error| RemoteFailure::new("TELNET_READ_FAILED", error.to_string()))?;
         if count == 0 {
+            // The status is complete even if the server hung up right after it.
+            if let Some(status) = end_at.and_then(|at| end_status(transcript, at, markers, true)) {
+                return Ok(status);
+            }
             return Err(RemoteFailure::new(
                 "TELNET_CLOSED",
                 "The Telnet server closed the connection.",
@@ -235,13 +279,22 @@ async fn read_until_output(
         }
         let remaining = MAX_CAPTURE_BYTES.saturating_sub(transcript.len());
         transcript.extend_from_slice(&parsed.data[..parsed.data.len().min(remaining)]);
-        let lowercase = String::from_utf8_lossy(transcript).to_ascii_lowercase();
-        if lowercase.contains(&end) {
-            return Ok(());
+        if end_at.is_none() {
+            end_at = find_bytes(transcript, markers.end.as_bytes(), end_search_from);
+            end_search_from = transcript.len().saturating_sub(markers.end.len() - 1);
         }
-        let server_said = lowercase.replacen(&request, "", 1);
-        let before_output = server_said.find(&begin).unwrap_or(server_said.len());
-        check_login_failure(&server_said.as_bytes()[..before_output])?;
+        if let Some(status) = end_at.and_then(|at| end_status(transcript, at, markers, false)) {
+            return Ok(status);
+        }
+        if !begin_seen {
+            let lowercase = String::from_utf8_lossy(transcript).to_ascii_lowercase();
+            let server_said = lowercase.replacen(&request, "", 1);
+            let before_output = server_said.find(&begin);
+            check_login_failure(
+                &server_said.as_bytes()[..before_output.unwrap_or(server_said.len())],
+            )?;
+            begin_seen = before_output.is_some();
+        }
         if transcript.len() >= MAX_CAPTURE_BYTES {
             return Err(RemoteFailure::new(
                 "OUTPUT_LIMIT",
@@ -249,6 +302,35 @@ async fn read_until_output(
             ));
         }
     }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    haystack
+        .get(from..)?
+        .windows(needle.len())
+        .position(|window| window == needle)
+        .map(|position| from + position)
+}
+
+/// The status the shell printed right after the end marker at `end_at`, once
+/// that line is complete: `Some(Some(code))`, or `Some(None)` when the line
+/// carries no digits (a shell without `$?`). `None` while digits may still follow.
+fn end_status(
+    transcript: &[u8],
+    end_at: usize,
+    markers: &Markers,
+    closed: bool,
+) -> Option<Option<i32>> {
+    let rest = &transcript[end_at + markers.end.len()..];
+    let digits = rest.iter().take_while(|byte| byte.is_ascii_digit()).count();
+    if digits == rest.len() && !closed {
+        return None;
+    }
+    Some(
+        std::str::from_utf8(&rest[..digits])
+            .ok()
+            .and_then(|digits| digits.parse().ok()),
+    )
 }
 
 fn check_login_failure(transcript: &[u8]) -> Result<(), RemoteFailure> {
@@ -267,25 +349,31 @@ fn check_login_failure(transcript: &[u8]) -> Result<(), RemoteFailure> {
 
 /// One line when possible, so an interactive shell prints no prompt between
 /// the markers and the command's output; a multi-line command (or one ending
-/// in `&`, which `;` would break) falls back to one line per statement.
-fn request_line(command: &str) -> String {
+/// in `&` or `;`, which the joining `;` would break) falls back to one line per
+/// statement. `$?` after the end marker reports the command's exit status.
+fn request_line(command: &str, markers: &Markers) -> String {
     let trimmed = command.trim_end();
-    if trimmed.contains(['\r', '\n', '#']) || trimmed.ends_with('&') {
-        format!("echo {BEGIN_MARKER_SOURCE}\r\n{command}\r\necho {END_MARKER_SOURCE}\r\n")
+    let Markers {
+        begin_source,
+        end_source,
+        ..
+    } = markers;
+    if trimmed.contains(['\r', '\n', '#']) || trimmed.ends_with(['&', ';']) {
+        format!("echo {begin_source}\r\n{command}\r\necho {end_source}$?\r\n")
     } else {
-        format!("echo {BEGIN_MARKER_SOURCE}; {trimmed}; echo {END_MARKER_SOURCE}\r\n")
+        format!("echo {begin_source}; {trimmed}; echo {end_source}$?\r\n")
     }
 }
 
 /// Everything the command printed between the two markers, ignoring echoed
 /// input and prompts around them.
-fn extract_output(transcript: &str) -> String {
+fn extract_output(transcript: &str, markers: &Markers) -> String {
     let after_begin = transcript
-        .rsplit_once(BEGIN_MARKER)
+        .rsplit_once(markers.begin.as_str())
         .map(|(_, value)| value)
         .unwrap_or(transcript);
     let before_end = after_begin
-        .split_once(END_MARKER)
+        .split_once(markers.end.as_str())
         .map(|(value, _)| value)
         .unwrap_or(after_begin);
     before_end.trim_matches(['\r', '\n', ' ']).to_owned()
@@ -460,7 +548,7 @@ mod tests {
 
     #[test]
     fn login_failure_is_only_recognised_before_the_request_echo() {
-        let request = request_line("echo 'Access denied'");
+        let request = request_line("echo 'Access denied'", &Markers::new());
         let echoed = format!("$ {request}");
         let server_said =
             echoed
@@ -482,20 +570,82 @@ mod tests {
 
     #[test]
     fn output_is_taken_between_the_printed_markers_even_when_input_is_echoed() {
+        let markers = Markers::with_tag("t1");
+        let Markers {
+            begin,
+            end,
+            begin_source,
+            end_source,
+        } = &markers;
         let echoed = format!(
-            "$ echo {BEGIN_MARKER_SOURCE}\r\nuname\r\necho {END_MARKER_SOURCE}\r\n{BEGIN_MARKER}\r\nLinux\r\n{END_MARKER}\r\n$ "
+            "$ echo {begin_source}\r\nuname\r\necho {end_source}$?\r\n{begin}\r\nLinux\r\n{end}0\r\n$ "
         );
-        assert_eq!(extract_output(&echoed), "Linux");
-        assert!(!echoed.contains(&format!("echo {BEGIN_MARKER}")));
-        let silent = format!("device> {BEGIN_MARKER}\r\nhi\r\n{END_MARKER}\r\ndevice> ");
-        assert_eq!(extract_output(&silent), "hi");
+        assert_eq!(extract_output(&echoed, &markers), "Linux");
+        assert!(!echoed.contains(&format!("echo {begin}")));
+        let silent = format!("device> {begin}\r\nhi\r\n{end}0\r\ndevice> ");
+        assert_eq!(extract_output(&silent, &markers), "hi");
         assert_eq!(
-            request_line("uname -s  "),
-            format!("echo {BEGIN_MARKER_SOURCE}; uname -s; echo {END_MARKER_SOURCE}\r\n")
+            request_line("uname -s  ", &markers),
+            format!("echo {begin_source}; uname -s; echo {end_source}$?\r\n")
         );
-        assert!(request_line("sleep 1 &").starts_with(&format!("echo {BEGIN_MARKER_SOURCE}\r\n")));
-        assert!(request_line("a\nb").contains("\r\na\nb\r\n"));
-        assert!(request_line("uptime # note").contains("\r\nuptime # note\r\n"));
+        assert!(
+            request_line("sleep 1 &", &markers).starts_with(&format!("echo {begin_source}\r\n"))
+        );
+        assert!(request_line("ls;", &markers).contains("\r\nls;\r\n"));
+        assert!(request_line("a\nb", &markers).contains("\r\na\nb\r\n"));
+        assert!(request_line("uptime # note", &markers).contains("\r\nuptime # note\r\n"));
+    }
+
+    #[test]
+    fn markers_differ_per_call_so_output_cannot_end_the_capture() {
+        let first = Markers::new();
+        let second = Markers::new();
+        assert_ne!(first.end, second.end);
+        let transcript = format!(
+            "{}\r\nold log: {}0\r\nmore\r\n{}0\r\n",
+            first.begin, second.end, first.end
+        );
+        assert_eq!(
+            extract_output(&transcript, &first),
+            format!("old log: {}0\r\nmore", second.end)
+        );
+    }
+
+    #[test]
+    fn exit_status_is_read_only_once_its_line_is_complete() {
+        let markers = Markers::with_tag("t2");
+        let at = |text: &str| find_bytes(text.as_bytes(), markers.end.as_bytes(), 0).unwrap();
+        let partial = format!("x{}1", markers.end);
+        assert_eq!(
+            end_status(partial.as_bytes(), at(&partial), &markers, false),
+            None
+        );
+        assert_eq!(
+            end_status(partial.as_bytes(), at(&partial), &markers, true),
+            Some(Some(1))
+        );
+        let complete = format!("x{}127\r\n$ ", markers.end);
+        assert_eq!(
+            end_status(complete.as_bytes(), at(&complete), &markers, false),
+            Some(Some(127))
+        );
+        let no_status = format!("{}$?\r\n", markers.end);
+        assert_eq!(
+            end_status(no_status.as_bytes(), at(&no_status), &markers, false),
+            Some(None)
+        );
+    }
+
+    #[test]
+    fn end_marker_is_found_across_read_boundaries() {
+        let marker = b"__END__";
+        let first = b"output __EN";
+        let mut transcript = first.to_vec();
+        assert_eq!(find_bytes(&transcript, marker, 0), None);
+        let resume = transcript.len().saturating_sub(marker.len() - 1);
+        transcript.extend_from_slice(b"D__0\r\n");
+        assert_eq!(find_bytes(&transcript, marker, resume), Some(7));
+        assert_eq!(find_bytes(b"ab", marker, 5), None);
     }
 
     #[test]

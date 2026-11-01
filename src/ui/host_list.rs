@@ -1,7 +1,8 @@
 use eframe::egui::{self, Color32, RichText};
 
 use super::{HostTestState, HostsApp, retain_visible_selection};
-use crate::model::{HostFilter, HostProfile, normalize_tags};
+use crate::i18n::Catalog;
+use crate::model::{HostFilter, HostProfile, Protocol, normalize_tags};
 
 // Dark-mode fills sit under light text; light-mode fills under dark text.
 pub(super) const TEST_SUCCESS_FILL_DARK: Color32 = Color32::from_rgb(36, 105, 67);
@@ -17,6 +18,11 @@ const ROW_LINE_GAP: f32 = 3.0;
 const ROW_ACCENT_WIDTH: f32 = 3.0;
 const DETAIL_SIZE: f32 = 11.5;
 const SECONDARY_SIZE: f32 = 11.0;
+const BADGE_SIZE: f32 = 10.0;
+const BADGE_HEIGHT: f32 = 14.0;
+const BADGE_PADDING_X: f32 = 4.0;
+/// Badges that would squeeze the alias below this width stay in the hover text only.
+const MIN_ALIAS_WIDTH: f32 = 72.0;
 
 pub(super) fn host_row_fill(state: Option<HostTestState>, dark_mode: bool) -> Option<Color32> {
     match (state, dark_mode) {
@@ -54,11 +60,68 @@ pub(super) enum RowMarker {
 /// between Codex calls, so the relaxed hosts stand out in the list.
 pub(super) const RETAINED_GLYPH: &str = "∞";
 
+/// A feature enabled on the host, shown as a small pill after the alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RowBadge {
+    Sudo,
+    Su,
+    CallApproval,
+    Jump,
+    CodexHidden,
+}
+
+impl RowBadge {
+    fn label(self, catalog: &Catalog) -> &str {
+        match self {
+            Self::Sudo => "sudo",
+            Self::Su => "su",
+            Self::CallApproval => catalog.text("badge_call_approval"),
+            Self::Jump => catalog.text("badge_jump"),
+            Self::CodexHidden => catalog.text("badge_codex_hidden"),
+        }
+    }
+
+    fn hint(self, catalog: &Catalog) -> &str {
+        catalog.text(match self {
+            Self::Sudo => "sudo_enabled",
+            Self::Su => "su_enabled",
+            Self::CallApproval => "ssh_call_approval",
+            Self::Jump => "host_chain",
+            Self::CodexHidden => "codex_hidden",
+        })
+    }
+}
+
+fn row_badges(host: &HostProfile) -> Vec<RowBadge> {
+    let advanced = &host.advanced;
+    let ssh = host.protocol == Protocol::Ssh;
+    [
+        (
+            ssh && advanced.sudo.as_ref().is_some_and(|sudo| sudo.enabled),
+            RowBadge::Sudo,
+        ),
+        (
+            ssh && advanced.su.as_ref().is_some_and(|su| su.enabled),
+            RowBadge::Su,
+        ),
+        (
+            ssh && advanced.require_call_approval,
+            RowBadge::CallApproval,
+        ),
+        (ssh && host.jump_host.is_some(), RowBadge::Jump),
+        (advanced.codex_hidden, RowBadge::CodexHidden),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, badge)| enabled.then_some(badge))
+    .collect()
+}
+
 pub(super) struct HostRowModel<'a> {
     pub alias: &'a str,
     pub detail: String,
     pub marker: Option<RowMarker>,
     pub retained: bool,
+    pub badges: Vec<RowBadge>,
     /// Tags when present, otherwise the first line of the description.
     pub secondary: String,
     pub test_state: Option<HostTestState>,
@@ -97,6 +160,7 @@ impl<'a> HostRowModel<'a> {
             ),
             marker,
             retained: host.effective_auth_persistence() != crate::model::AuthPersistence::PerCall,
+            badges: row_badges(host),
             secondary,
             test_state,
             selected,
@@ -109,11 +173,64 @@ fn row_label(text: RichText) -> egui::Label {
     egui::Label::new(text).truncate().selectable(false)
 }
 
+/// Draws the alias and as many badges as leave it readable; a long alias truncates first.
+fn alias_line(ui: &mut egui::Ui, model: &HostRowModel<'_>, catalog: &Catalog) {
+    let height = ui.text_style_height(&egui::TextStyle::Body);
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let gap = ui.spacing().item_spacing.x;
+            let room = ui.available_width() - MIN_ALIAS_WIDTH;
+            let mut reserved = 0.0;
+            let mut galleys = Vec::with_capacity(model.badges.len());
+            for badge in &model.badges {
+                let galley = ui.painter().layout_no_wrap(
+                    badge.label(catalog).to_owned(),
+                    egui::FontId::proportional(BADGE_SIZE),
+                    Color32::PLACEHOLDER,
+                );
+                let width = galley.size().x + 2.0 * BADGE_PADDING_X + gap;
+                if reserved + width > room {
+                    break;
+                }
+                reserved += width;
+                galleys.push(galley);
+            }
+            ui.scope(|ui| {
+                ui.set_max_width((ui.available_width() - reserved).max(0.0));
+                ui.add(row_label(RichText::new(model.alias).strong()));
+            });
+            for galley in galleys {
+                badge_pill(ui, galley);
+            }
+        },
+    );
+}
+
+/// The text is centred on its painted glyph bounds, as in `tag_chip`, because the CJK
+/// fallback fonts' tall line boxes would otherwise push it below the pill's middle.
+fn badge_pill(ui: &mut egui::Ui, galley: std::sync::Arc<egui::Galley>) {
+    let size = egui::vec2(galley.size().x + 2.0 * BADGE_PADDING_X, BADGE_HEIGHT);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let color = ui.visuals().text_color().gamma_multiply(0.85);
+    ui.painter().rect_stroke(
+        rect,
+        BADGE_HEIGHT / 2.0,
+        egui::Stroke::new(1.0, color.gamma_multiply(0.5)),
+        egui::StrokeKind::Inside,
+    );
+    let pos = rect.center() - galley.mesh_bounds.center().to_vec2();
+    ui.painter().galley(pos, galley, color);
+}
+
 /// Draws one host row and returns the row response plus the checkbox state if it changed.
 pub(super) fn host_row(
     ui: &mut egui::Ui,
     model: &HostRowModel<'_>,
     height: f32,
+    catalog: &Catalog,
 ) -> (egui::Response, Option<bool>) {
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
@@ -163,7 +280,7 @@ pub(super) fn host_row(
             }
             ui.vertical(|ui| {
                 ui.set_width(ui.available_width());
-                ui.add(row_label(RichText::new(model.alias).strong()));
+                alias_line(ui, model, catalog);
                 // `ui.horizontal` would reserve `interact_size.y`; allocate the exact line
                 // height instead so the third line stays inside the row.
                 let detail_height = line_height(ui, DETAIL_SIZE);
@@ -272,9 +389,11 @@ impl HostsApp {
         let batch_selected = &self.batch_selected;
         let test_states = &self.test_states;
         let delete_label = self.catalog.text("delete").to_owned();
+        let test_label = self.catalog.text("test_connection").to_owned();
         let retained_hint = self.catalog.text("persistence_retained_hint").to_owned();
         let mut selection_request = None;
         let mut deletion_request = None;
+        let mut test_request = None;
         let mut batch_toggle_request = None;
         let three_lines = hosts
             .iter()
@@ -309,10 +428,13 @@ impl HostsApp {
                     selected_id == Some(id),
                     batch_mode.then(|| batch_selected.contains(&id)),
                 );
-                let (response, checkbox_change) = host_row(ui, &model, row_height);
+                let (response, checkbox_change) = host_row(ui, &model, row_height, &self.catalog);
                 let mut hover = format!("{}\n{}", host.description, host.tags.join(", "));
                 if model.retained {
                     hover = format!("{hover}\n{RETAINED_GLYPH} {retained_hint}");
+                }
+                for badge in &model.badges {
+                    hover = format!("{hover}\n{}", badge.hint(&self.catalog));
                 }
                 let response = response.on_hover_text(hover);
                 if let Some(checked) = checkbox_change {
@@ -320,12 +442,21 @@ impl HostsApp {
                 } else if response.clicked() || response.secondary_clicked() {
                     if batch_mode {
                         batch_toggle_request = Some((id, !batch_selected.contains(&id)));
-                    } else {
+                    } else if response.clicked() || selected_id != Some(id) {
+                        // Right-clicking the open host keeps its unsaved form for the menu.
                         selection_request = Some(id);
                     }
                 }
                 if !batch_mode {
                     response.context_menu(|ui| {
+                        let testable = !self.testing_all && !self.host_test_running(id);
+                        if ui
+                            .add_enabled(testable, egui::Button::new(&test_label))
+                            .clicked()
+                        {
+                            test_request = Some(id);
+                            ui.close();
+                        }
                         if ui.button(&delete_label).clicked() {
                             deletion_request = Some(id);
                             ui.close();
@@ -355,6 +486,12 @@ impl HostsApp {
         } else if let Some(id) = deletion_request {
             self.select(id);
             self.delete_prompt = true;
+        } else if let Some(id) = test_request {
+            // Right-clicking already selected the row; test it like the editor's own button.
+            if self.selected != Some(id) {
+                self.select(id);
+            }
+            self.start_test();
         } else if let Some(id) = selection_request {
             self.select(id);
         }
@@ -440,9 +577,220 @@ impl HostsApp {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{find_text_rect, metadata_test_app};
+    use super::super::tests::{find_text_rect, in_isolated_store, metadata_test_app};
     use super::*;
-    use crate::model::HostProfile;
+    use crate::model::{HostProfile, SshAuth, SuSettings, SudoSettings};
+    use uuid::Uuid;
+
+    fn list_frame(
+        app: &mut HostsApp,
+        context: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 400.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.host_list(ui),
+        )
+    }
+
+    fn click(pos: egui::Pos2, button: egui::PointerButton) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
+    /// Right-clicks the row at `alias` and returns the frame showing its context menu.
+    fn open_menu(app: &mut HostsApp, context: &egui::Context, alias: &str) -> egui::FullOutput {
+        let shown = list_frame(app, context, 340.0, vec![]);
+        let row = find_text_rect(&shown.shapes, alias).unwrap().center();
+        list_frame(
+            app,
+            context,
+            340.0,
+            click(row, egui::PointerButton::Secondary),
+        );
+        list_frame(app, context, 340.0, vec![])
+    }
+
+    fn all_badges_profile() -> HostProfile {
+        let mut host = HostProfile {
+            alias: "example".into(),
+            address: "server.example.com".into(),
+            port: 22,
+            jump_host: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        host.advanced.sudo = Some(SudoSettings {
+            enabled: true,
+            credentials: vec![],
+        });
+        host.advanced.su = Some(SuSettings { enabled: true });
+        host.advanced.require_call_approval = true;
+        host.advanced.codex_hidden = true;
+        host
+    }
+
+    #[test]
+    fn badges_follow_enabled_features_and_ssh_only_ones_skip_telnet() {
+        assert!(row_badges(&HostProfile::default()).is_empty());
+        let mut host = all_badges_profile();
+        assert_eq!(
+            row_badges(&host),
+            [
+                RowBadge::Sudo,
+                RowBadge::Su,
+                RowBadge::CallApproval,
+                RowBadge::Jump,
+                RowBadge::CodexHidden
+            ]
+        );
+        host.advanced.sudo = Some(SudoSettings {
+            enabled: false,
+            credentials: vec![],
+        });
+        assert!(!row_badges(&host).contains(&RowBadge::Sudo));
+        host.protocol = Protocol::Telnet;
+        assert_eq!(row_badges(&host), [RowBadge::CodexHidden]);
+    }
+
+    #[test]
+    fn badges_sit_after_the_alias_inside_the_row_in_every_locale() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            super::super::theme::configure_fonts(&context, locale);
+            let mut app = metadata_test_app(&context, locale, all_badges_profile());
+            let mut output = list_frame(&mut app, &context, 340.0, vec![]);
+            for _ in 0..2 {
+                output = list_frame(&mut app, &context, 340.0, vec![]);
+            }
+            let rect = |text: &str| {
+                find_text_rect(&output.shapes, text)
+                    .unwrap_or_else(|| panic!("{locale} is missing badge {text}"))
+            };
+            let alias = rect("example");
+            let detail = rect("SSH · server.example.com:22");
+            let mut left = alias.right();
+            for badge in ["sudo", "su"].into_iter().chain(
+                ["badge_call_approval", "badge_jump", "badge_codex_hidden"]
+                    .map(|key| app.catalog.text(key)),
+            ) {
+                let badge = rect(badge);
+                assert!(badge.left() >= left, "{locale}: {badge:?}");
+                assert!(badge.right() <= 340.0, "{locale}: {badge:?}");
+                assert!(badge.center().y < detail.top(), "{locale}: {badge:?}");
+                left = badge.right();
+            }
+            assert!(alias.bottom() <= detail.top());
+        }
+    }
+
+    #[test]
+    fn narrow_rows_keep_the_alias_and_drop_the_badges_that_do_not_fit() {
+        let context = egui::Context::default();
+        super::super::theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", all_badges_profile());
+        let mut output = list_frame(&mut app, &context, 150.0, vec![]);
+        for _ in 0..2 {
+            output = list_frame(&mut app, &context, 150.0, vec![]);
+        }
+        let alias = find_text_rect(&output.shapes, "example").unwrap();
+        assert!(alias.width() > 30.0, "alias stays readable: {alias:?}");
+        assert!(find_text_rect(&output.shapes, "sudo").is_some());
+        assert!(find_text_rect(&output.shapes, app.catalog.text("badge_codex_hidden")).is_none());
+    }
+
+    #[test]
+    fn right_click_keeps_the_open_draft_and_offers_test_connection() {
+        let context = egui::Context::default();
+        super::super::theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", all_badges_profile());
+        app.selected = app.store.hosts.first().map(|host| host.id);
+        app.editor.as_mut().unwrap().profile.description = "unsaved draft".into();
+        let output = open_menu(&mut app, &context, "example");
+        assert_eq!(
+            app.editor.as_ref().unwrap().profile.description,
+            "unsaved draft"
+        );
+        let test = find_text_rect(&output.shapes, app.catalog.text("test_connection")).unwrap();
+        let delete = find_text_rect(&output.shapes, app.catalog.text("delete")).unwrap();
+        assert!(
+            test.bottom() <= delete.top(),
+            "test comes first in the menu"
+        );
+    }
+
+    #[test]
+    fn right_click_test_connection_is_disabled_during_test_all() {
+        let context = egui::Context::default();
+        super::super::theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", all_badges_profile());
+        app.selected = app.store.hosts.first().map(|host| host.id);
+        app.testing_all = true;
+        let output = open_menu(&mut app, &context, "example");
+        let test = find_text_rect(&output.shapes, app.catalog.text("test_connection")).unwrap();
+        list_frame(
+            &mut app,
+            &context,
+            340.0,
+            click(test.center(), egui::PointerButton::Primary),
+        );
+        assert!(app.test_operations.is_empty());
+    }
+
+    #[test]
+    fn right_click_test_connection_starts_a_test_of_that_host() {
+        if !in_isolated_store(
+            "ui::host_list::tests::right_click_test_connection_starts_a_test_of_that_host",
+        ) {
+            return;
+        }
+        let context = egui::Context::default();
+        super::super::theme::configure_fonts(&context, "en");
+        let other = HostProfile::new("other".into());
+        let target = HostProfile {
+            alias: "target".into(),
+            address: "127.0.0.1".into(),
+            port: 1,
+            username: "tester".into(),
+            ssh_auth: SshAuth::SshAgent,
+            ..Default::default()
+        };
+        let id = target.id;
+        let mut app = metadata_test_app(&context, "en", other);
+        app.store.hosts.push(target);
+        app.store.save().unwrap();
+        let output = open_menu(&mut app, &context, "target");
+        assert_eq!(app.selected, Some(id), "right-click selects the row");
+        let test = find_text_rect(&output.shapes, app.catalog.text("test_connection")).unwrap();
+        list_frame(
+            &mut app,
+            &context,
+            340.0,
+            click(test.center(), egui::PointerButton::Primary),
+        );
+        assert!(app.test_operations.contains_key(&id));
+        assert_eq!(app.test_states.get(&id), Some(&HostTestState::Testing));
+    }
 
     #[test]
     fn host_row_keeps_alias_details_and_tags_on_separate_lines() {

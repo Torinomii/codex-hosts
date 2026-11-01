@@ -1703,6 +1703,7 @@ async fn authenticate_password(
         .authenticate_keyboard_interactive_start(username.to_owned(), None)
         .await
         .map_err(|error| RemoteFailure::new("AUTH_FAILED", error.to_string()))?;
+    let mut password_sent = false;
     for _ in 0..8 {
         match response {
             KeyboardInteractiveAuthResponse::Success => return Ok(()),
@@ -1713,10 +1714,9 @@ async fn authenticate_password(
                 ));
             }
             KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                let answers = keyboard_interactive_answers(&prompts, password, &mut password_sent)?;
                 response = session
-                    .authenticate_keyboard_interactive_respond(
-                        prompts.iter().map(|_| password.to_owned()).collect(),
-                    )
+                    .authenticate_keyboard_interactive_respond(answers)
                     .await
                     .map_err(|error| RemoteFailure::new("AUTH_FAILED", error.to_string()))?;
             }
@@ -1726,6 +1726,28 @@ async fn authenticate_password(
         "AUTH_FAILED",
         "The server sent too many keyboard-interactive prompts.",
     ))
+}
+
+/// Answers one keyboard-interactive round. The saved password goes to a single
+/// hidden prompt, once: any other prompt (a one-time code, a retry after a
+/// rejected password) must not receive it, since that would disclose it to the
+/// wrong question or count against a lockout.
+fn keyboard_interactive_answers(
+    prompts: &[client::Prompt],
+    password: &str,
+    password_sent: &mut bool,
+) -> Result<Vec<String>, RemoteFailure> {
+    match prompts {
+        [] => Ok(Vec::new()),
+        [prompt] if !prompt.echo && !*password_sent => {
+            *password_sent = true;
+            Ok(vec![password.to_owned()])
+        }
+        _ => Err(RemoteFailure::new(
+            "AUTH_FAILED",
+            "The server rejected the password or asked for further keyboard-interactive input (such as a one-time code), which codex-hosts does not answer.",
+        )),
+    }
 }
 
 struct CommandResult {
@@ -2076,6 +2098,45 @@ mod tests {
         assert_eq!(value["expected_algorithm"], "ssh-ed25519");
         assert_eq!(value["observed_algorithm"], "ssh-rsa");
         assert!(value.get("host_key").is_none());
+    }
+
+    #[test]
+    fn keyboard_interactive_sends_the_password_to_one_hidden_prompt_only() {
+        let prompt = |text: &str, echo| client::Prompt {
+            prompt: text.to_owned(),
+            echo,
+        };
+        let mut sent = false;
+        assert!(
+            keyboard_interactive_answers(&[], "pw", &mut sent)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            keyboard_interactive_answers(&[prompt("Password: ", false)], "pw", &mut sent).unwrap(),
+            ["pw"]
+        );
+        assert!(sent);
+        // A second prompt is a retry or a second factor, never the password again.
+        assert!(
+            keyboard_interactive_answers(&[prompt("Password: ", false)], "pw", &mut sent).is_err()
+        );
+        let mut fresh = false;
+        for prompts in [
+            vec![prompt("Passcode or option (1-3): ", true)],
+            vec![
+                prompt("Password: ", false),
+                prompt("Verification code: ", false),
+            ],
+        ] {
+            assert_eq!(
+                keyboard_interactive_answers(&prompts, "pw", &mut fresh)
+                    .unwrap_err()
+                    .code,
+                "AUTH_FAILED"
+            );
+            assert!(!fresh);
+        }
     }
 
     #[test]

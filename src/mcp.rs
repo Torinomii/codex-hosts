@@ -139,14 +139,15 @@ impl CallGates {
         lock
     }
 
+    /// Per-host waits come before the global permit: a call queued behind a
+    /// busy host (a hardware touch can take minutes) must not hold one of the
+    /// few call slots that calls to other hosts need.
     async fn single_host(
         &self,
         target: &HostProfile,
         hosts: &[HostProfile],
         channels: u32,
     ) -> CallGuard {
-        let permit = self.permit().await;
-        let batch = BatchGuard::Shared(Arc::clone(&self.batch).read_owned().await);
         let mut per_call = resolve_ssh_chain(target, hosts)
             .map(|chain| chain.into_iter().cloned().collect::<Vec<_>>())
             .unwrap_or_else(|_| vec![target.clone()])
@@ -166,6 +167,8 @@ impl CallGates {
             .acquire_many_owned(channels)
             .await
             .expect("channel budget is never closed");
+        let permit = self.permit().await;
+        let batch = BatchGuard::Shared(Arc::clone(&self.batch).read_owned().await);
         CallGuard {
             _permit: permit,
             _batch: batch,
@@ -404,7 +407,7 @@ impl Server {
 
     #[tool(
         name = "exec",
-        description = "Run one command on a saved SSH or Telnet host and return its exit code and captured output (up to 1 MiB). The command is sent exactly as given. Telnet has no exit status: it returns exit_code 0 with the text the command printed between the server's prompts, so judge from the output. Never retry automatically: the command may not be idempotent.",
+        description = "Run one command on a saved SSH or Telnet host and return its exit code and captured output (up to 1 MiB). The command is sent exactly as given. On Telnet, exit_code is the status the remote shell prints, or 0 when it prints none, so also judge from the output. Never retry automatically: the command may not be idempotent.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1137,6 +1140,52 @@ mod tests {
             Ok::<(), RemoteFailure>(())
         }));
         assert_eq!(outcome.unwrap_err().code, "CANCELLED");
+    }
+
+    #[test]
+    fn calls_queued_on_a_busy_host_leave_call_slots_for_other_hosts() {
+        use crate::model::Protocol;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let busy = HostProfile {
+            alias: "busy".into(),
+            protocol: Protocol::Ssh,
+            ..Default::default()
+        };
+        let other = HostProfile {
+            alias: "other".into(),
+            protocol: Protocol::Ssh,
+            ..Default::default()
+        };
+        let hosts = Arc::new(vec![busy.clone(), other.clone()]);
+        runtime.block_on(async {
+            let gates = Arc::new(CallGates::new());
+            let running = gates.single_host(&busy, &hosts, 1).await;
+            let mut queued = Vec::new();
+            for _ in 0..MAX_CONCURRENT_CALLS {
+                let (gates, busy, hosts) = (Arc::clone(&gates), busy.clone(), Arc::clone(&hosts));
+                queued.push(tokio::spawn(async move {
+                    drop(gates.single_host(&busy, &hosts, 1).await);
+                }));
+            }
+            tokio::task::yield_now().await;
+            let unrelated = tokio::time::timeout(
+                Duration::from_millis(50),
+                gates.single_host(&other, &hosts, 1),
+            )
+            .await;
+            assert!(
+                unrelated.is_ok(),
+                "another host must not wait behind the queue"
+            );
+            drop(unrelated);
+            drop(running);
+            for task in queued {
+                task.await.unwrap();
+            }
+        });
     }
 
     #[test]

@@ -114,7 +114,7 @@ Every result carries `schema_version` (currently 1) and `status`.
 - `has_required_secret` is true for `private_key` and `ssh_agent` hosts; for password and Telnet hosts it reflects Windows Credential Manager for the current user, so a sandbox user can see false for a host the desktop user saved.
 - `verified` is true only after a successful probe, batch probe, or GUI test with the pinned key. A host accepted through the host-key prompt is pinned but not yet verified.
 
-`probe` and `exec`: `alias`, `exit_code`, `stdout`, `stderr`, `output_truncated`, and for SSH `host_fingerprint`, `host_key_algorithm`, `auth_key_fingerprint` (the public key that authenticated, for key and Agent routes), and `verified_host_keys` for each hop. `status` is `ok` when `exit_code` is 0 and `remote_error` otherwise. Telnet always reports `exit_code` 0.
+`probe` and `exec`: `alias`, `exit_code`, `stdout`, `stderr`, `output_truncated`, and for SSH `host_fingerprint`, `host_key_algorithm`, `auth_key_fingerprint` (the public key that authenticated, for key and Agent routes), and `verified_host_keys` for each hop. `status` is `ok` when `exit_code` is 0 and `remote_error` otherwise. Telnet reports the exit status the remote shell prints after the command, or 0 when it prints none.
 
 `exec_many`: `alias`, `results` in input order with `index`, `status` (`ok`, `remote_error`, `error`, or `cancelled` with `COMMAND_CANCELLED`), `exit_code`, `stdout`, `stderr`, `output_truncated`, `error_code`, `error_message`; overall `status` is `ok`, `completed_with_remote_errors`, or `completed_with_errors`.
 

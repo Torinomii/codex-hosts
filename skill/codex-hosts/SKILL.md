@@ -77,7 +77,7 @@ Parameters, result fields, limits, and every error code: [references/tool-protoc
 
 - Do not infer the remote OS or shell from SSH alone; use what the user said, `remote_env`, or output you already verified. Do not assume Bash, GNU utilities, `sudo`, systemd, a UTF-8 locale, or a TTY; prefer minimal non-interactive commands.
 - Partition hosts by shell family before `batch_exec`; never send a POSIX command to a known Windows group or the reverse.
-- Telnet logs in by script and needs a POSIX-style shell with `echo`. It returns `exit_code` 0 even when the command failed, so judge success from the output. A rejected login reports `AUTH_FAILED`; a command that ends the shell (such as `exit`) reports `TELNET_CLOSED`.
+- Telnet logs in by script and needs a POSIX-style shell with `echo`. Its `exit_code` is the status that shell prints (`$?`), or 0 when it prints none, so judge success from the output as well. A rejected login reports `AUTH_FAILED`; a command that ends the shell (such as `exit`) reports `TELNET_CLOSED`.
 
 ## Failures
 

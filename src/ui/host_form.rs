@@ -14,6 +14,8 @@ const STACKED_BREAKPOINT: f32 = 520.0;
 const LABEL_WIDTH: f32 = 168.0;
 const ROW_MARGIN: egui::Margin = egui::Margin::symmetric(10, 7);
 const MAX_FORM_WIDTH: f32 = 1100.0;
+/// Stands in for a saved login password while the empty field is not focused.
+const SAVED_PASSWORD_MASK: &str = "******";
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum FormLayout {
@@ -254,7 +256,13 @@ fn optional_number<T: egui::emath::Numeric>(
     });
 }
 
-fn basic_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) {
+fn basic_section(
+    ui: &mut egui::Ui,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+    testing_all: bool,
+    action: &mut Option<EditorAction>,
+) {
     section(ui, catalog.text("section_basic"), |ui| {
         let mut form = Form::new(ui, catalog);
         let missing = editor.show_required && editor.profile.alias.trim().is_empty();
@@ -272,46 +280,67 @@ fn basic_section(ui: &mut egui::Ui, editor: &mut HostEditor, catalog: &Catalog) 
         });
         form.row(ui, "tags", None, |ui, width| {
             ui.set_max_width(width);
-            let control = control_height(ui);
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, control),
-                egui::Layout::right_to_left(egui::Align::Center),
-                |ui| {
-                    let add = ui.add_sized(
-                        [ui.spacing().interact_size.x.max(72.0), control],
-                        egui::Button::new(catalog.text("add_tag")),
-                    );
-                    let input_width = ui.available_width();
-                    let input = ui.add(
-                        single_line(ui, &mut editor.tag_input, input_width)
-                            .hint_text(catalog.text("tag_hint")),
-                    );
-                    let enter =
-                        input.lost_focus() && ui.input(|state| state.key_pressed(egui::Key::Enter));
-                    if add.clicked() || enter {
-                        editor
-                            .profile
-                            .tags
-                            .push(std::mem::take(&mut editor.tag_input));
-                        editor.profile.tags = normalize_tags(&editor.profile.tags);
-                    }
-                },
+            // Test All writes the store when it finishes, so tags wait like Save does.
+            ui.add_enabled_ui(!testing_all, |ui| {
+                tags_field(ui, editor, catalog, width, action);
+            });
+        });
+    });
+}
+
+/// Adding or removing a tag asks for the tags alone to be saved at once.
+fn tags_field(
+    ui: &mut egui::Ui,
+    editor: &mut HostEditor,
+    catalog: &Catalog,
+    width: f32,
+    action: &mut Option<EditorAction>,
+) {
+    let control = control_height(ui);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, control),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            let add = ui.add_sized(
+                [ui.spacing().interact_size.x.max(72.0), control],
+                egui::Button::new(catalog.text("add_tag")),
             );
-            if !editor.profile.tags.is_empty() {
-                let mut remove = None;
-                ui.horizontal_wrapped(|ui| {
-                    for (index, tag) in editor.profile.tags.iter().enumerate() {
-                        if tag_chip(ui, tag).clicked() {
-                            remove = Some(index);
-                        }
-                    }
-                });
-                if let Some(index) = remove {
-                    editor.profile.tags.remove(index);
+            let input_width = ui.available_width();
+            let input = ui.add(
+                single_line(ui, &mut editor.tag_input, input_width)
+                    .hint_text(catalog.text("tag_hint")),
+            );
+            let enter = input.lost_focus() && ui.input(|state| state.key_pressed(egui::Key::Enter));
+            if add.clicked() || enter {
+                let tags = normalize_tags(
+                    editor
+                        .profile
+                        .tags
+                        .iter()
+                        .chain(std::iter::once(&editor.tag_input)),
+                );
+                editor.tag_input.clear();
+                if tags != editor.profile.tags {
+                    editor.profile.tags = tags;
+                    *action = Some(EditorAction::SaveTags);
+                }
+            }
+        },
+    );
+    if !editor.profile.tags.is_empty() {
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            for (index, tag) in editor.profile.tags.iter().enumerate() {
+                if tag_chip(ui, tag).clicked() {
+                    remove = Some(index);
                 }
             }
         });
-    });
+        if let Some(index) = remove {
+            editor.profile.tags.remove(index);
+            *action = Some(EditorAction::SaveTags);
+        }
+    }
 }
 
 /// A removable tag pill. The text is centred on its painted glyph bounds rather
@@ -519,16 +548,26 @@ fn auth_section(
                 catalog.text("login_password_user_changed").to_owned()
             } else if let Some(error) = editor.password_read_error.as_deref() {
                 catalog.format("credential_error", &[("error", error)])
-            } else if editor.saved_password_mode == Some(PasswordMode::Password)
-                && !editor.login_user_changed()
-            {
+            } else if editor.login_password_saved() {
                 catalog.text("password_saved").to_owned()
             } else {
                 catalog.text("password_required").to_owned()
             };
             form.row(ui, "password", Some(password_hint), |ui, width| {
-                let edit = single_line(ui, &mut editor.password, width).password(true);
-                ui.add_enabled(editor.password_mode == PasswordMode::Password, edit);
+                let id = egui::Id::new("login_password");
+                // The mask leaves on focus, so a new password is typed into an empty field.
+                let masked =
+                    editor.login_password_saved() && !ui.memory(|memory| memory.has_focus(id));
+                let mut edit = single_line(ui, &mut editor.password, width)
+                    .password(true)
+                    .id(id);
+                if masked {
+                    edit = edit.hint_text(SAVED_PASSWORD_MASK);
+                }
+                let response = ui.add_enabled(editor.password_mode == PasswordMode::Password, edit);
+                if masked && response.has_focus() {
+                    ui.ctx().request_repaint();
+                }
             });
         } else if editor.profile.ssh_auth == SshAuth::PrivateKey {
             let key_missing =
@@ -1327,10 +1366,8 @@ impl HostsApp {
     pub(super) fn editor_panel(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let catalog = self.catalog.clone();
         let hosts = self.store.hosts.clone();
-        let testing = self.testing_all
-            || self.selected.is_some_and(|id| {
-                self.test_operations.contains_key(&id) || self.pending_tests.contains(&id)
-            });
+        let testing =
+            self.testing_all || self.selected.is_some_and(|id| self.host_test_running(id));
         let codex_edit = self.launch.codex_edit;
         let mut action = None;
 
@@ -1392,6 +1429,7 @@ impl HostsApp {
 
         match action {
             Some(EditorAction::Save) => self.save(context),
+            Some(EditorAction::SaveTags) => self.save_tags(),
             Some(EditorAction::Test) => self.start_test(),
             Some(EditorAction::CancelCodex) => {
                 let alias = self
@@ -1496,7 +1534,7 @@ impl HostsApp {
             });
             ui.add_space(12.0);
         }
-        basic_section(ui, editor, catalog);
+        basic_section(ui, editor, catalog, self.testing_all, action);
         connection_section(ui, editor, catalog, hosts);
         auth_section(ui, editor, catalog, action);
         if editor.profile.protocol == Protocol::Ssh {
@@ -1510,8 +1548,201 @@ impl HostsApp {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{find_text_rect, metadata_test_app};
+    use super::super::tests::{find_text_rect, in_isolated_store, metadata_test_app};
     use super::*;
+
+    fn panel_frame(
+        app: &mut HostsApp,
+        context: &egui::Context,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1040.0, 1600.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.editor_panel(ui, context),
+        )
+    }
+
+    /// Clicks the text in the editor panel on a frame of its own.
+    fn click_text(app: &mut HostsApp, context: &egui::Context, text: &str) {
+        let shown = panel_frame(app, context, vec![]);
+        let target = find_text_rect(&shown.shapes, text)
+            .unwrap_or_else(|| panic!("missing {text}"))
+            .center();
+        panel_frame(app, context, click_events(target));
+        panel_frame(app, context, vec![]);
+    }
+
+    fn stored_host() -> HostProfile {
+        crate::storage::HostStore::load().unwrap().hosts[0].clone()
+    }
+
+    #[test]
+    fn tag_changes_save_at_once_and_leave_the_rest_of_the_form_as_a_draft() {
+        if !in_isolated_store(
+            "ui::host_form::tests::tag_changes_save_at_once_and_leave_the_rest_of_the_form_as_a_draft",
+        ) {
+            return;
+        }
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", metadata_profile());
+        app.store.save().unwrap();
+        panel_frame(&mut app, &context, vec![]);
+        let editor = app.editor.as_mut().unwrap();
+        editor.profile.description = "unsaved draft".into();
+        editor.tag_input = "db".into();
+        let add_tag = app.catalog.text("add_tag").to_owned();
+        click_text(&mut app, &context, &add_tag);
+        let stored = stored_host();
+        assert_eq!(stored.tags, ["prod", "web", "db"]);
+        assert_eq!(stored.description, "metadata notes\nsecond line");
+        let editor = app.editor.as_ref().unwrap();
+        assert_eq!(editor.profile.description, "unsaved draft");
+        assert!(editor.has_unsaved_changes());
+        assert!(editor.matches_stored_original(&app.store));
+        assert_eq!(app.status.text, app.catalog.text("status_tags_saved"));
+
+        // A duplicate changes nothing, so it writes nothing and reports nothing.
+        app.status.text = "untouched".into();
+        app.editor.as_mut().unwrap().tag_input = "DB".into();
+        click_text(&mut app, &context, &add_tag);
+        assert_eq!(stored_host().tags, ["prod", "web", "db"]);
+        assert_eq!(app.status.text, "untouched");
+
+        click_text(&mut app, &context, "db ×");
+        assert_eq!(stored_host().tags, ["prod", "web"]);
+        assert_eq!(stored_host().description, "metadata notes\nsecond line");
+
+        // With nothing else edited, the host is clean after a tag save.
+        app.editor.as_mut().unwrap().profile.description = "metadata notes\nsecond line".into();
+        assert!(!app.editor.as_ref().unwrap().has_unsaved_changes());
+    }
+
+    #[test]
+    fn a_tag_save_keeps_the_first_save_persistence_confirmation_pending() {
+        if !in_isolated_store(
+            "ui::host_form::tests::a_tag_save_keeps_the_first_save_persistence_confirmation_pending",
+        ) {
+            return;
+        }
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", metadata_profile());
+        app.store.save().unwrap();
+        let profile = app.store.hosts[0].clone();
+        app.editor = Some(HostEditor::fresh(profile));
+        app.editor.as_mut().unwrap().tag_input = "db".into();
+        let add_tag = app.catalog.text("add_tag").to_owned();
+        click_text(&mut app, &context, &add_tag);
+        let stored = stored_host();
+        assert!(stored.tags.contains(&"db".to_owned()));
+        assert_eq!(stored.auth_persistence, AuthPersistence::PerCall);
+        let editor = app.editor.as_ref().unwrap();
+        assert!(editor.first_save);
+        assert_eq!(editor.profile.auth_persistence, AuthPersistence::Session);
+        assert!(editor.persistence_change().is_some());
+    }
+
+    #[test]
+    fn codex_drafts_keep_tags_unsaved_until_their_own_save() {
+        if !in_isolated_store(
+            "ui::host_form::tests::codex_drafts_keep_tags_unsaved_until_their_own_save",
+        ) {
+            return;
+        }
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", metadata_profile());
+        app.store.save().unwrap();
+        app.launch.codex_edit = true;
+        app.editor.as_mut().unwrap().tag_input = "db".into();
+        let add_tag = app.catalog.text("add_tag").to_owned();
+        click_text(&mut app, &context, &add_tag);
+        assert_eq!(stored_host().tags, ["prod", "web"]);
+        assert!(
+            app.editor
+                .as_ref()
+                .unwrap()
+                .profile
+                .tags
+                .contains(&"db".to_owned())
+        );
+    }
+
+    #[test]
+    fn tags_cannot_change_while_test_all_owns_the_store() {
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", metadata_profile());
+        app.testing_all = true;
+        app.editor.as_mut().unwrap().tag_input = "db".into();
+        let add_tag = app.catalog.text("add_tag").to_owned();
+        click_text(&mut app, &context, &add_tag);
+        assert_eq!(
+            app.editor.as_ref().unwrap().profile.tags,
+            ["prod", "web"],
+            "the disabled button did nothing"
+        );
+    }
+
+    #[test]
+    fn saved_password_shows_a_mask_only_until_the_field_has_focus() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            theme::configure_fonts(&context, locale);
+            let mut profile = metadata_profile();
+            profile.username = "alice".into();
+            let mut app = metadata_test_app(&context, locale, profile);
+            let masked = |output: &egui::FullOutput| {
+                find_text_rect(&output.shapes, SAVED_PASSWORD_MASK).is_some()
+            };
+
+            let output = panel_frame(&mut app, &context, vec![]);
+            assert!(!masked(&output), "nothing saved, nothing to mask");
+
+            app.editor.as_mut().unwrap().saved_password_mode = Some(PasswordMode::Password);
+            let output = panel_frame(&mut app, &context, vec![]);
+            assert!(masked(&output), "a saved password is masked");
+
+            let field = egui::Id::new("login_password");
+            context.memory_mut(|memory| memory.request_focus(field));
+            let output = panel_frame(&mut app, &context, vec![]);
+            assert!(!masked(&output), "the focused field is empty");
+            assert!(app.editor.as_ref().unwrap().password.is_empty());
+
+            panel_frame(
+                &mut app,
+                &context,
+                vec![egui::Event::Text("new secret".into())],
+            );
+            assert_eq!(app.editor.as_ref().unwrap().password.as_str(), "new secret");
+
+            // Clearing the field and leaving it again still means "keep the saved one".
+            app.editor.as_mut().unwrap().password.clear();
+            context.memory_mut(|memory| memory.surrender_focus(field));
+            let output = panel_frame(&mut app, &context, vec![]);
+            assert!(masked(&output), "the mask returns on blur");
+
+            app.editor.as_mut().unwrap().password_mode = PasswordMode::NoPassword;
+            let output = panel_frame(&mut app, &context, vec![]);
+            assert!(!masked(&output), "no-password mode has nothing to mask");
+            app.editor.as_mut().unwrap().password_mode = PasswordMode::Password;
+
+            app.editor.as_mut().unwrap().profile.username = "bob".into();
+            let output = panel_frame(&mut app, &context, vec![]);
+            assert!(
+                !masked(&output),
+                "the saved password belongs to the old user"
+            );
+        }
+    }
 
     fn run_form(app: &mut HostsApp, context: &egui::Context, width: f32) -> egui::FullOutput {
         let mut output = None;
