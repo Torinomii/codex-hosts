@@ -50,15 +50,16 @@ Codex 向けの Windows SSH / Telnet ホスト管理ツール兼 MCP サーバ�
 最も手早いのは Codex に依頼する方法です。次の内容を Codex に貼り付けてください。
 
 ```text
-https://github.com/Torinomii/codex-hosts.git を固定ディレクトリにクローンし、scripts/install-local-skill.ps1 でビルド環境を確認してください。ビルド、リンクのインストール、旧パスの置き換えはそれぞれ実行前に私に確認してください。
-インストール先の codex-hosts Skill ディレクトリ全体が単一のシンボリックリンクで、実行ファイルがリリースビルドを参照することを確認し、SKILL.md に従って config.toml に codex-hosts MCP サーバーを登録し、チェックアウトを保持してください。
+https://github.com/Torinomii/codex-hosts/releases/latest から codex-hosts の最新リリースをインストールしてください。codex-hosts-windows-x86_64.zip と codex-hosts-windows-x86_64.zip.sha256 をダウンロードし、チェックサムが一致しなければ中止してください。
+インストール先のディレクトリを私に尋ね、インストールされた Skill がそこへリンクするため移動してはいけないことを伝えてください。ZIP をそこに展開して install-local-skill.ps1 -ReleasePackage を実行し、以前のインストールを置き換える前に私に確認してください。
+インストールされた codex-hosts Skill ディレクトリがそのディレクトリへの単一のシンボリックリンクであることを確認し、SKILL.md に従って config.toml に codex-hosts MCP サーバーを登録してください。
 ```
 
-Codex がリポジトリをクローンして対話式インストーラーを実行し（コンパイル、リンク作成、置き換えの前に確認を求めます）、MCP サーバーを登録します。ソースからビルドするため、下表の「ソースからビルド」と同じ環境が必要です。手動でインストールする場合は、表の後の 2 つの手順に従ってください。
+Codex が最新の Release をダウンロードして検証し、指定した場所にインストールして MCP サーバーを登録します。コンパイルは行いません。手動でインストールする場合は、表の後の 2 つの手順に従ってください。
 
 | 方法 | 必要な環境 | 開始方法 |
 | --- | --- | --- |
-| Codex に依頼（推奨） | Codex + 「ソースからビルド」の環境 | 上のプロンプト |
+| Codex に依頼（推奨） | Codex + 「GitHub Release」の環境 | 上のプロンプト |
 | GitHub Release | 64 ビット Windows 10+、PowerShell 7.2+ | `install.cmd` または以下のコマンド |
 | ソースからビルド | 上記 + Rust 1.92+、MSVC、Windows SDK | `scripts/install.cmd` または `scripts/install-local-skill.ps1` |
 
