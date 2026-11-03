@@ -103,17 +103,21 @@ async fn execute_async(
     command: &str,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
-    let password = credentials::load(profile.id, credentials::login_password_kind(profile))
-        .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?
-        .ok_or_else(|| {
-            RemoteFailure::new(
-                "CREDENTIAL_MISSING",
-                format!(
-                    "No password is saved for {}; open_host_editor for this alias lets the user add one.",
-                    profile.alias
-                ),
-            )
-        })?;
+    let password = if profile.is_vault_host() {
+        crate::bitwarden::resolve_login_password(profile, None).await?
+    } else {
+        credentials::load(profile.id, credentials::login_password_kind(profile))
+            .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?
+            .ok_or_else(|| {
+                RemoteFailure::new(
+                    "CREDENTIAL_MISSING",
+                    format!(
+                        "No password is saved for {}; open_host_editor for this alias lets the user add one.",
+                        profile.alias
+                    ),
+                )
+            })?
+    };
     let mut stream = bounded(
         limits.connect_timeout,
         "CONNECT_TIMEOUT",

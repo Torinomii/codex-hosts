@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::model::HostProfile;
+use crate::model::{BitwardenSettings, HostProfile};
 
 const STORE_VERSION: u32 = 2;
 
@@ -18,6 +18,8 @@ pub struct HostStore {
     pub version: u32,
     pub preferred_locale: Option<String>,
     pub hosts: Vec<HostProfile>,
+    /// Credential-manager choice and the Bitwarden account; non-secret.
+    pub bitwarden: BitwardenSettings,
     #[serde(skip)]
     write_blocked: Option<String>,
     // Exact loaded bytes (None means no primary). Never written into hosts.json.
@@ -42,6 +44,7 @@ impl Default for HostStore {
             version: STORE_VERSION,
             preferred_locale: None,
             hosts: Vec::new(),
+            bitwarden: BitwardenSettings::default(),
             write_blocked: None,
             revision: RefCell::new(None),
         }
@@ -108,6 +111,18 @@ impl HostStore {
             number += 1;
         }
     }
+}
+
+/// Serialises the load-modify-save sequences of one process (host-key trust
+/// after a call, vault-host mirrors after a refresh): without it two
+/// concurrent tool calls would each load, change and save the store and the
+/// revision check would fail one of them after its remote work succeeded.
+/// Other processes are kept out by the revision check itself.
+pub fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    static WRITERS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    WRITERS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn load_legacy_or_default() -> Result<HostStore, StorageError> {

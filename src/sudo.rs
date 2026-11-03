@@ -115,6 +115,8 @@ pub(crate) fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+/// Credential Manager only; the runtime path is [`password_for_async`].
+#[cfg(test)]
 pub fn password_for(
     profile: &HostProfile,
     username: &str,
@@ -124,6 +126,7 @@ pub fn password_for(
     })
 }
 
+#[cfg(test)]
 pub fn su_password_for(
     profile: &HostProfile,
     username: &str,
@@ -131,6 +134,49 @@ pub fn su_password_for(
     password_for_method_with(profile, username, PasswordMethod::Su, |kind| {
         credentials::load(profile.id, kind)
     })
+}
+
+/// A vault host's login password comes from its item: the one this call's
+/// admission already read (`vault_password`), else read again.
+pub async fn password_for_async(
+    profile: &HostProfile,
+    username: &str,
+    vault_password: Option<&Zeroizing<String>>,
+) -> Result<Zeroizing<String>, RemoteFailure> {
+    password_for_method_async(profile, username, PasswordMethod::Sudo, vault_password).await
+}
+
+/// Runtime variant of [`password_for_async`] for su.
+pub async fn su_password_for_async(
+    profile: &HostProfile,
+    username: &str,
+    vault_password: Option<&Zeroizing<String>>,
+) -> Result<Zeroizing<String>, RemoteFailure> {
+    password_for_method_async(profile, username, PasswordMethod::Su, vault_password).await
+}
+
+async fn password_for_method_async(
+    profile: &HostProfile,
+    username: &str,
+    method: PasswordMethod,
+    vault_password: Option<&Zeroizing<String>>,
+) -> Result<Zeroizing<String>, RemoteFailure> {
+    for candidate in candidates(profile, username, method)? {
+        let password = match candidate {
+            Candidate::Login if profile.is_vault_host() => match vault_password {
+                Some(password) => Some(password.clone()),
+                // Vault refusals keep their own codes: the user acts in the
+                // credential manager, not in this host's Advanced settings.
+                None => Some(crate::bitwarden::resolve_login_password(profile, None).await?),
+            },
+            candidate => credentials::load(profile.id, candidate.kind(profile))
+                .map_err(|_| method.failure("read", username))?,
+        };
+        if let Some(password) = usable(password, method, username)? {
+            return Ok(password);
+        }
+    }
+    Err(method.failure("missing", username))
 }
 
 #[derive(Clone, Copy)]
@@ -189,12 +235,83 @@ pub fn login_password_available(profile: &HostProfile) -> bool {
     profile.protocol == Protocol::Ssh
         && profile.ssh_auth == SshAuth::Password
         && PasswordMethod::Sudo.allowed(profile)
-        && credentials::load(profile.id, credentials::login_password_kind(profile))
-            .ok()
-            .flatten()
-            .is_some_and(|password| !password.is_empty() && validate_password(&password).is_ok())
+        && (
+            // Presence only: listing hosts never reads the vault.
+            profile.is_vault_host()
+                || credentials::load(profile.id, credentials::login_password_kind(profile))
+                    .ok()
+                    .flatten()
+                    .is_some_and(|password| {
+                        !password.is_empty() && validate_password(&password).is_ok()
+                    })
+        )
 }
 
+/// Where a password for `username` may come from, in the order it is tried.
+#[derive(Clone, Copy)]
+enum Candidate {
+    /// A user password the user saved in Advanced settings.
+    Record(Uuid),
+    /// The caller's own SSH login password.
+    Login,
+}
+
+impl Candidate {
+    fn kind(self, profile: &HostProfile) -> CredentialKind {
+        match self {
+            Self::Record(id) => CredentialKind::SudoPassword(id),
+            Self::Login => credentials::login_password_kind(profile),
+        }
+    }
+}
+
+/// Checks the requested purpose before any password is read. A saved user
+/// password comes first. Ordinary sudo authenticates the caller, even when
+/// executing as root or another user, so only that caller's
+/// password-authenticated SSH secret may be reused: never a key passphrase
+/// or another account's login password. Passwordless paths never get here.
+fn candidates(
+    profile: &HostProfile,
+    username: &str,
+    method: PasswordMethod,
+) -> Result<Vec<Candidate>, RemoteFailure> {
+    if !method.allowed(profile) {
+        return Err(method.failure("disabled", username));
+    }
+    let mut candidates = Vec::with_capacity(2);
+    if let Some(credential) = profile.advanced.sudo.as_ref().and_then(|settings| {
+        settings
+            .credentials
+            .iter()
+            .find(|credential| credential.username.trim() == username)
+    }) {
+        candidates.push(Candidate::Record(credential.id));
+    }
+    if profile.protocol == Protocol::Ssh
+        && profile.ssh_auth == SshAuth::Password
+        && username == profile.username.trim()
+    {
+        candidates.push(Candidate::Login);
+    }
+    Ok(candidates)
+}
+
+/// An empty slot counts as absent; a present password must be typeable.
+fn usable(
+    password: Option<Zeroizing<String>>,
+    method: PasswordMethod,
+    username: &str,
+) -> Result<Option<Zeroizing<String>>, RemoteFailure> {
+    match password.filter(|password| !password.is_empty()) {
+        Some(password) => {
+            validate_password(&password).map_err(|_| method.failure("invalid", username))?;
+            Ok(Some(password))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(test)]
 fn password_for_with<E>(
     profile: &HostProfile,
     username: &str,
@@ -203,42 +320,17 @@ fn password_for_with<E>(
     password_for_method_with(profile, username, PasswordMethod::Sudo, load)
 }
 
+#[cfg(test)]
 fn password_for_method_with<E>(
     profile: &HostProfile,
     username: &str,
     method: PasswordMethod,
     mut load: impl FnMut(CredentialKind) -> Result<Option<Zeroizing<String>>, E>,
 ) -> Result<Zeroizing<String>, RemoteFailure> {
-    // Check the requested purpose before reading either a shared user password
-    // or the SSH login password. Passwordless paths never call this function.
-    if !method.allowed(profile) {
-        return Err(method.failure("disabled", username));
-    }
-    let credential = profile.advanced.sudo.as_ref().and_then(|settings| {
-        settings
-            .credentials
-            .iter()
-            .find(|credential| credential.username.trim() == username)
-    });
-    if let Some(credential) = credential {
-        let password = load(CredentialKind::SudoPassword(credential.id))
-            .map_err(|_| method.failure("read", username))?;
-        if let Some(password) = password.filter(|password| !password.is_empty()) {
-            validate_password(&password).map_err(|_| method.failure("invalid", username))?;
-            return Ok(password);
-        }
-    }
-    // Ordinary sudo authenticates the caller, even when executing as root or
-    // another user. Reuse only that caller's password-authenticated SSH secret;
-    // never substitute a key passphrase or another account's login password.
-    if profile.protocol == Protocol::Ssh
-        && profile.ssh_auth == SshAuth::Password
-        && username == profile.username.trim()
-    {
-        let password = load(credentials::login_password_kind(profile))
-            .map_err(|_| method.failure("read", username))?;
-        if let Some(password) = password.filter(|password| !password.is_empty()) {
-            validate_password(&password).map_err(|_| method.failure("invalid", username))?;
+    for candidate in candidates(profile, username, method)? {
+        let password =
+            load(candidate.kind(profile)).map_err(|_| method.failure("read", username))?;
+        if let Some(password) = usable(password, method, username)? {
             return Ok(password);
         }
     }
@@ -491,6 +583,73 @@ mod tests {
                 .unwrap_err()
                 .code,
             "SUDO_CREDENTIAL_READ_FAILED"
+        );
+    }
+
+    #[test]
+    fn a_vault_backed_login_counts_as_available_without_reading_the_vault() {
+        let mut host = HostProfile {
+            username: "alice".into(),
+            ..Default::default()
+        };
+        host.advanced.sudo = Some(crate::model::SudoSettings {
+            enabled: true,
+            ..Default::default()
+        });
+        assert!(
+            !login_password_available(&host),
+            "nothing is saved for a fresh host"
+        );
+        host.vault = Some(crate::model::VaultHostRef {
+            item_id: Uuid::new_v4(),
+            item_name: "alice@host".into(),
+            revision_date: String::new(),
+        });
+        assert!(login_password_available(&host));
+        host.ssh_auth = SshAuth::PrivateKey;
+        assert!(
+            !login_password_available(&host),
+            "a key login has no password to reuse, bound or not"
+        );
+    }
+
+    #[test]
+    fn a_vault_host_answers_sudo_and_su_with_the_password_its_admission_read() {
+        let mut host = HostProfile {
+            username: "alice".into(),
+            ..Default::default()
+        };
+        host.advanced.sudo = Some(crate::model::SudoSettings {
+            enabled: true,
+            ..Default::default()
+        });
+        host.advanced.su = Some(crate::model::SuSettings { enabled: true });
+        host.vault = Some(crate::model::VaultHostRef {
+            item_id: Uuid::new_v4(),
+            item_name: "alice@host".into(),
+            revision_date: String::new(),
+        });
+        let admitted = Zeroizing::new("from-the-item".to_owned());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Reading the vault again would need a configured account (and,
+        // under "every call", a second master password); none is set up here.
+        let sudo = runtime
+            .block_on(password_for_async(&host, "alice", Some(&admitted)))
+            .unwrap();
+        let su = runtime
+            .block_on(su_password_for_async(&host, "alice", Some(&admitted)))
+            .unwrap();
+        assert_eq!(sudo.as_str(), "from-the-item");
+        assert_eq!(su.as_str(), "from-the-item");
+        let other = runtime
+            .block_on(password_for_async(&host, "bob", Some(&admitted)))
+            .unwrap_err();
+        assert_eq!(
+            other.code, "SUDO_CREDENTIAL_MISSING",
+            "another account never gets the login password"
         );
     }
 

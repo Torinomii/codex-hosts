@@ -103,6 +103,8 @@ pub fn launch(
     })
 }
 
+/// Credential Manager only; the runtime path is [`password_for_async`].
+#[cfg(test)]
 pub fn password_for(
     profile: &HostProfile,
     target: &str,
@@ -110,6 +112,16 @@ pub fn password_for(
     // The shared password store is indexed by username. The SSH password can
     // only be reused when it belongs to this very target, never for another user.
     crate::sudo::su_password_for(profile, target)
+}
+
+/// The shared password store is indexed by username. The SSH password can
+/// only be reused when it belongs to this very target, never for another user.
+pub async fn password_for_async(
+    profile: &HostProfile,
+    target: &str,
+    vault_password: Option<&Zeroizing<String>>,
+) -> Result<Zeroizing<String>, RemoteFailure> {
+    crate::sudo::su_password_for_async(profile, target, vault_password).await
 }
 
 pub struct AuthProtocol {

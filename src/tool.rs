@@ -11,11 +11,13 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
+use crate::bitwarden;
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
 use crate::model::{
-    AuthPersistence, HostFilter, HostProfile, Protocol, RemoteEnv, SshAuth, normalize_tags,
+    AuthPersistence, CredentialSource, HostFilter, HostProfile, Protocol, RemoteEnv, SshAuth,
+    normalize_tags,
 };
 use crate::ssh::{self, AgentKeyInfo, OperationLimits, RemoteFailure, VerifiedHostKey};
 use crate::storage::HostStore;
@@ -124,6 +126,10 @@ pub(crate) struct HostSummary {
     pub(crate) protocol: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh_auth: Option<&'static str>,
+    /// Where the login password lives (`credential_manager` or `bitwarden`);
+    /// absent for key and agent logins.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) credential_source: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) agent_key_fingerprint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -415,22 +421,22 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             },
         }));
     }
-    let store = HostStore::load()
-        .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
-
     match request {
         ToolRequest::Capabilities
         | ToolRequest::TemporarySecretsOpen { .. }
         | ToolRequest::TemporarySecrets { .. } => unreachable!(),
         ToolRequest::AgentIdentities => unreachable!(),
         ToolRequest::FidoIdentities => unreachable!(),
-        ToolRequest::ListHosts { tags } => list_hosts(&store, tags).map(ToolResponse::List),
+        ToolRequest::ListHosts { tags } => {
+            let store = ssh::runtime().block_on(load_store_for_listing())?;
+            list_hosts(&store, tags).map(ToolResponse::List)
+        }
         ToolRequest::Probe {
             alias,
             connect_timeout_ms,
             command_timeout_ms,
         } => {
-            let host = find_host(&store, &alias)?.clone();
+            let (store, host) = ssh::runtime().block_on(load_host(&alias))?;
             validate_profile(&host)?;
             crate::approval::authorize_sync(crate::approval::Review::new(
                 std::slice::from_ref(&host),
@@ -454,18 +460,18 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             connect_timeout_ms,
             command_timeout_ms,
         } => {
-            let host = find_host(&store, &alias)?;
-            validate_profile(host)?;
+            let (store, host) = ssh::runtime().block_on(load_host(&alias))?;
+            validate_profile(&host)?;
             ssh::validate_stdin(stdin.as_deref())?;
             crate::approval::authorize_sync(crate::approval::Review::new(
-                std::slice::from_ref(host),
+                std::slice::from_ref(&host),
                 &store.hosts,
                 vec![command.clone()],
                 stdin.as_deref(),
                 None,
             )?)?;
             Ok(ToolResponse::Remote(connection::execute_with_input(
-                host,
+                &host,
                 &store.hosts,
                 &command,
                 stdin.as_deref(),
@@ -484,10 +490,10 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             command_timeout_ms,
         } => {
             validate_commands(&commands)?;
-            let host = find_host(&store, &alias)?;
-            validate_profile(host)?;
+            let (store, host) = ssh::runtime().block_on(load_host(&alias))?;
+            validate_profile(&host)?;
             crate::approval::authorize_sync(crate::approval::Review::new(
-                std::slice::from_ref(host),
+                std::slice::from_ref(&host),
                 &store.hosts,
                 commands.clone(),
                 None,
@@ -499,7 +505,7 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             let mut operation_limits = limits(connect_timeout_ms, command_timeout_ms, None);
             operation_limits.output_bytes = Some(MAX_BATCH_OUTPUT_BYTES);
             let mut result = connection::execute_many(
-                host,
+                &host,
                 &store.hosts,
                 &commands,
                 concurrency,
@@ -516,16 +522,20 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             batch_timeout_ms,
             continue_on_error,
         } => ssh::runtime()
-            .block_on(execute_batch(
-                &store.hosts,
-                aliases,
-                BatchAction::Probe,
-                max_concurrency,
-                Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
-                batch_timeout_ms,
-                continue_on_error,
-                false,
-            ))
+            .block_on(async {
+                let store = load_store_for_aliases(&aliases).await?;
+                execute_batch(
+                    &store.hosts,
+                    aliases,
+                    BatchAction::Probe,
+                    max_concurrency,
+                    Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
+                    batch_timeout_ms,
+                    continue_on_error,
+                    false,
+                )
+                .await
+            })
             .map(ToolResponse::Batch),
         ToolRequest::BatchExec {
             aliases,
@@ -537,16 +547,20 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
             batch_timeout_ms,
             continue_on_error,
         } => ssh::runtime()
-            .block_on(execute_batch(
-                &store.hosts,
-                aliases,
-                BatchAction::Exec(command),
-                max_concurrency,
-                Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
-                batch_timeout_ms,
-                continue_on_error,
-                false,
-            ))
+            .block_on(async {
+                let store = load_store_for_aliases(&aliases).await?;
+                execute_batch(
+                    &store.hosts,
+                    aliases,
+                    BatchAction::Exec(command),
+                    max_concurrency,
+                    Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
+                    batch_timeout_ms,
+                    continue_on_error,
+                    false,
+                )
+                .await
+            })
             .map(ToolResponse::Batch),
     }
 }
@@ -554,9 +568,8 @@ fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
 fn execute_sudo_request(
     params: &crate::sudo::Request,
 ) -> Result<crate::ssh::RemoteResult, RemoteFailure> {
-    let store = HostStore::load()
-        .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
-    let host = find_host(&store, &params.alias)?;
+    let (store, host) = ssh::runtime().block_on(load_host(&params.alias))?;
+    let host = &host;
     validate_profile(host)?;
     let target = crate::sudo::validate(host, &params.program, &params.args, Some(&params.user))?;
     crate::approval::authorize_sync(crate::approval::Review::new(
@@ -583,9 +596,8 @@ fn execute_sudo_request(
 fn execute_su_request(
     params: &crate::su::Request,
 ) -> Result<crate::ssh::RemoteResult, RemoteFailure> {
-    let store = HostStore::load()
-        .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
-    let host = find_host(&store, &params.alias)?;
+    let (store, host) = ssh::runtime().block_on(load_host(&params.alias))?;
+    let host = &host;
     validate_profile(host)?;
     let target = crate::su::validate(host, &params.program, &params.args, Some(&params.user))?;
     crate::approval::authorize_sync(crate::approval::Review::new(
@@ -630,15 +642,17 @@ pub(crate) fn list_hosts(
         tags: normalize_tags(tags),
     };
     let mut hosts = Vec::with_capacity(store.hosts.len());
-    for host in store
-        .hosts
-        .iter()
-        .filter(|host| !host.advanced.codex_hidden && filter.matches(host))
-    {
+    for host in store.hosts.iter().filter(|host| {
+        !host.advanced.codex_hidden
+            && filter.matches(host)
+            && (store.bitwarden.enabled || !host.is_vault_host())
+    }) {
         // A Credential Manager read that fails for one host should not hide
-        // the whole list; that host simply reports no usable secret.
+        // the whole list; that host simply reports no usable secret. A
+        // vault-backed host counts by reference: the vault is never read here.
         let has_required_secret = match (host.protocol, host.ssh_auth) {
             (Protocol::Ssh, SshAuth::PrivateKey | SshAuth::SshAgent) => true,
+            _ if host.is_vault_host() => true,
             _ => credentials::has(host.id, credentials::login_password_kind(host)).unwrap_or(false),
         };
         hosts.push(HostSummary {
@@ -650,6 +664,7 @@ pub(crate) fn list_hosts(
             username: host.username.clone(),
             protocol: host.protocol.stable_name(),
             ssh_auth: (host.protocol == Protocol::Ssh).then(|| host.ssh_auth.stable_name()),
+            credential_source: host.credential_source().map(CredentialSource::stable_name),
             agent_key_fingerprint: (host.protocol == Protocol::Ssh
                 && host.ssh_auth == SshAuth::SshAgent
                 && !host.agent_key_fingerprint.trim().is_empty())
@@ -1086,10 +1101,7 @@ pub(crate) fn merge_verified_host_keys(
     // Concurrent calls in the MCP server each load, modify and save the store;
     // without this the store's revision check fails one of them after its
     // remote authentication already succeeded.
-    static STORE_MERGE: Mutex<()> = Mutex::new(());
-    let _merge = STORE_MERGE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _merge = crate::storage::write_lock();
     let mut fresh = HostStore::load()
         .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
     let mut changed = false;
@@ -1153,7 +1165,67 @@ pub(crate) fn find_host<'a>(
     store: &'a HostStore,
     alias: &str,
 ) -> Result<&'a HostProfile, RemoteFailure> {
-    find_host_in(&store.hosts, alias)
+    let host = find_host_in(&store.hosts, alias)?;
+    if host.is_vault_host() && !store.bitwarden.enabled {
+        return Err(RemoteFailure::new(
+            "BITWARDEN_DISABLED",
+            format!(
+                "The host {alias} is defined in Bitwarden, which is switched off in codex-hosts."
+            ),
+        ));
+    }
+    Ok(host)
+}
+
+/// Loads the store and resolves `alias`, mirroring the Bitwarden folder
+/// first when the alias is unknown (a host created in the vault moments ago)
+/// — that read may ask for the master password, as the connection would.
+pub(crate) async fn load_host(alias: &str) -> Result<(HostStore, HostProfile), RemoteFailure> {
+    let store = load_store()?;
+    let found = find_host(&store, alias).cloned();
+    match found {
+        Ok(host) => Ok((store, host)),
+        Err(error) if error.code == "ALIAS_NOT_FOUND" && store.bitwarden.available() => {
+            if !bitwarden::discover().await? {
+                return Err(error);
+            }
+            let store = load_store()?;
+            let host = find_host(&store, alias)?.clone();
+            Ok((store, host))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Loads the store for a batch, mirroring the Bitwarden folder first when
+/// any alias is unknown.
+pub(crate) async fn load_store_for_aliases(aliases: &[String]) -> Result<HostStore, RemoteFailure> {
+    let store = load_store()?;
+    let unknown = aliases
+        .iter()
+        .any(|alias| crate::model::find_alias(&store.hosts, alias).is_none());
+    if unknown && store.bitwarden.available() && bitwarden::discover().await? {
+        return load_store();
+    }
+    Ok(store)
+}
+
+/// Loads the store for a listing, mirroring the Bitwarden folder first when
+/// that costs nothing (a stored key that is not spent by being read).
+pub(crate) async fn load_store_for_listing() -> Result<HostStore, RemoteFailure> {
+    let store = load_store()?;
+    if !store.bitwarden.available() {
+        return Ok(store);
+    }
+    match bitwarden::refresh_quietly().await {
+        Ok(Some(_)) => load_store(),
+        // A locked vault or a failed sync leaves the listing on the mirrors.
+        Ok(None) | Err(_) => Ok(store),
+    }
+}
+
+fn load_store() -> Result<HostStore, RemoteFailure> {
+    HostStore::load().map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))
 }
 
 pub(crate) fn find_host_in<'a>(

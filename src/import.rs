@@ -118,6 +118,7 @@ pub fn parse_template(
             port,
             username: item.username.trim().to_owned(),
             login_password_id: Some(Uuid::new_v4()),
+            vault: None,
             protocol: item.protocol,
             ssh_auth: item.ssh_auth,
             private_key_path: item.private_key_path.trim().to_owned(),

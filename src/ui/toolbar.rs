@@ -1,38 +1,34 @@
 use eframe::egui::{self, RichText};
 
+use super::bitwarden::VaultState;
 use super::{HostsApp, retain_visible_selection, theme};
 use crate::i18n::Catalog;
 
 impl HostsApp {
+    /// The window-wide bar: credential services, temporary secrets, the
+    /// vault's state, and the language. Actions on the host list itself sit
+    /// beside the list ([`HostsApp::host_actions_menu`]).
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
-        retain_visible_selection(
-            &self.store.hosts,
-            &self.host_filter,
-            &mut self.batch_selected,
-        );
-        let mut open_import = false;
-        let mut test_all = false;
-        let mut begin_batch = false;
+        let mut open_credentials = false;
+        let mut open_bitwarden = false;
         ui.horizontal(|ui| {
             ui.add_space(8.0);
-            if !self.launch.codex_edit {
-                ui.add_enabled_ui(!self.batch_mode, |ui| {
-                    if ui.button(self.catalog.text("import_hosts")).clicked() {
-                        open_import = true;
-                    }
-                    if ui
-                        .add_enabled(
-                            self.tests_idle(),
-                            egui::Button::new(self.catalog.text("test_all")),
-                        )
-                        .clicked()
-                    {
-                        test_all = true;
-                    }
-                    if ui.button(self.catalog.text("batch_manage")).clicked() {
-                        begin_batch = true;
-                    }
-                });
+            if !self.launch.codex_edit
+                && ui
+                    .add_enabled(
+                        self.credential_manager.is_none(),
+                        egui::Button::new(self.catalog.text("credential_manager")),
+                    )
+                    .on_hover_text(self.catalog.text("credential_manager_hint"))
+                    .clicked()
+            {
+                open_credentials = true;
+            }
+            if self.temporary.is_some()
+                && ui.button(self.catalog.text("temp_title")).clicked()
+                && let Some(temporary) = &mut self.temporary
+            {
+                temporary.visible = true;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(8.0);
@@ -45,13 +41,80 @@ impl HostsApp {
                     self.exiting = true;
                     context.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if self.temporary.is_some()
-                    && ui.button(self.catalog.text("temp_title")).clicked()
-                    && let Some(temporary) = &mut self.temporary
-                {
-                    temporary.visible = true;
+                if !self.launch.codex_edit && self.vault_chip(ui) {
+                    open_bitwarden = true;
                 }
             });
+        });
+        if open_credentials {
+            self.open_credential_manager();
+        } else if open_bitwarden {
+            self.open_bitwarden_page();
+        }
+    }
+
+    /// "Bitwarden · unlocked/locked/off" once an account is set up; a click
+    /// opens the Bitwarden page of the credential services.
+    fn vault_chip(&self, ui: &mut egui::Ui) -> bool {
+        let settings = &self.store.bitwarden;
+        if settings.profile.is_none() || settings.cli_path.is_none() {
+            return false;
+        }
+        let (key, color) = match (settings.enabled, self.vault_state) {
+            (false, _) => ("service_status_disabled", ui.visuals().weak_text_color()),
+            (true, Some(VaultState::Unlocked)) => {
+                ("bw_status_unlocked", theme::success_color(ui.visuals()))
+            }
+            (true, Some(VaultState::Locked)) => ("bw_status_locked", ui.visuals().warn_fg_color),
+            (true, Some(VaultState::SignedOut)) => {
+                ("bw_status_signed_out", ui.visuals().warn_fg_color)
+            }
+            (true, None) => ("bw_status_unknown", ui.visuals().weak_text_color()),
+        };
+        let text = RichText::new(format!("●  Bitwarden · {}", self.catalog.text(key))).color(color);
+        ui.add_enabled(
+            self.credential_manager.is_none(),
+            egui::Button::new(text).frame(false),
+        )
+        .on_hover_text(self.catalog.text("vault_chip_hint"))
+        .clicked()
+    }
+
+    /// The host list's own actions (import, test all, batch), in one menu
+    /// beside the list title.
+    pub(super) fn host_actions_menu(&mut self, ui: &mut egui::Ui) {
+        if self.launch.codex_edit {
+            return;
+        }
+        retain_visible_selection(
+            &self.store.hosts,
+            &self.host_filter,
+            &mut self.batch_selected,
+        );
+        let mut open_import = false;
+        let mut test_all = false;
+        let mut begin_batch = false;
+        let tests_idle = self.tests_idle();
+        ui.add_enabled_ui(!self.batch_mode, |ui| {
+            ui.menu_button("⋯", |ui| {
+                if ui.button(self.catalog.text("import_hosts")).clicked() {
+                    open_import = true;
+                    ui.close();
+                }
+                if ui
+                    .add_enabled(tests_idle, egui::Button::new(self.catalog.text("test_all")))
+                    .clicked()
+                {
+                    test_all = true;
+                    ui.close();
+                }
+                if ui.button(self.catalog.text("batch_manage")).clicked() {
+                    begin_batch = true;
+                    ui.close();
+                }
+            })
+            .response
+            .on_hover_text(self.catalog.text("host_actions_hint"));
         });
         if open_import {
             self.import_window_open = true;

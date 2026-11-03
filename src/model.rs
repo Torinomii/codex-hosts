@@ -241,6 +241,153 @@ impl AdvancedSettings {
     }
 }
 
+/// Where a host's password is kept, reported by `list_hosts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// Windows Credential Manager, the original store.
+    CredentialManager,
+    /// A Login item in the user's Bitwarden vault, read through `bw.exe`.
+    Bitwarden,
+}
+
+impl CredentialSource {
+    pub fn stable_name(self) -> &'static str {
+        match self {
+            Self::CredentialManager => "credential_manager",
+            Self::Bitwarden => "bitwarden",
+        }
+    }
+}
+
+/// The Bitwarden Login item a vault-backed host mirrors. The item is the
+/// source of truth for the alias (its name), the endpoint (its `ssh://` or
+/// `telnet://` URI), the username, the password, the description and the
+/// tags (`codex-hosts:` custom fields); the profile keeps only local state
+/// such as host-key trust, privilege settings, and approval switches.
+/// Nothing secret.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VaultHostRef {
+    /// Vault item id; also the profile id.
+    pub item_id: Uuid,
+    /// Item name at the last refresh (the alias).
+    pub item_name: String,
+    /// `revisionDate` at the last refresh; a changed item is a new pool key.
+    #[serde(default)]
+    pub revision_date: String,
+}
+
+/// How long an unlocked Bitwarden session may serve calls before the master
+/// password is asked for again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ReauthPolicy {
+    /// Every call asks; nothing is stored between calls.
+    PerCall,
+    /// Stored until unused for this many minutes.
+    Idle {
+        #[serde(default = "default_idle_minutes")]
+        minutes: u32,
+    },
+    /// Stored until the codex-hosts window exits.
+    UntilExit,
+    /// Stored until Bitwarden rejects it.
+    Permanent,
+}
+
+impl Default for ReauthPolicy {
+    fn default() -> Self {
+        Self::Idle {
+            minutes: DEFAULT_REAUTH_IDLE_MINUTES,
+        }
+    }
+}
+
+fn default_idle_minutes() -> u32 {
+    DEFAULT_REAUTH_IDLE_MINUTES
+}
+
+pub const DEFAULT_REAUTH_IDLE_MINUTES: u32 = 15;
+pub const MAX_REAUTH_IDLE_MINUTES: u32 = 24 * 60;
+/// Seconds a `bw sync` may be old before a vault host is used; 0 syncs before
+/// every use (subject to [`MIN_SYNC_SPACING_SECONDS`]).
+pub const DEFAULT_SYNC_MAX_AGE_SECONDS: u64 = 0;
+/// Calls that follow each other closely (a batch, a probe then an exec) share
+/// one sync even under "sync before every use".
+pub const MIN_SYNC_SPACING_SECONDS: u64 = 5;
+/// The choices the credential manager offers for the sync window, in seconds.
+pub const SYNC_MAX_AGE_CHOICES: [u64; 4] = [0, 60, 5 * 60, 30 * 60];
+/// Folder the wizard proposes for host credentials.
+pub const DEFAULT_BITWARDEN_FOLDER: &str = "codex-hosts";
+
+/// The one Bitwarden account codex-hosts uses. Non-secret; the login state
+/// lives in the CLI data directory and the session key in Credential Manager.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BitwardenProfile {
+    /// Stable id; also names the CLI data directory.
+    pub id: Uuid,
+    /// Account e-mail.
+    pub email: String,
+    /// `bw config server` target; `None` is the Bitwarden cloud (US).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_url: Option<String>,
+    /// Folder holding host Login items, by id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_id: Option<Uuid>,
+    /// Display name of that folder.
+    pub folder_name: String,
+    /// When the master password is asked for again.
+    pub policy: ReauthPolicy,
+}
+
+impl Default for BitwardenProfile {
+    fn default() -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            email: String::new(),
+            server_url: None,
+            folder_id: None,
+            folder_name: DEFAULT_BITWARDEN_FOLDER.to_owned(),
+            policy: ReauthPolicy::default(),
+        }
+    }
+}
+
+/// Credential-manager settings kept with the host store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BitwardenSettings {
+    /// Whether vault-backed hosts are shown and served at all.
+    pub enabled: bool,
+    /// Absolute path of the native `bw.exe` chosen by the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<std::path::PathBuf>,
+    /// The configured account, once the wizard finished.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<BitwardenProfile>,
+    /// How old the vault cache may be when a vault host is used, in seconds;
+    /// 0 syncs before every use.
+    pub sync_max_age_seconds: u64,
+}
+
+impl Default for BitwardenSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cli_path: None,
+            profile: None,
+            sync_max_age_seconds: DEFAULT_SYNC_MAX_AGE_SECONDS,
+        }
+    }
+}
+
+impl BitwardenSettings {
+    /// Whether vault-backed hosts can be served right now.
+    pub fn available(&self) -> bool {
+        self.enabled && self.profile.is_some() && self.cli_path.is_some()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HostProfile {
@@ -254,6 +401,9 @@ pub struct HostProfile {
     /// Immutable credential record for this login identity. None reads legacy profiles.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login_password_id: Option<Uuid>,
+    /// Set for a vault-backed host: the Bitwarden item that defines it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault: Option<VaultHostRef>,
     pub protocol: Protocol,
     pub ssh_auth: SshAuth,
     pub private_key_path: String,
@@ -279,6 +429,7 @@ impl Default for HostProfile {
             port: 22,
             username: String::new(),
             login_password_id: None,
+            vault: None,
             protocol: Protocol::Ssh,
             ssh_auth: SshAuth::Password,
             private_key_path: String::new(),
@@ -331,6 +482,36 @@ impl HostProfile {
             return Some(ValidationIssue::AuthPersistence);
         }
         self.advanced.validation_issue()
+    }
+
+    /// Whether logging in needs the login password at all.
+    pub fn uses_login_password(&self) -> bool {
+        match self.protocol {
+            Protocol::Ssh => self.ssh_auth == SshAuth::Password,
+            Protocol::Telnet => true,
+        }
+    }
+
+    /// The Bitwarden item this host mirrors, for a vault-backed host.
+    pub fn vault(&self) -> Option<&VaultHostRef> {
+        self.vault.as_ref()
+    }
+
+    /// Whether the host is defined by a Bitwarden item rather than this
+    /// profile and Credential Manager.
+    pub fn is_vault_host(&self) -> bool {
+        self.vault.is_some()
+    }
+
+    /// Where the login password comes from, when one is used at all.
+    pub fn credential_source(&self) -> Option<CredentialSource> {
+        self.uses_login_password().then(|| {
+            if self.is_vault_host() {
+                CredentialSource::Bitwarden
+            } else {
+                CredentialSource::CredentialManager
+            }
+        })
     }
 
     /// Telnet has no session layer yet, so its profiles always authenticate per call.

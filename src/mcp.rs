@@ -353,7 +353,8 @@ impl Server {
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_hosts(&self, Parameters(params): Parameters<ListHostsParams>) -> CallToolResult {
-        finish(load_store().and_then(|store| tool::list_hosts(&store, params.tags)))
+        let store = tool::load_store_for_listing().await;
+        finish(store.and_then(|store| tool::list_hosts(&store, params.tags)))
     }
 
     #[tool(
@@ -599,7 +600,7 @@ impl Server {
         finish(
             cancellable(ct, async move {
                 let _guard = self.gates.batch().await;
-                let hosts = load_store()?.hosts;
+                let hosts = tool::load_store_for_aliases(&params.aliases).await?.hosts;
                 tool::execute_batch(
                     &hosts,
                     params.aliases,
@@ -636,7 +637,7 @@ impl Server {
         finish(
             cancellable(ct, async move {
                 let _guard = self.gates.batch().await;
-                let hosts = load_store()?.hosts;
+                let hosts = tool::load_store_for_aliases(&params.aliases).await?.hosts;
                 tool::execute_batch(
                     &hosts,
                     params.aliases,
@@ -673,8 +674,7 @@ async fn probe_host(
     gates: &CallGates,
     params: ProbeParams,
 ) -> Result<ssh::RemoteResult, RemoteFailure> {
-    let store = load_store()?;
-    let host = tool::find_host(&store, &params.alias)?.clone();
+    let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     crate::approval::authorize(crate::approval::Review::new(
         std::slice::from_ref(&host),
@@ -700,8 +700,7 @@ async fn exec_host(
     params: ExecParams,
     stdin: Option<String>,
 ) -> Result<ssh::RemoteResult, RemoteFailure> {
-    let store = load_store()?;
-    let host = tool::find_host(&store, &params.alias)?.clone();
+    let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     ssh::validate_stdin(stdin.as_deref())?;
     crate::approval::authorize(crate::approval::Review::new(
@@ -728,8 +727,7 @@ async fn exec_many_host(
     params: ExecManyParams,
 ) -> Result<ssh::RemoteManyResult, RemoteFailure> {
     tool::validate_commands(&params.commands)?;
-    let store = load_store()?;
-    let host = tool::find_host(&store, &params.alias)?.clone();
+    let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     crate::approval::authorize(crate::approval::Review::new(
         std::slice::from_ref(&host),
@@ -760,8 +758,7 @@ async fn exec_sudo_host(
     gates: &CallGates,
     params: crate::sudo::Request,
 ) -> Result<ssh::RemoteResult, RemoteFailure> {
-    let store = load_store()?;
-    let host = tool::find_host(&store, &params.alias)?.clone();
+    let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     let target = crate::sudo::validate(&host, &params.program, &params.args, Some(&params.user))?;
     crate::approval::authorize(crate::approval::Review::new(
@@ -792,8 +789,7 @@ async fn exec_su_host(
     gates: &CallGates,
     params: crate::su::Request,
 ) -> Result<ssh::RemoteResult, RemoteFailure> {
-    let store = load_store()?;
-    let host = tool::find_host(&store, &params.alias)?.clone();
+    let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     let target = crate::su::validate(&host, &params.program, &params.args, Some(&params.user))?;
     crate::approval::authorize(crate::approval::Review::new(
@@ -962,7 +958,19 @@ covering all listed commands and hosts from call launch to completion; authoriza
 over to another call, even on a kept connection. Temporary secret fields require approval by default, \
 unless the user has disabled it for every referenced field in the app. When a call fails with \
 CREDENTIAL_MISSING, HOSTKEY_UNKNOWN, HOSTKEY_MISMATCH, or PROFILE_INVALID, call open_host_editor \
-for that alias instead of asking for details in chat. exec_sudo accepts an absolute program and argv, \
+for that alias instead of asking for details in chat. A host whose list entry reports \
+credential_source bitwarden is defined by a Login item in one folder of the user's Bitwarden vault \
+(name = alias, ssh:// or telnet:// URI = endpoint, username and password = login); codex-hosts re-reads \
+the item through the official bw CLI before every use, so changes made in the vault apply at once, \
+and a host created in that folder is found on the next call even if list_hosts did not show it yet. \
+While the vault is locked, list_hosts keeps those hosts as last seen and a call to one waits while \
+the codex-hosts window asks the user for the master password (inside the call approval when one is \
+due); BITWARDEN_LOCKED means that prompt was cancelled or expired. BITWARDEN_SIGNED_OUT and \
+BITWARDEN_DISABLED mean the user must log in or enable Bitwarden in the window (switched off, those \
+hosts are not listed). Never ask for the master password in chat or run bw yourself. \
+BITWARDEN_ITEM_MISSING or BITWARDEN_ITEM_MISMATCH means the item was removed or no longer describes a \
+host, which the user fixes in Bitwarden or through open_host_editor. \
+exec_sudo accepts an absolute program and argv, \
 requires an explicit user on every call (choose root explicitly), and normally reuses the saved login password of the current SSH user when that user \
 is requested for sudo authentication. Each Advanced switch authorizes saved-password supply for its own purpose; false never rules out passwordless execution. Optional saved account passwords override it. An empty sudo_credentials \
 list does not mean sudo is unavailable; sudo_login_password_available reports login-password availability. \

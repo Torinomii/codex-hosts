@@ -1,14 +1,26 @@
 [package]
 name = "codex-hosts"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0"
 description = "A small, auditable GUI for stable Codex-managed SSH and Telnet hosts on Windows."
 readme = "README.md"
 build = "build.rs"
+default-run = "codex-hosts"
+
+# The Bitwarden CLI adapter is a library target of its own, kept free of the
+# app's modules; it is compiled into the single release exe.
+[lib]
+name = "codex_hosts_bw"
+path = "src/bw/lib.rs"
+
+[[bin]]
+name = "codex-hosts"
+path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 csv = "1"
 eframe = { version = "0.35.0", default-features = false, features = ["wgpu"] }
 raw-window-handle = "0.6"
@@ -35,6 +47,9 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shel
 [build-dependencies]
 serde_json = "1"
 winresource = "0.1.31"
+
+[dev-dependencies]
+static_assertions = "1"
 
 [profile.release]
 lto = "fat"

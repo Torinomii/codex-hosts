@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::i18n::Catalog;
 use crate::model::{HostProfile, Protocol, resolve_ssh_chain};
@@ -34,6 +35,12 @@ pub struct Review {
     commands: Vec<String>,
     stdin: Option<String>,
     sudo_user: Option<String>,
+    /// The same dialog asks for the Bitwarden master password: a vault host
+    /// is in the call and reading it would otherwise prompt right after.
+    #[serde(default)]
+    unlock_vault: bool,
+    #[serde(skip)]
+    uses_vault: bool,
 }
 
 impl Review {
@@ -47,6 +54,7 @@ impl Review {
         let target_ids: HashSet<_> = targets.iter().map(|host| host.id).collect();
         let mut seen: HashMap<Uuid, usize> = HashMap::new();
         let mut hosts: Vec<ReviewHost> = Vec::new();
+        let mut uses_vault = false;
         for target in targets {
             let chain = if target.protocol == Protocol::Ssh {
                 resolve_ssh_chain(target, all).map_err(|_| {
@@ -56,6 +64,7 @@ impl Review {
                 vec![target]
             };
             for host in chain {
+                uses_vault |= host.is_vault_host();
                 let is_jump = host.id != target.id;
                 if let Some(&index) = seen.get(&host.id) {
                     hosts[index].is_jump |= is_jump;
@@ -80,6 +89,8 @@ impl Review {
             commands,
             stdin: stdin.map(str::to_owned),
             sudo_user,
+            unlock_vault: false,
+            uses_vault,
         })
     }
 
@@ -117,10 +128,13 @@ impl Review {
 
 /// Each tool handler calls this once before credentials, connections or workers.
 /// Nothing is cached across calls, including calls that reuse an SSH session.
-pub(crate) async fn authorize(review: Review) -> Result<(), RemoteFailure> {
+/// When the call's vault hosts would ask for the master password next, the
+/// approval asks for it too, so the user answers one dialog.
+pub(crate) async fn authorize(mut review: Review) -> Result<(), RemoteFailure> {
     if !review.required() {
         return Ok(());
     }
+    review.unlock_vault = review.uses_vault && crate::bitwarden::unlock_due();
     let response = tokio::task::spawn_blocking(|| {
         temporary_secrets::request_gui(Request::Show { temporary: false })
     })
@@ -220,6 +234,63 @@ pub(crate) struct Queue {
     detail: Option<Detail>,
     feedback: crate::approval_ui::Feedback,
     expired_notices: usize,
+    /// The master password typed into a dialog whose calls read the vault.
+    master_password: Zeroizing<String>,
+    unlock: Unlock,
+    unlock_error: Option<String>,
+}
+
+/// An allowed decision that waits for the window to unlock the vault: the
+/// calls stay pending until it succeeds, and stay open for another try when
+/// it fails.
+#[derive(Default)]
+enum Unlock {
+    #[default]
+    Idle,
+    Requested(Vec<Uuid>, Zeroizing<String>),
+    Running(Vec<Uuid>),
+}
+
+impl Unlock {
+    fn busy(&self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+}
+
+/// The master-password row of a dialog whose calls read the vault; true
+/// when Enter submits it.
+fn unlock_row(
+    ui: &mut egui::Ui,
+    catalog: &Catalog,
+    password: &mut Zeroizing<String>,
+    error: Option<&str>,
+    busy: bool,
+) -> bool {
+    ui.add(egui::Label::new(catalog.text("approval_unlock_text")).wrap());
+    if let Some(error) = error {
+        ui.colored_label(ui.visuals().warn_fg_color, error);
+    }
+    ui.horizontal(|ui| {
+        ui.label(catalog.text("master_password"));
+        // Shared by the batch and the detail view, which show together.
+        let key = egui::Id::new("approval_master_password");
+        let revealed = crate::ui::theme::password_revealed(ui, key);
+        let response = ui.add_enabled(
+            !busy,
+            egui::TextEdit::singleline(&mut **password)
+                .password(!revealed)
+                .desired_width(240.0),
+        );
+        crate::ui::forget_password_history(ui, &response);
+        crate::ui::theme::reveal_button(ui, catalog, key);
+        if busy {
+            ui.spinner();
+        }
+        response.lost_focus()
+            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            && !password.is_empty()
+    })
+    .inner
 }
 
 struct Batch {
@@ -335,6 +406,61 @@ impl Queue {
         }
     }
 
+    fn needs_unlock(&self, ids: &[Uuid]) -> bool {
+        self.calls.iter().any(|call| {
+            ids.contains(&call.id)
+                && call.status == "pending"
+                && call
+                    .review
+                    .as_ref()
+                    .is_some_and(|review| review.unlock_vault)
+        })
+    }
+
+    /// Allows `ids`, through the vault unlock first when one of them reads
+    /// the vault.
+    fn allow(&mut self, ids: &[Uuid], catalog: &Catalog) {
+        if !self.needs_unlock(ids) {
+            self.decide(ids, true, catalog);
+        } else if !self.unlock.busy() && !self.master_password.is_empty() {
+            self.unlock_error = None;
+            self.unlock =
+                Unlock::Requested(ids.to_vec(), std::mem::take(&mut self.master_password));
+        }
+    }
+
+    /// The master password of an allowed decision, for the window to unlock
+    /// the vault with; handed over once.
+    pub(crate) fn take_unlock(&mut self) -> Option<Zeroizing<String>> {
+        match std::mem::take(&mut self.unlock) {
+            Unlock::Requested(ids, password) => {
+                self.unlock = Unlock::Running(ids);
+                Some(password)
+            }
+            other => {
+                self.unlock = other;
+                None
+            }
+        }
+    }
+
+    /// The window's unlock result: the calls are allowed once the vault is
+    /// open (the key is stored for them by then); otherwise they stay
+    /// pending with the reason shown.
+    pub(crate) fn finish_unlock(&mut self, result: Result<(), String>, catalog: &Catalog) {
+        let Unlock::Running(ids) = std::mem::take(&mut self.unlock) else {
+            return;
+        };
+        if result.is_ok() && self.detail.is_some_and(|detail| ids.contains(&detail.id)) {
+            self.detail = None;
+        }
+        match result {
+            Ok(()) if ids.iter().any(|id| self.active(*id)) => self.decide(&ids, true, catalog),
+            Ok(()) => {}
+            Err(error) => self.unlock_error = Some(error),
+        }
+    }
+
     fn decide(&mut self, ids: &[Uuid], allow: bool, catalog: &Catalog) {
         self.expire();
         let mut decided = 0;
@@ -389,6 +515,8 @@ impl Queue {
         if !self.pending() {
             self.batch = None;
             self.detail = None;
+            self.master_password = Zeroizing::default();
+            self.unlock_error = None;
             self.feedback.show(context, "ssh_approval_feedback");
             return;
         }
@@ -404,6 +532,12 @@ impl Queue {
             .filter(|call| ids.contains(&call.id) && call.status == "pending")
             .collect();
         let active_ids: Vec<_> = active.iter().map(|call| call.id).collect();
+        let unlock = active.iter().any(|call| {
+            call.review
+                .as_ref()
+                .is_some_and(|review| review.unlock_vault)
+        });
+        let busy = self.unlock.busy();
         let next = self
             .calls
             .iter()
@@ -437,19 +571,37 @@ impl Queue {
                     .wrap(),
                 );
                 if !active.is_empty() {
+                    let mut submit = false;
+                    if unlock {
+                        submit = unlock_row(
+                            ui,
+                            catalog,
+                            &mut self.master_password,
+                            self.unlock_error.as_deref(),
+                            busy,
+                        );
+                    }
+                    let can_allow = !unlock || (!busy && !self.master_password.is_empty());
                     let buttons = ui
                         .add_enabled_ui(ready, |ui| {
                             crate::approval_ui::actions(
                                 ui,
                                 catalog,
-                                true,
-                                "approval_allow_all",
+                                can_allow,
+                                if unlock {
+                                    "approval_unlock_allow_all"
+                                } else {
+                                    "approval_allow_all"
+                                },
                                 "approval_reject_all",
                             )
                         })
                         .inner;
                     if ready {
                         decision = buttons.decision;
+                        if submit && decision.is_none() {
+                            decision = Some(true);
+                        }
                     }
                     #[cfg(test)]
                     for call in &active {
@@ -566,8 +718,12 @@ impl Queue {
         {
             decision = Some(false);
         }
-        if let Some(allow) = decision {
-            self.decide(&active_ids, allow, catalog);
+        match decision {
+            Some(true) => self.allow(&active_ids, catalog),
+            Some(false) => self.decide(&active_ids, false, catalog),
+            None => {}
+        }
+        if decision.is_some() {
             self.rearm(now);
         }
         if next_batch {
@@ -605,6 +761,8 @@ impl Queue {
         }
         let mut decision = None;
         let mut back = false;
+        let unlock = review.unlock_vault;
+        let busy = self.unlock.busy();
         let id = egui::Id::new(("ssh_call_detail", detail.id));
         let modal = egui::Modal::new(id)
             .area(
@@ -620,14 +778,31 @@ impl Queue {
                 ui.heading(catalog.text("approval_detail_title"));
                 ui.add(egui::Label::new(catalog.text("approval_detail_scope")).wrap());
                 ui.add(egui::Label::new(review.summary(catalog)).wrap());
+                let mut submit = false;
+                if unlock {
+                    submit = unlock_row(
+                        ui,
+                        catalog,
+                        &mut self.master_password,
+                        self.unlock_error.as_deref(),
+                        busy,
+                    );
+                }
                 let buttons = crate::approval_ui::actions(
                     ui,
                     catalog,
-                    true,
-                    "approval_allow_call",
+                    !unlock || (!busy && !self.master_password.is_empty()),
+                    if unlock {
+                        "approval_unlock_allow_call"
+                    } else {
+                        "approval_allow_call"
+                    },
                     "approval_reject_call",
                 );
                 decision = buttons.decision;
+                if submit && decision.is_none() {
+                    decision = Some(true);
+                }
                 #[cfg(test)]
                 context.data_mut(|data| {
                     data.insert_temp(
@@ -725,8 +900,14 @@ impl Queue {
             back = true;
         }
         if let Some(allow) = decision {
-            self.decide(&[detail.id], allow, catalog);
-            self.detail = None;
+            if allow {
+                self.allow(&[detail.id], catalog);
+            } else {
+                self.decide(&[detail.id], false, catalog);
+            }
+            if !self.unlock.busy() {
+                self.detail = None;
+            }
             self.rearm(now);
         } else if back {
             self.detail = None;
@@ -755,6 +936,8 @@ mod tests {
             commands: vec!["printf test".into()],
             stdin: None,
             sudo_user: None,
+            unlock_vault: false,
+            uses_vault: false,
         }
     }
     #[test]
@@ -797,6 +980,129 @@ mod tests {
                 .unwrap()
                 .required()
         );
+    }
+
+    #[test]
+    fn a_vault_host_anywhere_in_the_chain_marks_the_review_and_only_the_ask_crosses_the_pipe() {
+        let mut jump = HostProfile::new("jump".into());
+        let mut target = HostProfile::new("target".into());
+        target.jump_host = Some(jump.id);
+        target.advanced.require_call_approval = true;
+        let plain = Review::new(
+            std::slice::from_ref(&target),
+            &[jump.clone(), target.clone()],
+            vec![],
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!plain.uses_vault);
+        jump.vault = Some(crate::model::VaultHostRef {
+            item_id: Uuid::new_v4(),
+            item_name: "jump".into(),
+            revision_date: String::new(),
+        });
+        let hosts = [jump, target.clone()];
+        let mut review =
+            Review::new(std::slice::from_ref(&target), &hosts, vec![], None, None).unwrap();
+        assert!(review.uses_vault && !review.unlock_vault);
+        review.unlock_vault = true;
+        let sent: Review = serde_json::from_str(&serde_json::to_string(&review).unwrap()).unwrap();
+        assert!(sent.unlock_vault);
+        assert!(!sent.uses_vault, "the window never needs the host scan");
+    }
+
+    #[test]
+    fn a_locked_vault_is_unlocked_and_allowed_in_the_same_dialog() {
+        for detail_view in [false, true] {
+            let mut queue = Queue::default();
+            let id = Uuid::new_v4();
+            let mut asks = review();
+            asks.unlock_vault = true;
+            queue.submit(id, asks);
+            let context = egui::Context::default();
+            crate::ui::configure_fonts(&context, "en");
+            let catalog = Catalog::for_locale(Some("en"));
+            warm(&mut queue, &context, &catalog);
+            if detail_view {
+                queue.detail = Some(Detail {
+                    id,
+                    command: None,
+                    focus: false,
+                });
+                queue.rearm(context.input(|input| input.time));
+                warm(&mut queue, &context, &catalog);
+            }
+            let key = if detail_view {
+                egui::Id::new(("ssh_detail_buttons", id))
+            } else {
+                egui::Id::new(("ssh_approval_buttons", id))
+            };
+            let confirm = || {
+                context
+                    .data(|data| data.get_temp::<(egui::Rect, egui::Rect)>(key))
+                    .unwrap()
+                    .0
+                    .center()
+            };
+            click(&mut queue, &context, confirm());
+            assert_eq!(queue.take(id), "pending", "no password, nothing to allow");
+            assert!(queue.take_unlock().is_none());
+
+            queue.master_password = Zeroizing::new("wrong".into());
+            warm(&mut queue, &context, &catalog);
+            click(&mut queue, &context, confirm());
+            assert_eq!(
+                queue.take(id),
+                "pending",
+                "allowed only once the vault opens"
+            );
+            assert_eq!(
+                queue.take_unlock().as_deref().map(String::as_str),
+                Some("wrong")
+            );
+            assert!(queue.take_unlock().is_none(), "handed over once");
+            assert!(queue.master_password.is_empty(), "the field keeps no copy");
+            queue.finish_unlock(Err("Invalid master password.".into()), &catalog);
+            assert_eq!(
+                queue.take(id),
+                "pending",
+                "a failed unlock leaves the call open"
+            );
+            assert_eq!(
+                queue.unlock_error.as_deref(),
+                Some("Invalid master password.")
+            );
+
+            queue.master_password = Zeroizing::new("right".into());
+            warm(&mut queue, &context, &catalog);
+            click(&mut queue, &context, confirm());
+            assert_eq!(
+                queue.take_unlock().as_deref().map(String::as_str),
+                Some("right")
+            );
+            queue.finish_unlock(Ok(()), &catalog);
+            assert_eq!(queue.take(id), "approved");
+            assert!(queue.detail.is_none());
+            warm(&mut queue, &context, &catalog);
+            assert!(queue.unlock_error.is_none());
+        }
+    }
+
+    #[test]
+    fn rejecting_while_the_vault_unlocks_never_allows_the_call() {
+        let mut queue = Queue::default();
+        let id = Uuid::new_v4();
+        let mut asks = review();
+        asks.unlock_vault = true;
+        queue.submit(id, asks);
+        let catalog = Catalog::for_locale(Some("en"));
+        queue.master_password = Zeroizing::new("secret".into());
+        queue.allow(&[id], &catalog);
+        assert!(queue.take_unlock().is_some());
+        queue.decide(&[id], false, &catalog);
+        queue.finish_unlock(Ok(()), &catalog);
+        assert_eq!(queue.take(id), "cancelled");
     }
 
     #[test]

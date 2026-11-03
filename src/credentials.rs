@@ -12,6 +12,9 @@ pub enum CredentialKind {
     LoginPassword(Uuid),
     KeyPassphrase,
     SudoPassword(Uuid),
+    /// The unlocked Bitwarden session key of one account profile, kept
+    /// between calls for as long as the re-authentication policy allows.
+    BitwardenSession(Uuid),
 }
 
 pub struct CredentialSnapshot {
@@ -28,6 +31,7 @@ impl CredentialKind {
             Self::LoginPassword(id) => format!("login-password:{id}"),
             Self::KeyPassphrase => "key-passphrase".into(),
             Self::SudoPassword(id) => format!("sudo-password:{id}"),
+            Self::BitwardenSession(id) => format!("bitwarden-session:{id}"),
         }
     }
 }
@@ -257,6 +261,51 @@ pub enum CredentialError {
     Keyring(#[from] KeyringError),
 }
 
+/// Tests that touch Windows Credential Manager take turns, across the test
+/// threads and the isolated-store child processes alike: concurrent writes
+/// and deletes have been observed to make a read right after a delete still
+/// return the old entry.
+#[cfg(all(test, windows))]
+pub(crate) struct TestLock(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(all(test, windows))]
+impl Drop for TestLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: the handle came from CreateMutexW and is released once.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+pub(crate) fn test_lock() -> TestLock {
+    use windows_sys::Win32::Foundation::{WAIT_ABANDONED, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{CreateMutexW, INFINITE, WaitForSingleObject};
+    let name = "Local\\codex-hosts-credential-tests-v1\0"
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    // SAFETY: a named mutex in the session namespace; the wait is unbounded
+    // because the holders are other tests that finish.
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    assert!(!handle.is_null(), "credential test mutex");
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    assert!(
+        wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED,
+        "credential test mutex wait {wait}"
+    );
+    TestLock(handle)
+}
+
+#[cfg(all(test, not(windows)))]
+pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +313,7 @@ mod tests {
 
     #[test]
     fn empty_password_round_trips_as_a_saved_credential() {
+        let _guard = crate::credentials::test_lock();
         let id = Uuid::new_v4();
         let result = store(id, CredentialKind::Password, "")
             .and_then(|()| load(id, CredentialKind::Password));
@@ -278,6 +328,7 @@ mod tests {
 
     #[test]
     fn sudo_password_keys_are_isolated_from_login_other_users_and_hosts() {
+        let _guard = crate::credentials::test_lock();
         let host = Uuid::new_v4();
         let other_host = Uuid::new_v4();
         let first = CredentialKind::SudoPassword(Uuid::new_v4());
@@ -296,6 +347,7 @@ mod tests {
 
     #[test]
     fn multi_credential_failures_restore_all_modified_slots_and_report_rollback_failure() {
+        let _guard = crate::credentials::test_lock();
         let a = CredentialKind::SudoPassword(Uuid::new_v4());
         let b = CredentialKind::SudoPassword(Uuid::new_v4());
         for fail_write in [true, false] {
@@ -361,6 +413,7 @@ mod tests {
 
     #[test]
     fn deleting_a_host_cleans_sudo_slots_and_snapshot_restores_them() {
+        let _guard = crate::credentials::test_lock();
         let mut host = crate::model::HostProfile::default();
         let record = Uuid::new_v4();
         host.advanced.sudo = Some(crate::model::SudoSettings {

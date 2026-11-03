@@ -6,7 +6,7 @@ use eframe::egui::{self, RichText};
 
 use super::{FidoSetupAction, FidoSetupPrompt, HostsApp};
 use crate::i18n::Catalog;
-use crate::model::AuthPersistence;
+use crate::model::{AuthPersistence, HostProfile};
 use zeroize::Zeroizing;
 
 pub(super) enum DialogResult<T> {
@@ -20,7 +20,7 @@ fn dialog_width(context: &egui::Context, preferred: f32) -> f32 {
 }
 
 /// Common modal shell: heading, optional body text, then caller-provided content.
-fn dialog_shell<R>(
+pub(super) fn dialog_shell<R>(
     context: &egui::Context,
     id: &str,
     preferred_width: f32,
@@ -43,7 +43,7 @@ fn dialog_shell<R>(
         .inner
 }
 
-fn dialog_button_row(
+pub(super) fn dialog_button_row(
     ui: &mut egui::Ui,
     primary: &str,
     destructive: bool,
@@ -52,13 +52,11 @@ fn dialog_button_row(
     let mut result = None;
     ui.add_space(16.0);
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-        let mut primary_button = egui::Button::new(RichText::new(primary).strong());
-        if destructive {
-            let color = ui.visuals().error_fg_color;
-            primary_button = primary_button
-                .fill(color.linear_multiply(0.18))
-                .stroke(egui::Stroke::new(1.0, color));
-        }
+        let primary_button = if destructive {
+            super::theme::danger_confirm_button(ui, primary)
+        } else {
+            super::theme::primary_button(ui, primary)
+        };
         if ui.add(primary_button).clicked() {
             result = Some(true);
         }
@@ -123,8 +121,10 @@ impl HostsApp {
         self.import_cleanup_dialog(context);
         self.batch_export_dialog(context);
         self.delete_dialog(context);
+        self.unsaved_switch_dialog(context);
         self.persistence_dialog(context);
         self.batch_delete_dialog(context);
+        self.bitwarden_dialogs(context);
     }
 
     pub(super) fn any_dialog_open(&self) -> bool {
@@ -134,8 +134,10 @@ impl HostsApp {
             || self.import_cleanup_prompt.is_some()
             || self.batch_export_window_open
             || self.delete_prompt
+            || self.pending_switch.is_some()
             || self.persistence_prompt.is_some()
             || self.batch_delete_prompt
+            || self.bitwarden_dialog_open()
     }
 
     pub(super) fn open_fido_setup(&mut self) {
@@ -191,11 +193,17 @@ impl HostsApp {
                 ui.label(RichText::new(catalog.text("fido_setup_hint")).weak());
                 ui.add_space(12.0);
                 ui.label(RichText::new(catalog.text("fido_pin")).strong());
-                ui.add(
-                    egui::TextEdit::singleline(&mut *prompt.pin)
-                        .password(true)
-                        .desired_width(320.0),
-                );
+                ui.horizontal(|ui| {
+                    let key = egui::Id::new("fido_setup_pin");
+                    let revealed = super::theme::password_revealed(ui, key);
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut *prompt.pin)
+                            .password(!revealed)
+                            .desired_width(320.0),
+                    );
+                    super::theme::forget_password_history(ui, &response);
+                    super::theme::reveal_button(ui, catalog, key);
+                });
                 ui.label(RichText::new(catalog.text("fido_pin_hint")).small().weak());
                 ui.add_space(14.0);
                 let mut action = None;
@@ -449,11 +457,19 @@ impl HostsApp {
             return;
         }
         let catalog = &self.catalog;
+        let vault_host = self
+            .selected
+            .and_then(|id| self.store.hosts.iter().find(|host| host.id == id))
+            .is_some_and(HostProfile::is_vault_host);
         let choice = confirm_dialog(
             context,
             "delete_confirmation",
             catalog.text("delete_title"),
-            catalog.text("delete_message"),
+            catalog.text(if vault_host {
+                "vault_delete_message"
+            } else {
+                "delete_message"
+            }),
             catalog.text("confirm_delete"),
             catalog.text("cancel"),
             true,
@@ -462,6 +478,30 @@ impl HostsApp {
             self.delete_prompt = false;
             if confirm {
                 self.remove_selected();
+            }
+        }
+    }
+
+    /// The user picked another host (or a new one) while the form held
+    /// unsaved changes: discard them and go, or stay and keep editing.
+    fn unsaved_switch_dialog(&mut self, context: &egui::Context) {
+        let Some(next) = self.pending_switch else {
+            return;
+        };
+        let catalog = &self.catalog;
+        let choice = confirm_dialog(
+            context,
+            "unsaved_switch",
+            catalog.text("unsaved_switch_title"),
+            catalog.text("unsaved_switch_message"),
+            catalog.text("discard_changes"),
+            catalog.text("keep_editing"),
+            true,
+        );
+        if let Some(discard) = choice {
+            self.pending_switch = None;
+            if discard {
+                self.apply_switch(next);
             }
         }
     }

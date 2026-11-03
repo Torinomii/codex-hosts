@@ -49,6 +49,7 @@ impl Drop for Fixture {
 
 #[test]
 fn legacy_migration_removes_source_and_deleted_password_stays_deleted() {
+    let _guard = crate::credentials::test_lock();
     let fixture = Fixture::new();
     fixture.legacy().set_password("legacy-fixture").unwrap();
     let migrated = load(fixture.host.id, CredentialKind::Password)
@@ -69,6 +70,7 @@ fn legacy_migration_removes_source_and_deleted_password_stays_deleted() {
 
 #[test]
 fn explicit_delete_removes_unmigrated_and_shadowed_legacy_passwords() {
+    let _guard = crate::credentials::test_lock();
     for current in [false, true] {
         let fixture = Fixture::new();
         fixture.legacy().set_password("obsolete-fixture").unwrap();
@@ -90,6 +92,7 @@ fn explicit_delete_removes_unmigrated_and_shadowed_legacy_passwords() {
 
 #[test]
 fn versioned_login_never_falls_back_to_host_or_legacy_slots() {
+    let _guard = crate::credentials::test_lock();
     let mut fixture = Fixture::new();
     let slot = fixture.login_slot();
     fixture.legacy().set_password("legacy-fixture").unwrap();
@@ -106,6 +109,7 @@ fn versioned_login_never_falls_back_to_host_or_legacy_slots() {
 
 #[test]
 fn failed_identity_rotation_restores_legacy_or_versioned_secret_without_new_slot() {
+    let _guard = crate::credentials::test_lock();
     for versioned in [false, true] {
         let mut fixture = Fixture::new();
         let old = if versioned {
@@ -142,6 +146,7 @@ fn failed_identity_rotation_restores_legacy_or_versioned_secret_without_new_slot
 
 #[test]
 fn stale_sudo_and_su_profiles_never_read_new_login_identity() {
+    let _guard = crate::credentials::test_lock();
     for versioned in [false, true] {
         let mut fixture = Fixture::new();
         fixture.host.advanced.sudo = Some(SudoSettings {
@@ -198,6 +203,7 @@ fn stale_sudo_and_su_profiles_never_read_new_login_identity() {
 
 #[test]
 fn versioned_snapshot_restore_and_serde_keep_exact_login_slot() {
+    let _guard = crate::credentials::test_lock();
     let mut fixture = Fixture::new();
     let CredentialKind::LoginPassword(id) = fixture.login_slot() else {
         unreachable!()

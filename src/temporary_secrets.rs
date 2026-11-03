@@ -49,6 +49,15 @@ pub enum Request {
     CancelSshApproval {
         id: Uuid,
     },
+    UnlockBitwarden {
+        id: Uuid,
+    },
+    TakeBitwardenUnlock {
+        id: Uuid,
+    },
+    CancelBitwardenUnlock {
+        id: Uuid,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -401,6 +410,7 @@ pub(crate) struct SecretsApp {
     input_status: &'static str,
     context: egui::Context,
     ssh_approvals: crate::approval::Queue,
+    bitwarden_unlocks: crate::bitwarden::prompt::UnlockQueue,
     detail: Option<Uuid>,
     displayed_approval: Option<Uuid>,
     approval_ready_at: f64,
@@ -433,6 +443,19 @@ impl SecretsApp {
             }
             Request::CancelSshApproval { id } => {
                 self.ssh_approvals.cancel(id);
+                return self.approval_response(id, "cancelled");
+            }
+            Request::UnlockBitwarden { id } => {
+                let status = self.bitwarden_unlocks.submit(id);
+                self.restore_requested |= status == "pending";
+                return self.approval_response(id, status);
+            }
+            Request::TakeBitwardenUnlock { id } => {
+                let status = self.bitwarden_unlocks.take(id);
+                return self.approval_response(id, status);
+            }
+            Request::CancelBitwardenUnlock { id } => {
+                self.bitwarden_unlocks.cancel(id);
                 return self.approval_response(id, "cancelled");
             }
             request => request,
@@ -505,7 +528,10 @@ impl SecretsApp {
             },
             Request::ReviewSsh { .. }
             | Request::TakeSshApproval { .. }
-            | Request::CancelSshApproval { .. } => unreachable!(),
+            | Request::CancelSshApproval { .. }
+            | Request::UnlockBitwarden { .. }
+            | Request::TakeBitwardenUnlock { .. }
+            | Request::CancelBitwardenUnlock { .. } => unreachable!(),
         };
         if let Err(code) = result {
             return Response::error(self.session, code);
@@ -514,6 +540,29 @@ impl SecretsApp {
         response.operation_id = operation_id;
         response
     }
+    /// The Bitwarden unlock prompt a tool call is waiting on, if any.
+    pub(crate) fn bitwarden_unlock_pending(&self) -> Option<Uuid> {
+        self.bitwarden_unlocks.pending()
+    }
+
+    /// The master password an SSH call approval was allowed with, for the
+    /// window to unlock the vault; handed over once.
+    pub(crate) fn take_approval_unlock(&mut self) -> Option<Zeroizing<String>> {
+        self.ssh_approvals.take_unlock()
+    }
+
+    /// The window's unlock result for [`Self::take_approval_unlock`]: the
+    /// calls are allowed on success, else stay pending with the reason.
+    pub(crate) fn finish_approval_unlock(&mut self, result: Result<(), String>) {
+        let catalog = self.catalog.clone();
+        self.ssh_approvals.finish_unlock(result, &catalog);
+    }
+
+    /// The window's answer to an unlock prompt: `unlocked` or `cancelled`.
+    pub(crate) fn finish_bitwarden_unlock(&mut self, id: Uuid, status: &'static str) {
+        self.bitwarden_unlocks.finish(id, status);
+    }
+
     fn approval_response(&self, id: Uuid, status: &str) -> Response {
         Response {
             schema_version: 1,
@@ -601,6 +650,7 @@ impl SecretsApp {
     }
     fn poll(&mut self) {
         self.ssh_approvals.expire();
+        self.bitwarden_unlocks.expire();
         if let Some(running) = &self.running {
             let result = match running.result.try_recv() {
                 Ok(result) => Some(result),
@@ -750,6 +800,7 @@ impl SecretsApp {
             input_status: "ok",
             context,
             ssh_approvals: crate::approval::Queue::default(),
+            bitwarden_unlocks: crate::bitwarden::prompt::UnlockQueue::default(),
             detail: None,
             displayed_approval: None,
             approval_ready_at: 0.0,
@@ -1548,6 +1599,7 @@ mod tests {
             input_status: "ok",
             context: egui::Context::default(),
             ssh_approvals: crate::approval::Queue::default(),
+            bitwarden_unlocks: crate::bitwarden::prompt::UnlockQueue::default(),
             detail: None,
             displayed_approval: None,
             approval_ready_at: 0.0,

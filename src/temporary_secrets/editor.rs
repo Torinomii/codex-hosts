@@ -74,20 +74,30 @@ fn secret_cell(
     notice: &mut Option<&'static str>,
     change: &mut Option<&'static str>,
 ) {
-    let width = ui.available_width();
-    let mut output = egui::TextEdit::multiline(&mut *field.draft)
-        .id(egui::Id::new(("temporary_secret_input", &field.name)))
-        .password(true)
-        .desired_rows((64.0 / ui.text_style_height(&egui::TextStyle::Body)).ceil() as usize)
-        .desired_width(width)
-        .min_size(egui::vec2(width, 64.0))
-        .char_limit(MAX_VALUE_BYTES)
-        .hint_text(catalog.text(if field.value.is_some() {
-            "temp_replace_hint"
-        } else {
-            "temp_empty_hint"
-        }))
-        .show(ui);
+    let key = egui::Id::new(("temporary_secret_input", &field.name));
+    let revealed = crate::ui::theme::password_revealed(ui, key);
+    let reveal_width = CONTROL_HEIGHT + ui.spacing().item_spacing.x;
+    let width = (ui.available_width() - reveal_width).max(80.0);
+    let mut output = ui
+        .horizontal_top(|ui| {
+            let output = egui::TextEdit::multiline(&mut *field.draft)
+                .id(key)
+                .password(!revealed)
+                .desired_rows((64.0 / ui.text_style_height(&egui::TextStyle::Body)).ceil() as usize)
+                .desired_width(width)
+                .min_size(egui::vec2(width, 64.0))
+                .char_limit(MAX_VALUE_BYTES)
+                .hint_text(catalog.text(if field.value.is_some() {
+                    "temp_replace_hint"
+                } else {
+                    "temp_empty_hint"
+                }))
+                .show(ui);
+            crate::ui::theme::reveal_button(ui, catalog, key);
+            output
+        })
+        .inner;
+    crate::ui::forget_password_history(ui, &output.response);
     if output.response.changed() {
         *change = Some("ok");
     }

@@ -2,6 +2,7 @@
 
 mod approval;
 mod approval_ui;
+mod bitwarden;
 mod connection;
 mod credentials;
 mod fido;

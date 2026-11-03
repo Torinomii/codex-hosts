@@ -496,6 +496,7 @@ fn auth_section(
 ) {
     section(ui, catalog.text("section_auth"), |ui| {
         let mut form = Form::new(ui, catalog);
+        let vault_host = editor.is_vault_host();
         if editor.profile.protocol == Protocol::Ssh {
             form.required_row(ui, "auth_method", false, None, |ui, width| {
                 egui::ComboBox::from_id_salt("ssh_auth")
@@ -528,6 +529,8 @@ fn auth_section(
         if editor.profile.protocol == Protocol::Telnet
             || editor.profile.ssh_auth == SshAuth::Password
         {
+            // The same choice for both stores; a vault host writes the
+            // outcome into its item instead of Credential Manager.
             form.row(ui, "password_mode", None, |ui, _| {
                 ui.horizontal(|ui| {
                     ui.radio_value(
@@ -544,6 +547,8 @@ fn auth_section(
             });
             let password_hint = if editor.password_mode == PasswordMode::NoPassword {
                 catalog.text("no_password_hint").to_owned()
+            } else if vault_host && !editor.draft {
+                catalog.text("vault_password_hint").to_owned()
             } else if editor.login_user_changed() {
                 catalog.text("login_password_user_changed").to_owned()
             } else if let Some(error) = editor.password_read_error.as_deref() {
@@ -558,16 +563,25 @@ fn auth_section(
                 // The mask leaves on focus, so a new password is typed into an empty field.
                 let masked =
                     editor.login_password_saved() && !ui.memory(|memory| memory.has_focus(id));
-                let mut edit = single_line(ui, &mut editor.password, width)
-                    .password(true)
-                    .id(id);
-                if masked {
-                    edit = edit.hint_text(SAVED_PASSWORD_MASK);
-                }
-                let response = ui.add_enabled(editor.password_mode == PasswordMode::Password, edit);
-                if masked && response.has_focus() {
-                    ui.ctx().request_repaint();
-                }
+                let enabled = editor.password_mode == PasswordMode::Password && !editor.saving;
+                ui.horizontal(|ui| {
+                    // Per host, so another host's form starts masked.
+                    let key = egui::Id::new(("login_password", editor.profile.id));
+                    let revealed = theme::password_revealed(ui, key);
+                    let field_width = width - control_height(ui) - ui.spacing().item_spacing.x;
+                    let mut edit = single_line(ui, &mut editor.password, field_width)
+                        .password(!revealed)
+                        .id(id);
+                    if masked {
+                        edit = edit.hint_text(SAVED_PASSWORD_MASK);
+                    }
+                    let response = ui.add_enabled(enabled, edit);
+                    theme::forget_password_history(ui, &response);
+                    ui.add_enabled_ui(enabled, |ui| theme::reveal_button(ui, catalog, key));
+                    if masked && response.has_focus() {
+                        ui.ctx().request_repaint();
+                    }
+                });
             });
         } else if editor.profile.ssh_auth == SshAuth::PrivateKey {
             let key_missing =
@@ -609,8 +623,16 @@ fn auth_section(
                 catalog.text("passphrase_optional").to_owned()
             };
             form.row(ui, "key_passphrase", Some(passphrase_hint), |ui, width| {
-                let edit = single_line(ui, &mut editor.key_passphrase, width).password(true);
-                ui.add(edit);
+                ui.horizontal(|ui| {
+                    let key = egui::Id::new(("key_passphrase", editor.profile.id));
+                    let revealed = theme::password_revealed(ui, key);
+                    let field_width = width - control_height(ui) - ui.spacing().item_spacing.x;
+                    let edit = single_line(ui, &mut editor.key_passphrase, field_width)
+                        .password(!revealed);
+                    let response = ui.add(edit);
+                    theme::forget_password_history(ui, &response);
+                    theme::reveal_button(ui, catalog, key);
+                });
             });
         } else {
             form.row(
@@ -979,7 +1001,7 @@ fn su_accounts(
                     ui.set_width(ui.available_width());
                     let height = control_height(ui);
                     let gap = 6.0;
-                    let fields_width = (ui.available_width() - height - 2.0 * gap).max(100.0);
+                    let fields_width = (ui.available_width() - 2.0 * height - 3.0 * gap).max(100.0);
                     let username_width = (fields_width * 0.36).clamp(48.0, 220.0);
                     let password_width = fields_width - username_width;
                     let password = editor
@@ -998,14 +1020,19 @@ fn su_accounts(
                                 .hint_text(catalog.text("su_target_user")),
                         )
                         .on_hover_text(catalog.text("su_target_user"));
-                        ui.add_sized(
-                            [password_width, height],
-                            single_line(ui, password, password_width)
-                                .id(sudo_field_id(credential.id, "password"))
-                                .password(true)
-                                .hint_text(placeholder),
-                        )
-                        .on_hover_text(hint);
+                        let key = sudo_field_id(credential.id, "password");
+                        let revealed = theme::password_revealed(ui, key);
+                        let response = ui
+                            .add_sized(
+                                [password_width, height],
+                                single_line(ui, password, password_width)
+                                    .id(key)
+                                    .password(!revealed)
+                                    .hint_text(placeholder),
+                            )
+                            .on_hover_text(hint);
+                        theme::forget_password_history(ui, &response);
+                        theme::reveal_button(ui, catalog, key);
                         ui.menu_button("⋯", |ui| {
                             if ui.button(catalog.text("sudo_clear_password")).clicked() {
                                 password.clear();
@@ -1126,17 +1153,23 @@ fn current_user_password(
         |ui, width| {
             ui.horizontal(|ui| {
                 let menu_width = control_height(ui);
-                let password_width = (width - menu_width - ui.spacing().item_spacing.x).max(60.0);
-                changed = ui
+                let password_width =
+                    (width - 2.0 * (menu_width + ui.spacing().item_spacing.x)).max(60.0);
+                let enabled = ssh && crate::model::valid_sudo_username(&username);
+                let key = sudo_field_id(id, "password");
+                let revealed = theme::password_revealed(ui, key);
+                let response = ui
                     .add_enabled(
-                        ssh && crate::model::valid_sudo_username(&username),
+                        enabled,
                         single_line(ui, password, password_width)
-                            .id(sudo_field_id(id, "password"))
-                            .password(true)
+                            .id(key)
+                            .password(!revealed)
                             .hint_text(placeholder),
                     )
-                    .on_hover_text(hint)
-                    .changed();
+                    .on_hover_text(hint);
+                theme::forget_password_history(ui, &response);
+                ui.add_enabled_ui(enabled, |ui| theme::reveal_button(ui, catalog, key));
+                changed = response.changed();
                 ui.menu_button("⋯", |ui| {
                     if ui.button(catalog.text("sudo_clear_password")).clicked() {
                         password.clear();
@@ -1346,6 +1379,22 @@ fn host_key_section(ui: &mut egui::Ui, editor: &HostEditor, catalog: &Catalog) {
     });
 }
 
+/// Tells the user the host is its Bitwarden item: name, endpoint, account,
+/// password, description and tags are written to the vault on save, the
+/// rest of the form stays in this app.
+fn vault_banner(ui: &mut egui::Ui, editor: &HostEditor, catalog: &Catalog) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(catalog.text("vault_host_title")).strong());
+            if editor.saving {
+                ui.spinner();
+                ui.label(RichText::new(catalog.text("vault_saving")).weak());
+            }
+        });
+        ui.add(egui::Label::new(catalog.text("vault_host_hint")).wrap());
+    });
+}
+
 fn warning_callout(ui: &mut egui::Ui, text: &str) {
     let color = ui.visuals().warn_fg_color;
     egui::Frame::new()
@@ -1369,6 +1418,12 @@ impl HostsApp {
         let testing =
             self.testing_all || self.selected.is_some_and(|id| self.host_test_running(id));
         let codex_edit = self.launch.codex_edit;
+        let draft = self.editor.as_ref().is_some_and(|editor| editor.draft);
+        let saving = self.editor.as_ref().is_some_and(|editor| editor.saving);
+        let unsaved = self
+            .editor
+            .as_ref()
+            .is_some_and(HostEditor::has_unsaved_changes);
         let mut action = None;
 
         if self.editor.is_some() {
@@ -1382,7 +1437,7 @@ impl HostsApp {
                 .show(ui, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui
-                            .add_enabled(!testing, egui::Button::new(catalog.text("save")))
+                            .add_enabled(!testing, theme::primary_button(ui, catalog.text("save")))
                             .clicked()
                         {
                             action = Some(EditorAction::Save);
@@ -1403,8 +1458,42 @@ impl HostsApp {
                         if codex_edit && ui.button(catalog.text("cancel")).clicked() {
                             action = Some(EditorAction::CancelCodex);
                         }
+                        if draft && ui.button(catalog.text("discard_draft")).clicked() {
+                            action = Some(EditorAction::DiscardDraft);
+                        }
+                        if !draft
+                            && unsaved
+                            && ui
+                                .add_enabled(
+                                    !saving,
+                                    egui::Button::new(catalog.text("revert_changes")),
+                                )
+                                .on_hover_text(catalog.text("revert_changes_hint"))
+                                .clicked()
+                        {
+                            action = Some(EditorAction::Revert);
+                        }
                         if testing {
                             ui.spinner();
+                        }
+                        // Deleting sits apart, at the far left, so it is
+                        // found without being hit by mistake.
+                        if !draft && !codex_edit {
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    if ui
+                                        .add_enabled(
+                                            !testing && !saving,
+                                            theme::danger_button(ui, catalog.text("delete")),
+                                        )
+                                        .on_hover_text(catalog.text("delete_host_hint"))
+                                        .clicked()
+                                    {
+                                        action = Some(EditorAction::Delete);
+                                    }
+                                },
+                            );
                         }
                     });
                 });
@@ -1462,6 +1551,13 @@ impl HostsApp {
                 }
             }
             Some(EditorAction::OpenFidoSetup) => self.open_fido_setup(),
+            Some(EditorAction::DiscardDraft) => self.discard_draft(),
+            Some(EditorAction::Revert) => self.revert_editor(),
+            Some(EditorAction::Delete) => {
+                if self.selected.is_some() {
+                    self.delete_prompt = true;
+                }
+            }
             None => {}
         }
     }
@@ -1505,9 +1601,12 @@ impl HostsApp {
                 });
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.label(RichText::new(catalog.text("editor_subtitle")).weak());
-        });
+        // Where local secrets live; a vault host says so in its banner.
+        if !editor.is_vault_host() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(catalog.text("editor_subtitle")).weak());
+            });
+        }
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("*")
@@ -1534,6 +1633,10 @@ impl HostsApp {
             });
             ui.add_space(12.0);
         }
+        if editor.is_vault_host() {
+            vault_banner(ui, editor, catalog);
+            ui.add_space(12.0);
+        }
         basic_section(ui, editor, catalog, self.testing_all, action);
         connection_section(ui, editor, catalog, hosts);
         auth_section(ui, editor, catalog, action);
@@ -1550,6 +1653,7 @@ impl HostsApp {
 mod tests {
     use super::super::tests::{find_text_rect, in_isolated_store, metadata_test_app};
     use super::*;
+    use crate::model::VaultHostRef;
 
     fn panel_frame(
         app: &mut HostsApp,
@@ -1590,6 +1694,7 @@ mod tests {
         ) {
             return;
         }
+        let _guard = crate::credentials::test_lock();
         let context = egui::Context::default();
         theme::configure_fonts(&context, "en");
         let mut app = metadata_test_app(&context, "en", metadata_profile());
@@ -1632,6 +1737,7 @@ mod tests {
         ) {
             return;
         }
+        let _guard = crate::credentials::test_lock();
         let context = egui::Context::default();
         theme::configure_fonts(&context, "en");
         let mut app = metadata_test_app(&context, "en", metadata_profile());
@@ -1657,6 +1763,7 @@ mod tests {
         ) {
             return;
         }
+        let _guard = crate::credentials::test_lock();
         let context = egui::Context::default();
         theme::configure_fonts(&context, "en");
         let mut app = metadata_test_app(&context, "en", metadata_profile());
@@ -2011,6 +2118,309 @@ mod tests {
         }
     }
 
+    fn vault_profile() -> HostProfile {
+        let mut profile = metadata_profile();
+        profile.address = "10.0.0.5".into();
+        profile.username = "deploy".into();
+        profile.vault = Some(VaultHostRef {
+            item_id: profile.id,
+            item_name: profile.alias.clone(),
+            revision_date: "rev-1".into(),
+        });
+        profile
+    }
+
+    #[test]
+    fn vault_hosts_show_the_vault_banner_and_the_usual_choices() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            theme::configure_fonts(&context, locale);
+            let mut app = metadata_test_app(&context, locale, vault_profile());
+            assert!(app.editor.as_ref().unwrap().is_vault_host());
+            let output = run_form(&mut app, &context, 760.0);
+            let rect = |text: &str| {
+                find_text_rect(&output.shapes, text)
+                    .unwrap_or_else(|| panic!("missing {locale} text {text}"))
+            };
+            rect(app.catalog.text("vault_host_title"));
+            rect(app.catalog.text("vault_password_hint"));
+            // The same authentication and password choices as a local host.
+            rect(app.catalog.text("password_mode"));
+            rect(app.catalog.text("no_password"));
+            let editor = app.editor.as_ref().unwrap();
+            assert!(
+                !editor.password_value_missing(),
+                "the item holds a password"
+            );
+            assert!(!editor.has_unsaved_changes());
+        }
+    }
+
+    #[test]
+    fn the_form_offers_delete_for_saved_hosts_and_names_the_right_store() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            theme::configure_fonts(&context, locale);
+            let has = |app: &mut HostsApp, key: &str| {
+                panel_frame(app, &context, vec![]);
+                let output = panel_frame(app, &context, vec![]);
+                find_text_rect(&output.shapes, app.catalog.text(key)).is_some()
+            };
+            let mut app = metadata_test_app(&context, locale, metadata_profile());
+            assert!(
+                has(&mut app, "delete"),
+                "{locale}: delete in the action bar"
+            );
+            assert!(
+                has(&mut app, "editor_subtitle"),
+                "{locale}: local storage note"
+            );
+            let target = find_text_rect(
+                &panel_frame(&mut app, &context, vec![]).shapes,
+                app.catalog.text("delete"),
+            )
+            .unwrap()
+            .center();
+            panel_frame(&mut app, &context, click_events(target));
+            assert!(app.delete_prompt, "{locale}: delete asks first");
+
+            assert!(
+                !has(&mut app, "revert_changes"),
+                "{locale}: nothing to revert"
+            );
+            app.delete_prompt = false;
+            app.editor.as_mut().unwrap().profile.description = "typed".into();
+            assert!(
+                has(&mut app, "revert_changes"),
+                "{locale}: revert once edited"
+            );
+            let target = find_text_rect(
+                &panel_frame(&mut app, &context, vec![]).shapes,
+                app.catalog.text("revert_changes"),
+            )
+            .unwrap()
+            .center();
+            panel_frame(&mut app, &context, click_events(target));
+            assert!(
+                !app.editor.as_ref().unwrap().has_unsaved_changes(),
+                "{locale}: revert reloads the saved host"
+            );
+
+            let mut app = metadata_test_app(&context, locale, vault_profile());
+            assert!(
+                !has(&mut app, "editor_subtitle"),
+                "{locale}: a vault host does not claim Credential Manager"
+            );
+
+            app.new_host();
+            assert!(
+                !has(&mut app, "delete"),
+                "{locale}: a draft is discarded, not deleted"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_a_vault_host_writes_the_item_first_and_the_store_after() {
+        use codex_hosts_bw::FieldEdit;
+
+        use crate::credentials::{self, CredentialKind};
+
+        if !in_isolated_store(
+            "ui::host_form::tests::saving_a_vault_host_writes_the_item_first_and_the_store_after",
+        ) {
+            return;
+        }
+        let _guard = crate::credentials::test_lock();
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", vault_profile());
+        app.store.bitwarden.enabled = true;
+        app.store.bitwarden.cli_path = Some(std::path::PathBuf::from("C:/missing/bw.exe"));
+        app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+        app.store.save().unwrap();
+        let id = app.store.hosts[0].id;
+        app.editor = Some(HostEditor::load(app.store.hosts[0].clone()));
+        {
+            let editor = app.editor.as_mut().unwrap();
+            editor.profile.address = "10.0.0.6".into();
+            editor.profile.description = "front".into();
+            editor.profile.advanced.require_call_approval = true;
+            editor.password.push_str("new-pw");
+        }
+
+        // The save is deferred to the item write; nothing is stored yet.
+        assert!(!app.persist_editor().unwrap());
+        assert!(app.editor.as_ref().unwrap().saving);
+        assert!(app.pending_vault_save.is_some());
+        assert!(app.vault_job.is_some());
+        assert_eq!(stored_host().address, "10.0.0.5");
+        let write = app.editor.as_ref().unwrap().vault_write();
+        assert_eq!(write.host_uri, "ssh://10.0.0.6:22");
+        assert_eq!(write.name, "example");
+        assert_eq!(write.username, "deploy");
+        assert_eq!(write.description, "front");
+        assert_eq!(write.expected_revision, "rev-1");
+        assert!(matches!(write.password, FieldEdit::Set(_)));
+        assert_eq!(
+            app.persist_editor().unwrap_err(),
+            app.catalog.text("vault_saving"),
+            "a second save waits for the first item write"
+        );
+
+        // The item write lands: the store takes what the item now says plus
+        // the local settings from the form; Credential Manager stays empty.
+        app.vault_job = None;
+        let facts = crate::bitwarden::hosts::HostFacts {
+            alias: "example".into(),
+            protocol: Protocol::Ssh,
+            address: "10.0.0.6".into(),
+            port: 22,
+            username: "deploy".into(),
+            description: "front".into(),
+            tags: Vec::new(),
+            revision: "rev-2".into(),
+        };
+        app.finish_vault_save(id, &facts);
+        let stored = stored_host();
+        assert_eq!(stored.address, "10.0.0.6");
+        assert_eq!(stored.description, "front");
+        assert_eq!(stored.vault.as_ref().unwrap().revision_date, "rev-2");
+        assert!(
+            stored.advanced.require_call_approval,
+            "local settings saved"
+        );
+        assert!(!credentials::has(id, CredentialKind::Password).unwrap());
+        let editor = app.editor.as_ref().unwrap();
+        assert!(!editor.saving);
+        assert!(editor.password.is_empty());
+        assert!(!editor.has_unsaved_changes());
+        let listed = crate::tool::list_hosts(&app.store, vec![]).unwrap();
+        assert!(listed.hosts[0].has_required_secret);
+        assert_eq!(listed.hosts[0].credential_source, Some("bitwarden"));
+
+        // Switching Bitwarden off hides the host from Codex and refuses it.
+        app.store.bitwarden.enabled = false;
+        assert!(
+            crate::tool::list_hosts(&app.store, vec![])
+                .unwrap()
+                .hosts
+                .is_empty()
+        );
+        assert_eq!(
+            crate::tool::find_host(&app.store, "example")
+                .unwrap_err()
+                .code,
+            "BITWARDEN_DISABLED"
+        );
+    }
+
+    #[test]
+    fn a_new_local_host_is_a_draft_until_its_first_save() {
+        if !in_isolated_store(
+            "ui::host_form::tests::a_new_local_host_is_a_draft_until_its_first_save",
+        ) {
+            return;
+        }
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", metadata_profile());
+        app.store.save().unwrap();
+        app.new_host();
+        let editor = app.editor.as_ref().unwrap();
+        assert!(editor.draft && !editor.is_vault_host());
+        assert!(
+            editor.profile.alias.is_empty(),
+            "the alias is typed, not generated"
+        );
+        assert_eq!(app.selected, None);
+        assert_eq!(app.store.hosts.len(), 1, "nothing is stored before Save");
+        // Tags of a draft wait for its Save instead of writing at once.
+        app.editor.as_mut().unwrap().profile.tags.push("lab".into());
+        app.save_tags();
+        assert_eq!(app.store.hosts.len(), 1);
+        {
+            let editor = app.editor.as_mut().unwrap();
+            editor.profile.alias = "fresh".into();
+            editor.profile.address = "10.0.0.7".into();
+            editor.profile.username = "ops".into();
+            editor.profile.ssh_auth = SshAuth::SshAgent;
+        }
+        assert!(app.persist_editor().unwrap());
+        let stored = app.store.find_alias("fresh").unwrap();
+        assert_eq!(stored.tags, ["lab"]);
+        assert_eq!(app.selected, Some(stored.id));
+        let editor = app.editor.as_ref().unwrap();
+        assert!(!editor.draft);
+        assert!(!editor.has_unsaved_changes());
+
+        // Discarding a draft leaves the store untouched.
+        app.new_host();
+        app.discard_draft();
+        assert!(app.editor.is_none());
+        assert_eq!(app.store.hosts.len(), 2);
+    }
+
+    #[test]
+    fn a_vault_draft_creates_the_item_and_takes_its_id() {
+        if !in_isolated_store(
+            "ui::host_form::tests::a_vault_draft_creates_the_item_and_takes_its_id",
+        ) {
+            return;
+        }
+        let _guard = crate::credentials::test_lock();
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", metadata_profile());
+        app.store.bitwarden.enabled = true;
+        app.store.bitwarden.cli_path = Some(std::path::PathBuf::from("C:/missing/bw.exe"));
+        app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+        app.store.save().unwrap();
+        app.new_vault_host();
+        let editor = app.editor.as_ref().unwrap();
+        assert!(editor.draft && editor.is_vault_host());
+        assert!(
+            editor.has_unsaved_changes(),
+            "a draft is never dropped by a refresh"
+        );
+        assert!(
+            editor.password_value_missing(),
+            "a new item needs a password"
+        );
+        {
+            let editor = app.editor.as_mut().unwrap();
+            editor.profile.alias = "new-box".into();
+            editor.profile.address = "10.0.0.9".into();
+            editor.profile.username = "ops".into();
+            editor.password.push_str("pw");
+        }
+        assert!(!app.persist_editor().unwrap());
+        let write = app.editor.as_ref().unwrap().vault_write();
+        assert_eq!(write.item_id, None, "the item does not exist yet");
+        assert_eq!(write.expected_revision, "");
+        app.vault_job = None;
+        let item_id = uuid::Uuid::new_v4();
+        let facts = crate::bitwarden::hosts::HostFacts {
+            alias: "new-box".into(),
+            protocol: Protocol::Ssh,
+            address: "10.0.0.9".into(),
+            port: 22,
+            username: "ops".into(),
+            description: String::new(),
+            tags: Vec::new(),
+            revision: "rev-1".into(),
+        };
+        app.finish_vault_save(item_id, &facts);
+        let created = app.store.find_alias("new-box").unwrap();
+        assert_eq!(created.id, item_id, "the profile id is the item id");
+        assert_eq!(created.vault.as_ref().unwrap().item_id, item_id);
+        assert_eq!(app.selected, Some(item_id));
+        let editor = app.editor.as_ref().unwrap();
+        assert!(!editor.draft);
+        assert_eq!(editor.profile.id, item_id);
+        assert_eq!(app.store.hosts.len(), 2);
+    }
+
     #[test]
     fn sudo_controls_fit_narrow_and_wide_forms_in_every_locale() {
         for locale in ["en", "zh-CN", "zh-TW", "ja"] {
@@ -2291,7 +2701,8 @@ mod tests {
         use std::{env, fs, process::Command};
 
         // Run the real editor save path in a child so no process-wide test
-        // environment or user's actual host list is modified.
+        // environment or user's actual host list is modified. The credential
+        // lock is taken only after the child finished: it needs it itself.
         if env::var("CODEX_HOSTS_AUTH_FLOW_TEST_CHILD").as_deref() != Ok("1") {
             let directory =
                 env::temp_dir().join(format!("codex-hosts-auth-flow-{}", uuid::Uuid::new_v4()));
@@ -2301,6 +2712,7 @@ mod tests {
                 .env("CODEX_HOSTS_AUTH_FLOW_TEST_CHILD", "1")
                 .env("CODEX_HOSTS_DATA_DIR", &directory)
                 .output().unwrap();
+            let _guard = crate::credentials::test_lock();
             let fixture_path = directory.join("hosts.json");
             if fixture_path.exists() {
                 let store: HostStore =
@@ -2333,6 +2745,7 @@ mod tests {
             );
             return;
         }
+        let _guard = crate::credentials::test_lock();
         let directory = std::path::PathBuf::from(
             env::var_os("CODEX_HOSTS_DATA_DIR").expect("isolated data directory"),
         );

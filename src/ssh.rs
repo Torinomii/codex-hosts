@@ -23,6 +23,7 @@ use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0}
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
+use crate::bitwarden;
 use crate::credentials::{self, CredentialKind};
 use crate::fido;
 use crate::model::{HostProfile, Retention, SshAuth, chain_retention, resolve_ssh_chain};
@@ -234,10 +235,17 @@ struct SessionKey {
     agent_key_fingerprint: String,
     host_fingerprint: Option<String>,
     host_key_algorithm: Option<String>,
+    /// The Bitwarden item and session this operation was admitted under; a
+    /// session opened under another admission (or after a lock) is not reused.
+    bitwarden: Option<bitwarden::Admission>,
 }
 
 impl SessionKey {
-    fn new(host: &HostProfile, parent: Option<&SessionKey>) -> Self {
+    fn new(
+        host: &HostProfile,
+        parent: Option<&SessionKey>,
+        admission: Option<&bitwarden::Admission>,
+    ) -> Self {
         let private_key_version = (host.ssh_auth == SshAuth::PrivateKey)
             .then(|| fs::metadata(host.private_key_path.trim()).ok())
             .flatten()
@@ -262,6 +270,7 @@ impl SessionKey {
             agent_key_fingerprint: host.agent_key_fingerprint.trim().to_owned(),
             host_fingerprint: host.host_fingerprint.clone(),
             host_key_algorithm: host.host_key_algorithm.clone(),
+            bitwarden: admission.cloned(),
         }
     }
 }
@@ -1036,20 +1045,28 @@ async fn execute_operation_async(
                     run_command(target.handle.as_ref(), command, stdin, &capture_budget).await
                 }
                 Command::Sudo(launch) => {
-                    run_sudo(
+                    run_sudo_with(
                         target.handle.as_ref(),
                         launch,
                         &capture_budget,
-                        |username| crate::sudo::password_for(profile, username),
+                        ProfilePasswords {
+                            profile,
+                            method: PrivilegeMethod::Sudo,
+                            vault_password: sessions.target_vault_password.as_ref(),
+                        },
                     )
                     .await
                 }
                 Command::Su(launch) => {
-                    run_sudo(
+                    run_sudo_with(
                         target.handle.as_ref(),
                         launch,
                         &capture_budget,
-                        |username| crate::su::password_for(profile, username),
+                        ProfilePasswords {
+                            profile,
+                            method: PrivilegeMethod::Su,
+                            vault_password: sessions.target_vault_password.as_ref(),
+                        },
                     )
                     .await
                 }
@@ -1203,6 +1220,11 @@ async fn execute_many_async(
 struct ChainLease {
     hops: Vec<(Arc<PooledSession>, Option<Retention>)>,
     batch_scope: Option<uuid::Uuid>,
+    /// The login password the target's vault admission read for this call,
+    /// so sudo/su answer with it instead of reading the vault again (which
+    /// under "every call" would ask for the master password a second time).
+    /// Lives only as long as the lease, never in the pool.
+    target_vault_password: Option<zeroize::Zeroizing<String>>,
 }
 
 impl ChainLease {
@@ -1240,6 +1262,7 @@ async fn connect_chain(
     let mut sessions = ChainLease {
         hops: Vec::with_capacity(chain.len()),
         batch_scope: limits.batch_scope,
+        target_vault_password: None,
     };
     let mut verified_host_keys = Vec::with_capacity(chain.len());
     let mut auth_key_fingerprints = Vec::with_capacity(chain.len());
@@ -1251,7 +1274,9 @@ async fn connect_chain(
             None
         };
         let parent = sessions.last().cloned();
-        let session = pooled_connection(host, parent.as_ref(), limits, retention).await?;
+        let (session, vault_password) =
+            pooled_connection(host, parent.as_ref(), limits, retention).await?;
+        sessions.target_vault_password = vault_password;
         verified_host_keys.push(session.verified_host_key.clone());
         auth_key_fingerprints.push(session.auth_key_fingerprint.clone());
         sessions.hops.push((session, retention));
@@ -1264,15 +1289,39 @@ async fn pooled_connection(
     parent: Option<&Arc<PooledSession>>,
     limits: OperationLimits,
     retention: Option<Retention>,
-) -> Result<Arc<PooledSession>, RemoteFailure> {
-    let key = SessionKey::new(host, parent.map(|session| &session.key));
+) -> Result<(Arc<PooledSession>, Option<zeroize::Zeroizing<String>>), RemoteFailure> {
+    // A vault-backed host is admitted before the pool is consulted: the item
+    // is read afresh (synced per the configured window), so the key and the
+    // connection use the endpoint and account the vault holds now, and a
+    // retained session is only reused while the vault is still unlocked and
+    // the item unchanged.
+    let mut admission = None;
+    let mut vault_login = None;
+    let mut vault_password = None;
+    let refreshed;
+    let host: &HostProfile = if host.is_vault_host() {
+        let admitted = bitwarden::admit(host).await?;
+        admission = Some(admitted.admission.clone());
+        refreshed = admitted.host.clone();
+        let login = admitted.into_login();
+        // Handed to sudo/su only for the account the call was made for; an
+        // item whose username moved meanwhile goes back to the vault check.
+        if refreshed.username == host.username {
+            vault_password = login.password.clone();
+        }
+        vault_login = Some(login);
+        &refreshed
+    } else {
+        host
+    };
+    let key = SessionKey::new(host, parent.map(|session| &session.key), admission.as_ref());
     if let Some(session) = session_pool().ready(&key, limits.batch_scope, retention)? {
-        return Ok(session);
+        return Ok((session, vault_password));
     }
     let connection_lock = session_pool().connection_lock(&key);
     let _guard = connection_lock.lock().await;
     if let Some(session) = session_pool().ready(&key, limits.batch_scope, retention)? {
-        return Ok(session);
+        return Ok((session, vault_password));
     }
 
     let pool = Arc::clone(session_pool());
@@ -1283,7 +1332,15 @@ async fn pooled_connection(
             .disconnect(Disconnect::ByApplication, "LRU eviction", "")
             .await;
     }
-    let connected = connect_one(host, parent, key.clone(), limits, retention).await;
+    let connected = connect_one(
+        host,
+        parent,
+        key.clone(),
+        limits,
+        retention,
+        vault_login.take(),
+    )
+    .await;
     if let Err(error) = &connected {
         session_pool().block_reconnect(limits.batch_scope, &key);
         if error.code == "JUMP_CHANNEL_FAILED"
@@ -1298,7 +1355,7 @@ async fn pooled_connection(
         pool.record_batch_connection(limits.batch_scope, &session.key);
     }
     drop(reservation);
-    result
+    result.map(|session| (session, vault_password))
 }
 
 async fn connect_one(
@@ -1307,6 +1364,7 @@ async fn connect_one(
     key: SessionKey,
     limits: OperationLimits,
     retention: Option<Retention>,
+    vault_login: Option<bitwarden::VaultLogin>,
 ) -> Result<Arc<PooledSession>, RemoteFailure> {
     // A retained session must survive quiet stretches between calls, so the
     // link is watched with keepalives instead of the first call's command timeout.
@@ -1403,7 +1461,7 @@ async fn connect_one(
         limits.connect_timeout,
         "AUTH_TIMEOUT",
         "SSH authentication timed out.",
-        authenticate(&mut session, host),
+        authenticate(&mut session, host, vault_login),
     )
     .await?;
     let mut chain_ids = parent
@@ -1429,20 +1487,38 @@ async fn connect_one(
 async fn authenticate(
     session: &mut client::Handle<ServerKeyObserver>,
     host: &HostProfile,
+    vault_login: Option<bitwarden::VaultLogin>,
 ) -> Result<Option<String>, RemoteFailure> {
     match host.ssh_auth {
         SshAuth::Password => {
-            let password = credentials::load(host.id, credentials::login_password_kind(host))
-                .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?
-                .ok_or_else(|| {
-                    RemoteFailure::new(
-                        "CREDENTIAL_MISSING",
-                        format!(
-                            "No password is saved for {}; open_host_editor for this alias lets the user add one.",
-                            host.alias
-                        ),
-                    )
-                })?;
+            let password = if host.is_vault_host() {
+                // The admission read the item moments ago; only a missing
+                // password goes back to the vault (which then reports it).
+                match vault_login {
+                    Some(bitwarden::VaultLogin {
+                        password: Some(password),
+                        ..
+                    }) => password,
+                    other => {
+                        bitwarden::resolve_login_password(host, other.map(|login| login.session))
+                            .await?
+                    }
+                }
+            } else {
+                credentials::load(host.id, credentials::login_password_kind(host))
+                    .map_err(|error| {
+                        RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string())
+                    })?
+                    .ok_or_else(|| {
+                        RemoteFailure::new(
+                            "CREDENTIAL_MISSING",
+                            format!(
+                                "No password is saved for {}; open_host_editor for this alias lets the user add one.",
+                                host.alias
+                            ),
+                        )
+                    })?
+            };
             authenticate_password(session, &host.username, password.as_str())
                 .await
                 .map(|()| None)
@@ -1889,15 +1965,84 @@ async fn run_command(
     })
 }
 
+/// Answers the password prompt sudo or su raises inside the channel loop.
+trait PasswordSupplier {
+    async fn password_for(
+        &mut self,
+        username: &str,
+    ) -> Result<zeroize::Zeroizing<String>, RemoteFailure>;
+}
+
+/// The runtime supplier: Credential Manager, or for a vault host the login
+/// password this call's admission already read from its item.
+struct ProfilePasswords<'a> {
+    profile: &'a HostProfile,
+    method: PrivilegeMethod,
+    vault_password: Option<&'a zeroize::Zeroizing<String>>,
+}
+
+#[derive(Clone, Copy)]
+enum PrivilegeMethod {
+    Sudo,
+    Su,
+}
+
+impl PasswordSupplier for ProfilePasswords<'_> {
+    async fn password_for(
+        &mut self,
+        username: &str,
+    ) -> Result<zeroize::Zeroizing<String>, RemoteFailure> {
+        match self.method {
+            PrivilegeMethod::Sudo => {
+                crate::sudo::password_for_async(self.profile, username, self.vault_password).await
+            }
+            PrivilegeMethod::Su => {
+                crate::su::password_for_async(self.profile, username, self.vault_password).await
+            }
+        }
+    }
+}
+
+/// Tests script the prompt answers with a plain closure.
+#[cfg(test)]
+struct ScriptedPasswords<F>(F);
+
+#[cfg(test)]
+impl<F> PasswordSupplier for ScriptedPasswords<F>
+where
+    F: FnMut(&str) -> Result<zeroize::Zeroizing<String>, RemoteFailure>,
+{
+    async fn password_for(
+        &mut self,
+        username: &str,
+    ) -> Result<zeroize::Zeroizing<String>, RemoteFailure> {
+        (self.0)(username)
+    }
+}
+
+#[cfg(test)]
 async fn run_sudo<P, F>(
     session: &client::Handle<ServerKeyObserver>,
-    mut launch: crate::sudo::Launch<P>,
+    launch: crate::sudo::Launch<P>,
     budget: &CaptureBudget,
-    mut password_for: F,
+    password_for: F,
 ) -> Result<CommandResult, RemoteFailure>
 where
     P: crate::sudo::PasswordProtocol,
     F: FnMut(&str) -> Result<zeroize::Zeroizing<String>, RemoteFailure>,
+{
+    run_sudo_with(session, launch, budget, ScriptedPasswords(password_for)).await
+}
+
+async fn run_sudo_with<P, S>(
+    session: &client::Handle<ServerKeyObserver>,
+    mut launch: crate::sudo::Launch<P>,
+    budget: &CaptureBudget,
+    mut passwords: S,
+) -> Result<CommandResult, RemoteFailure>
+where
+    P: crate::sudo::PasswordProtocol,
+    S: PasswordSupplier,
 {
     use crate::sudo::{Frame, Redactor};
     use std::pin::Pin;
@@ -1953,7 +2098,7 @@ where
                             truncated |= append_limited(&mut stderr, &filtered, budget);
                         }
                         Frame::Authenticate(username) if !launch.protocol.ready_seen() => {
-                            let password = password_for(&username)?;
+                            let password = passwords.password_for(&username).await?;
                             crate::sudo::validate_password(&password).map_err(|e| {
                                 RemoteFailure::new(
                                     P::INVALID_PASSWORD,
@@ -2193,7 +2338,7 @@ mod tests {
     fn batch_scope_blocks_reconnect_until_the_batch_finishes() {
         let pool = SessionPool::default();
         let host = HostProfile::default();
-        let key = SessionKey::new(&host, None);
+        let key = SessionKey::new(&host, None, None);
         let scope = uuid::Uuid::new_v4();
         pool.block_reconnect(Some(scope), &key);
         let Err(error) = pool.ready(&key, Some(scope), None) else {
@@ -2207,7 +2352,7 @@ mod tests {
     #[test]
     fn concurrent_requests_for_one_jump_share_the_same_creation_lock() {
         let pool = SessionPool::default();
-        let key = SessionKey::new(&HostProfile::default(), None);
+        let key = SessionKey::new(&HostProfile::default(), None, None);
         let first = pool.connection_lock(&key);
         let second = pool.connection_lock(&key);
         assert!(Arc::ptr_eq(&first, &second));

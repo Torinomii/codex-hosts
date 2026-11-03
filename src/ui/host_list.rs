@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, RichText};
 
-use super::{HostTestState, HostsApp, retain_visible_selection};
+use super::bitwarden::VaultState;
+use super::{EditorSwitch, HostTestState, HostsApp, retain_visible_selection};
 use crate::i18n::Catalog;
 use crate::model::{HostFilter, HostProfile, Protocol, normalize_tags};
 
@@ -23,6 +24,235 @@ const BADGE_HEIGHT: f32 = 14.0;
 const BADGE_PADDING_X: f32 = 4.0;
 /// Badges that would squeeze the alias below this width stay in the hover text only.
 const MIN_ALIAS_WIDTH: f32 = 72.0;
+
+/// Which credential store defines a host; the list keeps the two apart once
+/// Bitwarden is set up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HostGroup {
+    Local,
+    Bitwarden,
+}
+
+impl HostGroup {
+    fn of(host: &HostProfile) -> Self {
+        if host.is_vault_host() {
+            Self::Bitwarden
+        } else {
+            Self::Local
+        }
+    }
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Local => "group_local",
+            Self::Bitwarden => "group_bitwarden",
+        }
+    }
+}
+
+/// Which groups the user folded away.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct GroupFolds {
+    pub(super) local: bool,
+    pub(super) bitwarden: bool,
+}
+
+impl GroupFolds {
+    fn collapsed(self, group: HostGroup) -> bool {
+        match group {
+            HostGroup::Local => self.local,
+            HostGroup::Bitwarden => self.bitwarden,
+        }
+    }
+}
+
+enum ListRow<'a> {
+    Header {
+        group: HostGroup,
+        count: usize,
+        collapsed: bool,
+    },
+    Host(&'a HostProfile),
+    /// A line under an empty Bitwarden section saying why it is empty.
+    Note(&'a str),
+}
+
+/// The rows to draw: a flat list while Bitwarden is not set up and every
+/// host is local, otherwise one header per group with its hosts under it
+/// (none while folded). With Bitwarden set up both headers always appear,
+/// so the two stores are never mixed; an empty Bitwarden section shows
+/// `vault_note` instead of hosts.
+fn group_rows<'a>(
+    hosts: &[&'a HostProfile],
+    folds: GroupFolds,
+    split: bool,
+    vault_note: &'a str,
+) -> Vec<ListRow<'a>> {
+    if !split
+        && hosts
+            .iter()
+            .all(|host| HostGroup::of(host) == HostGroup::Local)
+    {
+        return hosts.iter().map(|host| ListRow::Host(host)).collect();
+    }
+    let mut rows = Vec::with_capacity(hosts.len() + 3);
+    for group in [HostGroup::Local, HostGroup::Bitwarden] {
+        let members: Vec<&HostProfile> = hosts
+            .iter()
+            .copied()
+            .filter(|host| HostGroup::of(host) == group)
+            .collect();
+        if members.is_empty() && !(split && group == HostGroup::Bitwarden) {
+            continue;
+        }
+        let collapsed = folds.collapsed(group);
+        rows.push(ListRow::Header {
+            group,
+            count: members.len(),
+            collapsed,
+        });
+        if collapsed {
+            continue;
+        }
+        if members.is_empty() {
+            rows.push(ListRow::Note(vault_note));
+        } else {
+            rows.extend(members.into_iter().map(ListRow::Host));
+        }
+    }
+    rows
+}
+
+/// What a click on a header row asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderClick {
+    Fold,
+    /// The Bitwarden header's action button.
+    Vault,
+}
+
+/// The one action on the Bitwarden header, worded for the vault's state so
+/// the button says what it will do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum VaultAction {
+    Refresh,
+    Unlock,
+    LogIn,
+    /// A vault job is running; the button waits.
+    Reading,
+}
+
+impl VaultAction {
+    pub(super) fn for_state(state: Option<VaultState>, reading: bool) -> Self {
+        match (reading, state) {
+            (true, _) => Self::Reading,
+            (false, Some(VaultState::SignedOut)) => Self::LogIn,
+            (false, Some(VaultState::Locked)) => Self::Unlock,
+            (false, _) => Self::Refresh,
+        }
+    }
+
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Refresh => "vault_action_refresh",
+            Self::Unlock => "vault_action_unlock",
+            Self::LogIn => "vault_action_login",
+            Self::Reading => "vault_action_reading",
+        }
+    }
+
+    fn hint_key(self) -> &'static str {
+        match self {
+            Self::Refresh => "vault_refresh_hint",
+            Self::Unlock => "vault_unlock_hint",
+            Self::LogIn => "vault_login_hint",
+            Self::Reading => "vault_reading_hint",
+        }
+    }
+}
+
+/// A header row: the fold arrow, label and count at the left; the
+/// Bitwarden group also carries one labelled button at the right
+/// ([`VaultAction`]). Adding hosts goes through "＋ New host" above the list.
+fn group_row(
+    ui: &mut egui::Ui,
+    catalog: &Catalog,
+    group: HostGroup,
+    count: usize,
+    collapsed: bool,
+    row_height: f32,
+    vault_action: VaultAction,
+) -> Option<HeaderClick> {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let fill = ui.visuals().faint_bg_color;
+        ui.painter().rect_filled(rect, 0.0, fill);
+        let text = format!(
+            "{}  {} ({count})",
+            if collapsed { "▸" } else { "▾" },
+            catalog.text(group.label_key())
+        );
+        ui.painter().text(
+            egui::pos2(rect.left() + LIST_INSET, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            text,
+            egui::FontId::proportional(13.0),
+            ui.visuals().strong_text_color(),
+        );
+    }
+    if group == HostGroup::Bitwarden {
+        // A real widget on top of the row, so it gets its own hover and
+        // click and the row folds only when clicked elsewhere.
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect.shrink2(egui::vec2(LIST_INSET, 2.0)))
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        let reading = vault_action == VaultAction::Reading;
+        if child
+            .add_enabled(
+                !reading,
+                egui::Button::new(RichText::new(catalog.text(vault_action.label_key())).small()),
+            )
+            .on_hover_text(catalog.text(vault_action.hint_key()))
+            .on_disabled_hover_text(catalog.text(vault_action.hint_key()))
+            .clicked()
+        {
+            return Some(HeaderClick::Vault);
+        }
+        if reading {
+            child.spinner();
+        }
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+        .then_some(HeaderClick::Fold)
+}
+
+/// The note under an empty Bitwarden section, wrapped to the panel so a
+/// narrow list never cuts it off.
+fn note_row(ui: &mut egui::Ui, text: &str, row_height: f32) {
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Sense::hover(),
+    );
+    if ui.is_rect_visible(rect) {
+        let color = ui.visuals().weak_text_color();
+        let galley = ui.painter().layout(
+            text.to_owned(),
+            egui::FontId::proportional(DETAIL_SIZE),
+            color,
+            rect.width() - 2.0 * LIST_INSET,
+        );
+        let top = rect.center().y - galley.size().y / 2.0;
+        ui.painter()
+            .galley(egui::pos2(rect.left() + LIST_INSET, top), galley, color);
+    }
+}
 
 pub(super) fn host_row_fill(state: Option<HostTestState>, dark_mode: bool) -> Option<Color32> {
     match (state, dark_mode) {
@@ -350,17 +580,36 @@ impl HostsApp {
                 RichText::new(format!(
                     "{} ({})",
                     self.catalog.text("nav_title"),
-                    self.store.hosts.len()
+                    self.visible_host_count()
                 ))
                 .heading(),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(LIST_INSET);
-                if ui
-                    .button(format!("＋ {}", self.catalog.text("new_host")))
-                    .clicked()
-                {
-                    self.new_host();
+                self.host_actions_menu(ui);
+                let label = format!("＋ {}", self.catalog.text("new_host"));
+                if self.store.bitwarden.available() {
+                    // Two stores: the button asks which one the host goes to.
+                    let mut choice = None;
+                    ui.menu_button(label, |ui| {
+                        if ui.button(self.catalog.text("group_local")).clicked() {
+                            choice = Some(HostGroup::Local);
+                            ui.close();
+                        }
+                        if ui
+                            .button(self.catalog.text("new_vault_host"))
+                            .on_hover_text(self.catalog.text("new_vault_host_hint"))
+                            .clicked()
+                        {
+                            choice = Some(HostGroup::Bitwarden);
+                            ui.close();
+                        }
+                    });
+                    if let Some(group) = choice {
+                        self.switch_editor(EditorSwitch::New(group));
+                    }
+                } else if ui.button(label).clicked() {
+                    self.switch_editor(EditorSwitch::New(HostGroup::Local));
                 }
             });
         });
@@ -372,18 +621,30 @@ impl HostsApp {
             &self.host_filter,
             &mut self.batch_selected,
         );
+        let bitwarden_enabled = self.store.bitwarden.enabled;
         let hosts = self
             .store
             .hosts
             .iter()
             .filter(|host| self.host_filter.matches(host))
+            .filter(|host| bitwarden_enabled || !host.is_vault_host())
             .collect::<Vec<_>>();
-        if hosts.is_empty() {
+        let split = self.store.bitwarden.available();
+        if hosts.is_empty() && !split {
             ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(self.catalog.text("no_matching_hosts")).weak());
             });
         }
+        let vault_note = if self.vault_state == Some(VaultState::SignedOut) {
+            self.catalog.text("vault_section_signed_out").to_owned()
+        } else {
+            self.vault_note
+                .clone()
+                .unwrap_or_else(|| self.catalog.text("vault_section_unloaded").to_owned())
+        };
+        let vault_action = VaultAction::for_state(self.vault_state, self.vault_job_running());
+        let rows = group_rows(&hosts, self.collapsed_groups, split, &vault_note);
         let selected_id = self.selected;
         let batch_mode = self.batch_mode;
         let batch_selected = &self.batch_selected;
@@ -395,6 +656,8 @@ impl HostsApp {
         let mut deletion_request = None;
         let mut test_request = None;
         let mut batch_toggle_request = None;
+        let mut fold_request = None;
+        let mut vault_request = false;
         let three_lines = hosts
             .iter()
             .any(|host| !host.tags.is_empty() || !host.description.trim().is_empty());
@@ -409,7 +672,9 @@ impl HostsApp {
         if self.scroll_to_selected && viewport > 4000.0 {
             ui.ctx().request_repaint();
         } else if self.scroll_to_selected
-            && let Some(index) = hosts.iter().position(|host| Some(host.id) == selected_id)
+            && let Some(index) = rows
+                .iter()
+                .position(|row| matches!(row, ListRow::Host(host) if Some(host.id) == selected_id))
         {
             // Rows are uniform, so the offset is known without laying the list out first.
             let pitch = row_height + ui.spacing().item_spacing.y;
@@ -417,10 +682,36 @@ impl HostsApp {
             scroll_area = scroll_area.vertical_scroll_offset(offset);
             reveal_offset = Some(offset);
         }
-        let scroll_output = scroll_area.show_rows(ui, row_height, hosts.len(), |ui, row_range| {
+        let scroll_output = scroll_area.show_rows(ui, row_height, rows.len(), |ui, row_range| {
             ui.set_width(ui.available_width());
             for row in row_range {
-                let host = &hosts[row];
+                let host = match &rows[row] {
+                    ListRow::Header {
+                        group,
+                        count,
+                        collapsed,
+                    } => {
+                        match group_row(
+                            ui,
+                            &self.catalog,
+                            *group,
+                            *count,
+                            *collapsed,
+                            row_height,
+                            vault_action,
+                        ) {
+                            Some(HeaderClick::Fold) => fold_request = Some(*group),
+                            Some(HeaderClick::Vault) => vault_request = true,
+                            None => {}
+                        }
+                        continue;
+                    }
+                    ListRow::Note(text) => {
+                        note_row(ui, text, row_height);
+                        continue;
+                    }
+                    ListRow::Host(host) => *host,
+                };
                 let id = host.id;
                 let model = HostRowModel::from_profile(
                     host,
@@ -477,6 +768,21 @@ impl HostsApp {
             }
         }
 
+        if let Some(group) = fold_request {
+            match group {
+                HostGroup::Local => self.collapsed_groups.local = !self.collapsed_groups.local,
+                HostGroup::Bitwarden => {
+                    self.collapsed_groups.bitwarden = !self.collapsed_groups.bitwarden
+                }
+            }
+        }
+        if vault_request {
+            match vault_action {
+                VaultAction::LogIn => self.open_bitwarden_page(),
+                VaultAction::Refresh | VaultAction::Unlock => self.refresh_vault_hosts(),
+                VaultAction::Reading => {}
+            }
+        }
         if let Some((id, checked)) = batch_toggle_request {
             if checked {
                 self.batch_selected.insert(id);
@@ -484,16 +790,11 @@ impl HostsApp {
                 self.batch_selected.remove(&id);
             }
         } else if let Some(id) = deletion_request {
-            self.select(id);
-            self.delete_prompt = true;
+            self.switch_editor(EditorSwitch::Delete(id));
         } else if let Some(id) = test_request {
-            // Right-clicking already selected the row; test it like the editor's own button.
-            if self.selected != Some(id) {
-                self.select(id);
-            }
-            self.start_test();
+            self.switch_editor(EditorSwitch::Test(id));
         } else if let Some(id) = selection_request {
-            self.select(id);
+            self.switch_editor(EditorSwitch::Select(id));
         }
     }
 
@@ -673,6 +974,205 @@ mod tests {
         assert_eq!(row_badges(&host), [RowBadge::CodexHidden]);
     }
 
+    fn bitwarden_host(alias: &str) -> HostProfile {
+        let mut host = HostProfile {
+            alias: alias.into(),
+            address: "vault.example.com".into(),
+            username: "deploy".into(),
+            ..HostProfile::default()
+        };
+        host.vault = Some(crate::model::VaultHostRef {
+            item_id: host.id,
+            item_name: alias.into(),
+            revision_date: String::new(),
+        });
+        host
+    }
+
+    fn group_header(app: &HostsApp, group: HostGroup, count: usize, collapsed: bool) -> String {
+        format!(
+            "{}  {} ({count})",
+            if collapsed { "▸" } else { "▾" },
+            app.catalog.text(group.label_key())
+        )
+    }
+
+    #[test]
+    fn a_configured_account_splits_the_list_even_without_vault_hosts() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            super::super::theme::configure_fonts(&context, locale);
+            let mut app = metadata_test_app(&context, locale, all_badges_profile());
+            app.store.bitwarden.cli_path = Some(std::path::PathBuf::from("C:/bw/bw.exe"));
+            app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+            let mut output = list_frame(&mut app, &context, 340.0, vec![]);
+            for _ in 0..2 {
+                output = list_frame(&mut app, &context, 340.0, vec![]);
+            }
+            let local = find_text_rect(
+                &output.shapes,
+                &group_header(&app, HostGroup::Local, 1, false),
+            )
+            .unwrap_or_else(|| panic!("{locale}: local group header"));
+            let vault = find_text_rect(
+                &output.shapes,
+                &group_header(&app, HostGroup::Bitwarden, 0, false),
+            )
+            .unwrap_or_else(|| panic!("{locale}: empty Bitwarden group header"));
+            assert!(local.bottom() <= vault.top(), "{locale}: local first");
+            assert!(
+                find_text_rect(&output.shapes, app.catalog.text("vault_section_unloaded"))
+                    .is_some(),
+                "{locale}: the empty section says why"
+            );
+            assert!(
+                find_text_rect(&output.shapes, app.catalog.text("vault_action_refresh")).is_some(),
+                "{locale}: the Bitwarden header says what its button does"
+            );
+            assert!(
+                find_text_rect(&output.shapes, "↻").is_none()
+                    && find_text_rect(&output.shapes, "＋").is_none(),
+                "{locale}: no bare glyph buttons on the headers"
+            );
+
+            // Switching Bitwarden off removes the split again.
+            app.store.bitwarden.enabled = false;
+            let output = list_frame(&mut app, &context, 340.0, vec![]);
+            assert!(
+                find_text_rect(
+                    &output.shapes,
+                    &group_header(&app, HostGroup::Bitwarden, 0, false)
+                )
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn the_bitwarden_header_says_what_its_button_does_and_notes_fit() {
+        assert_eq!(VaultAction::for_state(None, false), VaultAction::Refresh);
+        assert_eq!(
+            VaultAction::for_state(Some(VaultState::Unlocked), false),
+            VaultAction::Refresh
+        );
+        assert_eq!(
+            VaultAction::for_state(Some(VaultState::Locked), false),
+            VaultAction::Unlock
+        );
+        assert_eq!(
+            VaultAction::for_state(Some(VaultState::SignedOut), false),
+            VaultAction::LogIn
+        );
+        assert_eq!(
+            VaultAction::for_state(Some(VaultState::Locked), true),
+            VaultAction::Reading
+        );
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            super::super::theme::configure_fonts(&context, locale);
+            let mut app = metadata_test_app(&context, locale, all_badges_profile());
+            app.store.bitwarden.cli_path = Some(std::path::PathBuf::from("C:/bw/bw.exe"));
+            app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+            for (state, note, action) in [
+                (
+                    VaultState::Locked,
+                    "vault_section_locked",
+                    "vault_action_unlock",
+                ),
+                (
+                    VaultState::SignedOut,
+                    "vault_section_signed_out",
+                    "vault_action_login",
+                ),
+                (
+                    VaultState::Unlocked,
+                    "vault_section_empty",
+                    "vault_action_refresh",
+                ),
+            ] {
+                app.vault_state = Some(state);
+                app.vault_note = Some(app.catalog.text(note).to_owned());
+                let mut output = list_frame(&mut app, &context, 300.0, vec![]);
+                for _ in 0..2 {
+                    output = list_frame(&mut app, &context, 300.0, vec![]);
+                }
+                let button = find_text_rect(&output.shapes, app.catalog.text(action))
+                    .unwrap_or_else(|| panic!("{locale}: {state:?} header button"));
+                assert!(button.right() <= 300.0, "{locale}: {state:?} button fits");
+                let note = find_text_rect(&output.shapes, app.catalog.text(note))
+                    .unwrap_or_else(|| panic!("{locale}: {state:?} note"));
+                assert!(
+                    note.left() >= LIST_INSET && note.right() <= 300.0 - LIST_INSET + 1.0,
+                    "{locale}: {state:?} note wraps inside the panel: {note:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hosts_group_by_credential_source_and_groups_fold_or_vanish() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            super::super::theme::configure_fonts(&context, locale);
+            let mut app = metadata_test_app(&context, locale, all_badges_profile());
+            app.store.hosts.push(bitwarden_host("vaulted"));
+            let mut output = list_frame(&mut app, &context, 340.0, vec![]);
+            for _ in 0..2 {
+                output = list_frame(&mut app, &context, 340.0, vec![]);
+            }
+            let local = find_text_rect(
+                &output.shapes,
+                &group_header(&app, HostGroup::Local, 1, false),
+            )
+            .unwrap_or_else(|| panic!("{locale}: local group header"));
+            let vault = find_text_rect(
+                &output.shapes,
+                &group_header(&app, HostGroup::Bitwarden, 1, false),
+            )
+            .unwrap_or_else(|| panic!("{locale}: Bitwarden group header"));
+            assert!(
+                local.bottom() <= vault.top(),
+                "{locale}: the local group comes first"
+            );
+            assert!(find_text_rect(&output.shapes, "vaulted").is_some());
+
+            // Clicking the Bitwarden header folds its hosts away.
+            list_frame(
+                &mut app,
+                &context,
+                340.0,
+                click(vault.center(), egui::PointerButton::Primary),
+            );
+            let output = list_frame(&mut app, &context, 340.0, vec![]);
+            assert!(app.collapsed_groups.bitwarden, "{locale}: fold state");
+            assert!(
+                find_text_rect(
+                    &output.shapes,
+                    &group_header(&app, HostGroup::Bitwarden, 1, true)
+                )
+                .is_some(),
+                "{locale}: folded header"
+            );
+            assert!(
+                find_text_rect(&output.shapes, "vaulted").is_none(),
+                "{locale}: folded host"
+            );
+
+            // Switching Bitwarden off hides the group and leaves a flat list.
+            app.store.bitwarden.enabled = false;
+            let output = list_frame(&mut app, &context, 340.0, vec![]);
+            assert!(
+                find_text_rect(
+                    &output.shapes,
+                    &group_header(&app, HostGroup::Local, 1, false)
+                )
+                .is_none()
+            );
+            assert!(find_text_rect(&output.shapes, "vaulted").is_none());
+            assert!(find_text_rect(&output.shapes, "example").is_some());
+        }
+    }
+
     #[test]
     fn badges_sit_after_the_alias_inside_the_row_in_every_locale() {
         for locale in ["en", "zh-CN", "zh-TW", "ja"] {
@@ -764,6 +1264,7 @@ mod tests {
         ) {
             return;
         }
+        let _guard = crate::credentials::test_lock();
         let context = egui::Context::default();
         super::super::theme::configure_fonts(&context, "en");
         let other = HostProfile::new("other".into());

@@ -14,6 +14,7 @@ use serde::Serialize;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+mod bitwarden;
 mod dialogs;
 mod host_form;
 mod host_list;
@@ -21,8 +22,10 @@ mod status;
 pub(crate) mod theme;
 mod toolbar;
 
-pub(crate) use theme::configure_fonts;
+pub(crate) use theme::{configure_fonts, forget_password_history};
 
+use bitwarden::{VaultTask, VaultWrite};
+use codex_hosts_bw::FieldEdit;
 use status::{StatusKind, StatusMessage};
 use theme::apply_style;
 
@@ -32,7 +35,8 @@ use crate::fido::{self, FidoKeyInfo};
 use crate::i18n::Catalog;
 use crate::import;
 use crate::model::{
-    AuthPersistence, HostFilter, HostProfile, Prefill, Protocol, SshAuth, normalize_tags,
+    AuthPersistence, HostFilter, HostProfile, Prefill, Protocol, SshAuth, VaultHostRef,
+    normalize_tags,
 };
 use crate::ssh::{
     OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE, VerifiedHostKey,
@@ -77,6 +81,11 @@ struct HostEditor {
     /// The persistence value the user confirmed in the change dialog; a
     /// different value in the form asks again.
     confirmed_persistence: Option<AuthPersistence>,
+    /// A host that is not in the store yet: the first save adds it (and,
+    /// for a vault host, creates the item, whose id the profile then takes).
+    draft: bool,
+    /// A vault save is running; the form waits for the item write.
+    saving: bool,
 }
 
 /// The action that was waiting on the persistence-change confirmation.
@@ -85,6 +94,50 @@ enum PendingAction {
     Save,
     Test,
     TestAll,
+}
+
+/// The item write that changes only the tags of a vault host, built from
+/// the stored mirror so nothing else in the form leaks into it.
+fn tags_write(stored: &HostProfile, tags: &[String]) -> VaultWrite {
+    let scheme = match stored.protocol {
+        Protocol::Ssh => codex_hosts_bw::UriScheme::Ssh,
+        Protocol::Telnet => codex_hosts_bw::UriScheme::Telnet,
+    };
+    let uri = codex_hosts_bw::HostUri {
+        scheme,
+        username: None,
+        host: stored.address.trim().to_owned(),
+        port: Some(stored.port),
+    };
+    VaultWrite {
+        item_id: Some(stored.id),
+        name: stored.alias.clone(),
+        host_uri: uri.to_string(),
+        username: stored.username.clone(),
+        password: FieldEdit::Keep,
+        description: stored.description.clone(),
+        tags: normalize_tags(tags),
+        expected_revision: stored
+            .vault
+            .as_ref()
+            .map(|vault| vault.revision_date.clone())
+            .unwrap_or_default(),
+    }
+}
+
+/// Everything a validated save writes, computed before anything is written
+/// so a vault-backed host can write its item first and the store after.
+struct SavePlan {
+    id: Uuid,
+    profile: HostProfile,
+    credential_update: Option<(CredentialKind, Zeroizing<String>)>,
+    sudo_updates: Vec<credentials::CredentialUpdate>,
+    store_password: bool,
+    store_key_passphrase: bool,
+    clear_login_password: bool,
+    invalidate_test_state: bool,
+    /// A vault draft: the profile is added to the store instead of replaced.
+    is_new: bool,
 }
 
 #[derive(Default)]
@@ -128,7 +181,10 @@ enum PasswordMode {
 
 impl HostEditor {
     fn load(profile: HostProfile) -> Self {
-        let (saved_password_mode, password_read_error) =
+        let (saved_password_mode, password_read_error) = if profile.is_vault_host() {
+            // The item holds the password; the form only offers to replace it.
+            (Some(PasswordMode::Password), None)
+        } else {
             match credentials::load(profile.id, credentials::login_password_kind(&profile)) {
                 Ok(Some(password)) => (
                     Some(if password.is_empty() {
@@ -140,7 +196,8 @@ impl HostEditor {
                 ),
                 Ok(None) => (None, None),
                 Err(error) => (None, Some(error.to_string())),
-            };
+            }
+        };
         let (has_key_passphrase, key_passphrase_read_error) =
             match credentials::has(profile.id, CredentialKind::KeyPassphrase) {
                 Ok(has_key_passphrase) => (has_key_passphrase, None),
@@ -162,6 +219,8 @@ impl HostEditor {
             focus_first_missing: false,
             first_save: false,
             confirmed_persistence: None,
+            draft: false,
+            saving: false,
         }
     }
 
@@ -169,10 +228,8 @@ impl HostEditor {
     /// for SSH hosts; the stored draft (and every profile the store loads or
     /// imports) stays per-call until the user confirms the choice on save.
     fn fresh(profile: HostProfile) -> Self {
-        let mut editor = Self {
-            first_save: true,
-            ..Self::load(profile)
-        };
+        let mut editor = Self::load(profile);
+        editor.first_save = true;
         if editor.profile.protocol == Protocol::Ssh {
             editor.profile.auth_persistence = AuthPersistence::Session;
         }
@@ -241,6 +298,7 @@ impl HostEditor {
                 .any(|password| !password.is_empty())
             || !self.sudo.cleared.is_empty()
             || self.password_mode != self.saved_password_mode.unwrap_or(PasswordMode::Password)
+            || self.draft
     }
 
     fn matches_stored_original(&self, store: &HostStore) -> bool {
@@ -249,6 +307,67 @@ impl HostEditor {
 
     fn needs_password(&self) -> bool {
         self.profile.protocol == Protocol::Telnet || self.profile.ssh_auth == SshAuth::Password
+    }
+
+    /// The host is defined by a Bitwarden item: the password and the
+    /// connection facts go to the item, never to Credential Manager.
+    fn is_vault_host(&self) -> bool {
+        self.profile.is_vault_host()
+    }
+
+    /// What the vault item should hold after this save.
+    fn vault_write(&self) -> VaultWrite {
+        let profile = &self.profile;
+        let scheme = match profile.protocol {
+            Protocol::Ssh => codex_hosts_bw::UriScheme::Ssh,
+            Protocol::Telnet => codex_hosts_bw::UriScheme::Telnet,
+        };
+        let uri = codex_hosts_bw::HostUri {
+            scheme,
+            username: None,
+            host: profile.address.trim().to_owned(),
+            port: Some(profile.port),
+        };
+        // Key and Agent logins leave the item password alone.
+        let password = if !self.needs_password() {
+            FieldEdit::Keep
+        } else {
+            match self.password_mode {
+                PasswordMode::Password if !self.password.is_empty() => {
+                    FieldEdit::Set(self.password.clone())
+                }
+                PasswordMode::Password => FieldEdit::Keep,
+                PasswordMode::NoPassword => FieldEdit::Clear,
+            }
+        };
+        VaultWrite {
+            item_id: (!self.draft).then_some(profile.id),
+            name: profile.alias.trim().to_owned(),
+            host_uri: uri.to_string(),
+            username: profile.username.trim().to_owned(),
+            password,
+            description: profile.description.trim().to_owned(),
+            tags: normalize_tags(profile.tags.iter().chain(std::iter::once(&self.tag_input))),
+            expected_revision: (!self.draft)
+                .then(|| {
+                    profile
+                        .vault
+                        .as_ref()
+                        .map(|vault| vault.revision_date.clone())
+                })
+                .flatten()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The write to retry after an unlock: the current form when it still
+    /// edits the same item, else the kept write.
+    pub(super) fn vault_write_or(&self, fallback: VaultWrite) -> VaultWrite {
+        if self.is_vault_host() && (self.draft == fallback.item_id.is_none()) {
+            self.vault_write()
+        } else {
+            fallback
+        }
     }
 
     fn login_user_changed(&self) -> bool {
@@ -265,11 +384,11 @@ impl HostEditor {
     fn should_clear_login_password(&self) -> bool {
         // A key/Agent login must not retain the previous account's password
         // for a later password login or sudo fallback under the new username.
-        self.login_user_changed() && !self.needs_password()
+        !self.is_vault_host() && self.login_user_changed() && !self.needs_password()
     }
 
     fn should_store_password(&self) -> bool {
-        if !self.needs_password() {
+        if !self.needs_password() || self.is_vault_host() {
             return false;
         }
         match self.password_mode {
@@ -288,6 +407,12 @@ impl HostEditor {
     }
 
     fn password_value_missing(&self) -> bool {
+        if self.is_vault_host() {
+            // An existing item keeps its password; a new one needs one.
+            return self.draft
+                && self.password_mode == PasswordMode::Password
+                && self.password.is_empty();
+        }
         self.needs_password()
             && self.password_mode == PasswordMode::Password
             && self.password.is_empty()
@@ -299,6 +424,8 @@ impl HostEditor {
         self.connection_changed()
             || self.should_store_password()
             || self.should_store_key_passphrase()
+            || self.profile.vault != self.original.vault
+            || (self.is_vault_host() && !self.password.is_empty())
     }
 
     fn sudo_updates(&self) -> Result<Vec<credentials::CredentialUpdate>, &'static str> {
@@ -418,6 +545,23 @@ enum EditorAction {
     BrowsePrivateKey,
     DiscoverFido,
     OpenFidoSetup,
+    /// Closes a new host that was never saved.
+    DiscardDraft,
+    /// Asks to delete the open host.
+    Delete,
+    /// Drops the unsaved changes to a saved host.
+    Revert,
+}
+
+/// Where the user asked the form to go next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorSwitch {
+    Select(Uuid),
+    /// Select the host, then ask to delete it.
+    Delete(Uuid),
+    /// Select the host, then test it.
+    Test(Uuid),
+    New(host_list::HostGroup),
 }
 
 struct FidoSetupPrompt {
@@ -470,6 +614,34 @@ pub struct HostsApp {
     launch: LaunchOptions,
     callback_written: bool,
     pending_callback: Option<PendingCallback>,
+    /// The credential-manager dialog, while open.
+    credential_manager: Option<bitwarden::CredentialManager>,
+    /// The master-password prompt a tool call or a window task is waiting on.
+    unlock_prompt: Option<bitwarden::UnlockPrompt>,
+    /// The unlock an SSH call approval asked for along with the call.
+    approval_unlock: Option<bitwarden::ApprovalUnlock>,
+    /// The vault job the window runs for its hosts (refresh, save, delete).
+    vault_job: Option<bitwarden::VaultJob>,
+    /// The store side of a vault save, written once the item write lands.
+    pending_vault_save: Option<SavePlan>,
+    /// The session the window unlocked, reused by its own vault jobs.
+    vault_session: Option<codex_hosts_bw::SessionKey>,
+    /// How the vault was last seen (`None` until known), for the toolbar's
+    /// status.
+    vault_state: Option<bitwarden::VaultState>,
+    /// The confirmation shown once the Bitwarden setup finished.
+    bitwarden_setup_done: Option<bitwarden::SetupDone>,
+    /// Where the form was asked to go while it held unsaved changes; the
+    /// unsaved-changes dialog asks before it goes.
+    pending_switch: Option<EditorSwitch>,
+    /// When the window last checked the idle policy.
+    vault_policy_checked: Option<Instant>,
+    /// Why the Bitwarden section is empty, once known.
+    vault_note: Option<String>,
+    /// Folder items that are not served as hosts, from the last refresh.
+    vault_problems: Vec<(String, crate::bitwarden::hosts::ItemProblem)>,
+    /// Host-list groups the user folded away.
+    collapsed_groups: host_list::GroupFolds,
 }
 
 impl HostsApp {
@@ -603,7 +775,7 @@ impl HostsApp {
             crate::tray::Tray::new(context.egui_ctx.clone(), catalog.clone()).ok()
         };
         let tray_available = tray.is_some();
-        Ok(Self {
+        let mut app = Self {
             temporary,
             tray,
             exiting: false,
@@ -638,7 +810,82 @@ impl HostsApp {
             launch,
             callback_written: false,
             pending_callback: None,
-        })
+            credential_manager: None,
+            unlock_prompt: None,
+            approval_unlock: None,
+            vault_job: None,
+            pending_vault_save: None,
+            vault_session: None,
+            vault_state: None,
+            bitwarden_setup_done: None,
+            pending_switch: None,
+            vault_policy_checked: None,
+            vault_note: None,
+            vault_problems: Vec::new(),
+            collapsed_groups: host_list::GroupFolds::default(),
+        };
+        app.clear_stale_window_sessions();
+        app.refresh_vault_hosts_quietly();
+        Ok(app)
+    }
+
+    /// Hosts the list can show: vault hosts are hidden while Bitwarden is
+    /// switched off.
+    fn visible_host_count(&self) -> usize {
+        let vault_shown = self.store.bitwarden.enabled;
+        self.store
+            .hosts
+            .iter()
+            .filter(|host| vault_shown || !host.is_vault_host())
+            .count()
+    }
+
+    /// Moves the form where the user asked, asking first when that would
+    /// drop unsaved changes to the open host.
+    fn switch_editor(&mut self, next: EditorSwitch) {
+        let leaves = match next {
+            EditorSwitch::Select(id) | EditorSwitch::Test(id) => self.selected != Some(id),
+            // Deleting the open host drops its edits anyway.
+            EditorSwitch::Delete(id) => self.selected != Some(id),
+            EditorSwitch::New(_) => true,
+        };
+        if leaves
+            && self
+                .editor
+                .as_ref()
+                .is_some_and(HostEditor::has_unsaved_changes)
+        {
+            self.pending_switch = Some(next);
+            return;
+        }
+        self.apply_switch(next);
+    }
+
+    fn apply_switch(&mut self, next: EditorSwitch) {
+        match next {
+            // The open host keeps its form; reverting is its own button.
+            EditorSwitch::Select(id) => {
+                if self.selected != Some(id) {
+                    self.select(id);
+                }
+            }
+            EditorSwitch::Delete(id) => {
+                if self.selected != Some(id) {
+                    self.select(id);
+                }
+                self.delete_prompt = true;
+            }
+            EditorSwitch::Test(id) => {
+                // Right-clicking the open host keeps its form; test it like
+                // the editor's own button.
+                if self.selected != Some(id) {
+                    self.select(id);
+                }
+                self.start_test();
+            }
+            EditorSwitch::New(host_list::HostGroup::Local) => self.new_host(),
+            EditorSwitch::New(host_list::HostGroup::Bitwarden) => self.new_vault_host(),
+        }
     }
 
     fn select(&mut self, id: Uuid) {
@@ -658,6 +905,10 @@ impl HostsApp {
         if self.store.same_revision(&fresh) {
             return Ok(());
         }
+        let kept_edits = self
+            .editor
+            .as_ref()
+            .is_some_and(HostEditor::has_unsaved_changes);
         reconcile_host_editor(&mut self.editor, &mut self.selected, &fresh);
         self.store = fresh;
         self.batch_selected
@@ -667,34 +918,76 @@ impl HostsApp {
         self.delete_prompt = false;
         self.persistence_prompt = None;
         self.batch_delete_prompt = false;
-        self.set_status_key("hosts_refreshed");
+        // Only worth saying when the form kept edits over the new data.
+        if kept_edits {
+            self.set_status_key("hosts_refreshed");
+        }
         Ok(())
     }
 
+    /// Opens the form on a new local host; nothing is stored until Save.
     fn new_host(&mut self) {
-        let profile = HostProfile::new(self.store.next_neutral_alias());
-        let id = profile.id;
-        self.store.hosts.push(profile.clone());
-        if let Err(error) = self.store.save() {
-            self.store.hosts.retain(|host| host.id != id);
-            self.set_status_format("storage_error", &[("error", &error.to_string())]);
-            return;
-        }
-        self.selected = Some(id);
-        self.editor = Some(HostEditor::fresh(profile));
-        self.scroll_to_selected = true;
+        let mut editor = HostEditor::fresh(HostProfile::new(String::new()));
+        editor.draft = true;
+        self.selected = None;
+        self.editor = Some(editor);
+        self.collapsed_groups.local = false;
     }
 
-    fn persist_editor(&mut self) -> Result<(), String> {
+    /// Opens the form on a new host of the Bitwarden folder; the first save
+    /// creates the item.
+    pub(super) fn new_vault_host(&mut self) {
+        if !self.store.bitwarden.available() {
+            self.set_status_key("bw_not_configured");
+            return;
+        }
+        let mut profile = HostProfile::new(String::new());
+        profile.ssh_auth = SshAuth::Password;
+        profile.vault = Some(VaultHostRef {
+            item_id: profile.id,
+            item_name: String::new(),
+            revision_date: String::new(),
+        });
+        let mut editor = HostEditor::fresh(profile);
+        editor.draft = true;
+        editor.saved_password_mode = None;
+        self.selected = None;
+        self.editor = Some(editor);
+        self.collapsed_groups.bitwarden = false;
+    }
+
+    /// Reloads the open saved host from the store, dropping its edits.
+    fn revert_editor(&mut self) {
+        if let Some(id) = self.selected
+            && self.editor.as_ref().is_some_and(|editor| !editor.draft)
+        {
+            self.select(id);
+        }
+    }
+
+    /// Closes an unsaved new host; the store never saw it.
+    fn discard_draft(&mut self) {
+        if self.editor.as_ref().is_some_and(|editor| editor.draft) {
+            self.editor = None;
+            self.selected = None;
+            self.set_status_key("status_ready");
+        }
+    }
+
+    /// Validates the form and works out what a save writes, without writing.
+    fn plan_editor_save(&mut self) -> Result<SavePlan, String> {
         self.refresh_hosts()?;
         if self
             .editor
             .as_ref()
-            .is_some_and(|editor| !editor.matches_stored_original(&self.store))
+            .is_some_and(|editor| !editor.draft && !editor.matches_stored_original(&self.store))
         {
             return Err(self.catalog.text("host_changed").to_owned());
         }
         let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
+        if editor.saving {
+            return Err(self.catalog.text("vault_saving").to_owned());
+        }
         let missing = editor.missing_required_fields();
         if !missing.is_empty() {
             editor.show_required = true;
@@ -731,7 +1024,10 @@ impl HostsApp {
         let old_password_kind = credentials::login_password_kind(&editor.original);
         // Never reuse a host-wide slot for a new login identity, even when
         // switching to key/Agent auth without saving a password yet.
-        if editor.login_user_changed() || (store_password && profile.login_password_id.is_none()) {
+        if !editor.is_vault_host()
+            && (editor.login_user_changed()
+                || (store_password && profile.login_password_id.is_none()))
+        {
             profile.login_password_id = Some(Uuid::new_v4());
         }
         let password_kind = credentials::login_password_kind(&profile);
@@ -751,10 +1047,9 @@ impl HostsApp {
         let (sudo_settings, mut sudo_updates) = editor
             .sudo_changes()
             .map_err(|key| self.catalog.text(key).to_owned())?;
-        if clear_login_password || password_kind != old_password_kind {
+        if clear_login_password || (!editor.is_vault_host() && password_kind != old_password_kind) {
             sudo_updates.push((old_password_kind, None));
         }
-        let id = editor.profile.id;
         profile.advanced.sudo = sudo_settings;
         profile.tags = normalize_tags(
             profile
@@ -799,14 +1094,65 @@ impl HostsApp {
             profile.host_key_first_seen_unix = None;
             profile.host_key_last_verified_unix = None;
         }
+        Ok(SavePlan {
+            id: editor.profile.id,
+            profile,
+            credential_update,
+            sudo_updates,
+            store_password,
+            store_key_passphrase,
+            clear_login_password,
+            invalidate_test_state,
+            is_new: editor.draft,
+        })
+    }
 
+    /// Saves the form. A vault-backed host is written to its Bitwarden item
+    /// first, on a worker; `Ok(false)` means that write is still running and
+    /// the store is updated when it finishes.
+    fn persist_editor(&mut self) -> Result<bool, String> {
+        let plan = self.plan_editor_save()?;
+        let vault_host = self.editor.as_ref().is_some_and(HostEditor::is_vault_host);
+        if vault_host {
+            if self.vault_job_running() {
+                return Err(self.catalog.text("busy").to_owned());
+            }
+            let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
+            editor.saving = true;
+            let write = editor.vault_write();
+            self.pending_vault_save = Some(plan);
+            self.start_vault_task(VaultTask::Save(write));
+            return Ok(false);
+        }
+        self.commit_editor_save(plan)?;
+        Ok(true)
+    }
+
+    /// Writes the planned save into the store and Credential Manager.
+    fn commit_editor_save(&mut self, plan: SavePlan) -> Result<(), String> {
+        let SavePlan {
+            id,
+            profile,
+            credential_update,
+            mut sudo_updates,
+            store_password,
+            store_key_passphrase,
+            clear_login_password,
+            invalidate_test_state,
+            is_new,
+        } = plan;
         let mut updated_store = self.store.clone();
-        let stored = updated_store
-            .hosts
-            .iter_mut()
-            .find(|host| host.id == id)
-            .ok_or_else(|| "HOST_NOT_FOUND".to_owned())?;
-        stored.clone_from(&profile);
+        if is_new {
+            updated_store.hosts.push(profile.clone());
+        } else {
+            let stored = updated_store
+                .hosts
+                .iter_mut()
+                .find(|host| host.id == id)
+                .ok_or_else(|| "HOST_NOT_FOUND".to_owned())?;
+            stored.clone_from(&profile);
+        }
+        let id = profile.id;
 
         if !sudo_updates.is_empty() {
             if let Some((kind, secret)) = &credential_update {
@@ -874,6 +1220,8 @@ impl HostsApp {
         editor.first_save = false;
         editor.confirmed_persistence = None;
         editor.tag_input.clear();
+        editor.draft = false;
+        editor.saving = false;
         if store_password {
             editor.saved_password_mode = Some(editor.password_mode);
             editor.password_read_error = None;
@@ -884,12 +1232,112 @@ impl HostsApp {
             editor.password_read_error = None;
             editor.password.clear();
         }
+        if editor.is_vault_host() {
+            editor.saved_password_mode = Some(editor.password_mode);
+            editor.password.clear();
+        }
         if store_key_passphrase {
             editor.has_key_passphrase = true;
             editor.key_passphrase_read_error = None;
             editor.key_passphrase.clear();
         }
+        if is_new {
+            self.selected = Some(id);
+            self.scroll_to_selected = true;
+        }
         Ok(())
+    }
+
+    /// The item write finished: the store takes the host as the item now
+    /// describes it, plus the local settings from the form.
+    pub(super) fn finish_vault_save(
+        &mut self,
+        item_id: Uuid,
+        facts: &crate::bitwarden::hosts::HostFacts,
+    ) {
+        let Some(mut plan) = self.pending_vault_save.take() else {
+            // No form save pending: a tag write. The stored mirror takes
+            // what the item says now.
+            if let Some(stored) = self.store.hosts.iter_mut().find(|host| host.id == item_id) {
+                crate::bitwarden::hosts::apply(facts, item_id, stored);
+                let stored = stored.clone();
+                match self.store.save() {
+                    Ok(()) => {
+                        if let Some(editor) = self
+                            .editor
+                            .as_mut()
+                            .filter(|editor| editor.profile.id == item_id)
+                        {
+                            editor.original.tags = stored.tags.clone();
+                            editor.original.vault = stored.vault.clone();
+                            editor.profile.vault = stored.vault.clone();
+                        }
+                        self.set_status_key("status_tags_saved");
+                    }
+                    Err(error) => {
+                        self.set_status_format("storage_error", &[("error", &error.to_string())])
+                    }
+                }
+            }
+            return;
+        };
+        if plan.is_new {
+            plan.profile.id = item_id;
+            plan.profile.login_password_id = None;
+        }
+        crate::bitwarden::hosts::apply(facts, item_id, &mut plan.profile);
+        let saved_alias = plan.profile.alias.clone();
+        match self.commit_editor_save(plan) {
+            Ok(()) => {
+                self.set_status_key("vault_saved");
+                if self.launch.codex_edit {
+                    match self.write_callback("saved", Some(&saved_alias)) {
+                        Ok(()) => self
+                            .repaint_context
+                            .send_viewport_cmd(egui::ViewportCommand::Close),
+                        Err(error) => {
+                            self.set_status_format("callback_error", &[("error", &error)])
+                        }
+                    }
+                }
+            }
+            Err(error) => self.editor_save_failed(error),
+        }
+    }
+
+    /// A vault save did not happen; the form stays a draft.
+    pub(super) fn editor_save_failed(&mut self, error: String) {
+        self.pending_vault_save = None;
+        if let Some(editor) = self.editor.as_mut() {
+            editor.saving = false;
+        }
+        self.set_status(StatusKind::Error, error);
+    }
+
+    /// The host's item is in the Bitwarden trash: its mirror and local
+    /// secrets go too.
+    pub(super) fn finish_vault_delete(&mut self, item_id: Uuid) {
+        if let Some(profile) = self
+            .store
+            .hosts
+            .iter()
+            .find(|host| host.id == item_id)
+            .cloned()
+        {
+            let _ = credentials::delete_host(&profile);
+        }
+        self.store.hosts.retain(|host| host.id != item_id);
+        if let Err(error) = self.store.save() {
+            self.set_status_format("storage_error", &[("error", &error.to_string())]);
+            return;
+        }
+        if self.selected == Some(item_id) {
+            self.selected = None;
+            self.editor = None;
+        }
+        self.test_states.remove(&item_id);
+        crate::ssh::invalidate_profile(item_id);
+        self.set_status_key("vault_deleted");
     }
 
     /// Writes only the tag list; every other field in the form stays a draft until Save.
@@ -921,8 +1369,31 @@ impl HostsApp {
     }
 
     fn save_tags(&mut self) {
-        // A Codex draft is written only by its Save, so Cancel leaves the store untouched.
-        if self.launch.codex_edit {
+        // A Codex draft and a new host are written only by their Save, so
+        // Cancel or discarding leaves the store untouched.
+        if self.launch.codex_edit || self.editor.as_ref().is_some_and(|editor| editor.draft) {
+            return;
+        }
+        // Tags of a vault host live in its item: the write goes there first
+        // and the store follows when it lands.
+        if let Some(write) = self
+            .editor
+            .as_ref()
+            .filter(|editor| editor.is_vault_host())
+            .and_then(|editor| {
+                self.store
+                    .hosts
+                    .iter()
+                    .find(|host| host.id == editor.profile.id)
+                    .map(|stored| tags_write(stored, &editor.profile.tags))
+            })
+        {
+            if self.vault_job_running() {
+                self.set_status_key("busy");
+                return;
+            }
+            self.start_vault_task(VaultTask::Save(write));
+            self.set_status_key("vault_saving");
             return;
         }
         match self.persist_tags() {
@@ -977,7 +1448,8 @@ impl HostsApp {
             return;
         }
         match self.persist_editor() {
-            Ok(()) => {
+            Ok(false) => self.set_status_key("vault_saving"),
+            Ok(true) => {
                 self.set_status_key("status_saved");
                 if self.launch.codex_edit {
                     let alias = self
@@ -1001,9 +1473,16 @@ impl HostsApp {
         if self.ask_persistence_confirmation(PendingAction::Test) {
             return;
         }
-        if let Err(error) = self.persist_editor() {
-            self.set_status(StatusKind::Error, error);
-            return;
+        match self.persist_editor() {
+            Ok(true) => {}
+            Ok(false) => {
+                self.set_status_key("vault_saving");
+                return;
+            }
+            Err(error) => {
+                self.set_status(StatusKind::Error, error);
+                return;
+            }
         }
         let Some(id) = self.editor.as_ref().map(|editor| editor.profile.id) else {
             return;
@@ -1077,10 +1556,18 @@ impl HostsApp {
                 || editor.should_store_password()
                 || editor.should_store_key_passphrase()
                 || editor.password_value_missing()
-        }) && let Err(error) = self.persist_editor()
-        {
-            self.set_status(StatusKind::Error, error);
-            return;
+        }) {
+            match self.persist_editor() {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.set_status_key("vault_saving");
+                    return;
+                }
+                Err(error) => {
+                    self.set_status(StatusKind::Error, error);
+                    return;
+                }
+            }
         }
         let ids = self
             .store
@@ -1373,6 +1860,17 @@ impl HostsApp {
             .any(|host| host.jump_host == Some(id))
         {
             self.set_status_key("chain_in_use");
+            return;
+        }
+        // A vault-backed host is its item: deleting it moves the item to the
+        // Bitwarden trash first; the mirror goes when that write lands.
+        if self
+            .store
+            .hosts
+            .iter()
+            .any(|host| host.id == id && host.is_vault_host())
+        {
+            self.start_vault_task(VaultTask::Delete(id));
             return;
         }
         let Some(profile) = self.store.hosts.iter().find(|host| host.id == id).cloned() else {
@@ -1818,6 +2316,10 @@ impl eframe::App for HostsApp {
         visuals.panel_fill.to_normalized_gamma_f32()
     }
 
+    fn on_exit(&mut self) {
+        self.forget_window_scoped_session();
+    }
+
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tests();
         let mut restore = false;
@@ -2238,6 +2740,8 @@ mod tests {
             focus_first_missing: false,
             first_save: false,
             confirmed_persistence: None,
+            draft: false,
+            saving: false,
         };
         let mut store = HostStore::default();
         store.hosts.push(profile.clone());
@@ -2276,6 +2780,19 @@ mod tests {
             launch: LaunchOptions::default(),
             callback_written: false,
             pending_callback: None,
+            credential_manager: None,
+            unlock_prompt: None,
+            approval_unlock: None,
+            vault_job: None,
+            pending_vault_save: None,
+            vault_session: None,
+            vault_state: None,
+            bitwarden_setup_done: None,
+            pending_switch: None,
+            vault_policy_checked: None,
+            vault_note: None,
+            vault_problems: Vec::new(),
+            collapsed_groups: host_list::GroupFolds::default(),
         }
     }
 
@@ -2397,14 +2914,28 @@ mod tests {
                 .map(|(_, rect, _)| *rect)
                 .unwrap_or_else(|| panic!("{label}: missing control {key}"))
         };
-        let toolbar_y = find("import_hosts").center().y;
-        for key in ["test_all", "batch_manage", "tray_exit", "language"] {
+        let toolbar_y = find("credential_manager").center().y;
+        for key in ["tray_exit", "language"] {
             let rect = find(key);
             assert!(
                 (rect.center().y - toolbar_y).abs() < 4.0,
                 "{label}: toolbar control {key} wrapped to another row"
             );
         }
+        // The list's own actions sit in a menu beside the list title.
+        let menu = texts
+            .iter()
+            .find(|(text, _, _)| text == "⋯")
+            .map(|(_, rect, _)| *rect)
+            .unwrap_or_else(|| panic!("{label}: missing host actions menu"));
+        assert!(
+            menu.center().y > toolbar_y + 10.0,
+            "{label}: menu below the toolbar"
+        );
+        assert!(
+            menu.right() < size[0] * 0.5,
+            "{label}: menu beside the host list"
+        );
         let save = find("save");
         let test = find("test_connection");
         assert!(
@@ -2416,9 +2947,14 @@ mod tests {
         assert!(status.bottom() <= size[1] && status.top() > save.bottom());
         let list_title = texts
             .iter()
-            .find(|(text, _, _)| text.starts_with(app.catalog.text("nav_title")))
+            .find(|(text, _, _)| text.starts_with(&format!("{} (", app.catalog.text("nav_title"))))
             .expect("host list title");
-        assert!(list_title.1.left() < size[0] * 0.3);
+        assert!(
+            list_title.1.left() < size[0] * 0.3,
+            "{label}: list title {:?} at {:?}",
+            list_title.0,
+            list_title.1
+        );
         assert!(find("section_basic").left() > list_title.1.right());
         // The row for the selected host must be readable in the list.
         assert!(
@@ -2737,6 +3273,8 @@ mod tests {
             focus_first_missing: false,
             first_save: false,
             confirmed_persistence: None,
+            draft: false,
+            saving: false,
         };
         assert!(!editor.test_result_is_stale());
         editor.password.push_str("replacement");
@@ -3018,6 +3556,117 @@ mod tests {
         assert!(!should_hide_to_tray(true, false, false, false, true));
         assert!(!should_hide_to_tray(true, false, true, false, false));
         assert!(!should_hide_to_tray(true, true, false, false, false));
+    }
+
+    fn render_texts(app: &mut HostsApp, context: &egui::Context) -> Vec<String> {
+        let mut texts = Vec::new();
+        for _ in 0..3 {
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 760.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            );
+            texts = painted_texts(&output.shapes)
+                .into_iter()
+                .map(|(text, _, _)| text)
+                .collect();
+        }
+        texts
+    }
+
+    #[test]
+    fn unsaved_edits_ask_before_the_form_moves_elsewhere() {
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let first = HostProfile::new("first".into());
+        let second = HostProfile::new("second".into());
+        let mut app = metadata_test_app(&context, "en", first.clone());
+        app.store.hosts.push(second.clone());
+
+        // Nothing typed: the form just moves.
+        app.switch_editor(EditorSwitch::Select(second.id));
+        assert_eq!(app.selected, Some(second.id));
+        assert!(app.pending_switch.is_none());
+
+        app.switch_editor(EditorSwitch::Select(first.id));
+        app.editor.as_mut().unwrap().profile.description = "typed".into();
+        for next in [
+            EditorSwitch::Select(second.id),
+            EditorSwitch::Test(second.id),
+            EditorSwitch::Delete(second.id),
+            EditorSwitch::New(host_list::HostGroup::Local),
+        ] {
+            app.switch_editor(next);
+            assert_eq!(
+                app.pending_switch,
+                Some(next),
+                "{next:?} waits for a choice"
+            );
+            assert_eq!(app.selected, Some(first.id), "{next:?} keeps the form");
+            assert_eq!(app.editor.as_ref().unwrap().profile.description, "typed");
+            let texts = render_texts(&mut app, &context);
+            assert!(
+                texts
+                    .iter()
+                    .any(|text| text == app.catalog.text("unsaved_switch_message")),
+                "{next:?}: the dialog explains"
+            );
+            app.pending_switch = None;
+        }
+        // Clicking the open host again keeps the form and its edits.
+        app.switch_editor(EditorSwitch::Select(first.id));
+        assert!(app.pending_switch.is_none());
+        assert_eq!(app.editor.as_ref().unwrap().profile.description, "typed");
+
+        // Discarding goes where the user asked.
+        app.switch_editor(EditorSwitch::Select(second.id));
+        let next = app.pending_switch.take().unwrap();
+        app.apply_switch(next);
+        assert_eq!(app.selected, Some(second.id));
+        assert!(!app.editor.as_ref().unwrap().has_unsaved_changes());
+    }
+
+    #[test]
+    fn the_status_bar_counts_hosts_per_store_once_bitwarden_is_set_up() {
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut app = metadata_test_app(&context, "en", HostProfile::new("local".into()));
+        let mut vault = HostProfile::new("vaulted".into());
+        vault.vault = Some(VaultHostRef {
+            item_id: vault.id,
+            item_name: "vaulted".into(),
+            revision_date: String::new(),
+        });
+        app.store.hosts.push(vault);
+        let texts = render_texts(&mut app, &context);
+        assert!(
+            texts.contains(&app.catalog.format("host_count", &[("count", "2")])),
+            "{texts:?}"
+        );
+
+        app.store.bitwarden.cli_path = Some(PathBuf::from("C:/bw/bw.exe"));
+        app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+        let texts = render_texts(&mut app, &context);
+        assert!(
+            texts.contains(
+                &app.catalog
+                    .format("host_count_split", &[("local", "1"), ("vault", "1")])
+            ),
+            "{texts:?}"
+        );
+
+        // Switched off, the vault hosts are hidden and not counted.
+        app.store.bitwarden.enabled = false;
+        let texts = render_texts(&mut app, &context);
+        assert!(
+            texts.contains(&app.catalog.format("host_count", &[("count", "1")])),
+            "{texts:?}"
+        );
     }
 }
 
