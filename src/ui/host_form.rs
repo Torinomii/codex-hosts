@@ -496,7 +496,6 @@ fn auth_section(
 ) {
     section(ui, catalog.text("section_auth"), |ui| {
         let mut form = Form::new(ui, catalog);
-        let vault_host = editor.is_vault_host();
         if editor.profile.protocol == Protocol::Ssh {
             form.required_row(ui, "auth_method", false, None, |ui, width| {
                 egui::ComboBox::from_id_salt("ssh_auth")
@@ -547,9 +546,9 @@ fn auth_section(
             });
             let password_hint = if editor.password_mode == PasswordMode::NoPassword {
                 catalog.text("no_password_hint").to_owned()
-            } else if vault_host && !editor.draft {
-                catalog.text("vault_password_hint").to_owned()
-            } else if editor.login_user_changed() {
+            } else if let Some(texts) = editor.vault_texts().filter(|_| !editor.draft) {
+                catalog.text(texts.password_hint).to_owned()
+            } else if !editor.draft && editor.login_user_changed() {
                 catalog.text("login_password_user_changed").to_owned()
             } else if let Some(error) = editor.password_read_error.as_deref() {
                 catalog.format("credential_error", &[("error", error)])
@@ -1379,19 +1378,22 @@ fn host_key_section(ui: &mut egui::Ui, editor: &HostEditor, catalog: &Catalog) {
     });
 }
 
-/// Tells the user the host is its Bitwarden item: name, endpoint, account,
-/// password, description and tags are written to the vault on save, the
-/// rest of the form stays in this app.
+/// Tells the user the host is its password-manager item: name, endpoint,
+/// account, password, description and tags are written to the item on
+/// save, the rest of the form stays in this app.
 fn vault_banner(ui: &mut egui::Ui, editor: &HostEditor, catalog: &Catalog) {
+    let Some(texts) = editor.vault_texts() else {
+        return;
+    };
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(catalog.text("vault_host_title")).strong());
+            ui.label(RichText::new(catalog.text(texts.host_title)).strong());
             if editor.saving {
                 ui.spinner();
-                ui.label(RichText::new(catalog.text("vault_saving")).weak());
+                ui.label(RichText::new(catalog.text(texts.saving)).weak());
             }
         });
-        ui.add(egui::Label::new(catalog.text("vault_host_hint")).wrap());
+        ui.add(egui::Label::new(catalog.text(texts.host_hint)).wrap());
     });
 }
 
@@ -2126,8 +2128,54 @@ mod tests {
             item_id: profile.id,
             item_name: profile.alias.clone(),
             revision_date: "rev-1".into(),
+            ..Default::default()
         });
         profile
+    }
+
+    #[test]
+    fn a_onepassword_host_saves_through_its_item_like_any_vault_host() {
+        if !in_isolated_store(
+            "ui::host_form::tests::a_onepassword_host_saves_through_its_item_like_any_vault_host",
+        ) {
+            return;
+        }
+        let _guard = crate::credentials::test_lock();
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut profile = vault_profile();
+        let vault = profile.vault.as_mut().unwrap();
+        vault.provider = crate::model::VaultProvider::OnePassword;
+        vault.external_id = Some("testitem000000000000000000".into());
+        let mut app = metadata_test_app(&context, "en", profile);
+        app.store.onepassword.cli_path = Some(std::path::PathBuf::from("C:/missing/op.exe"));
+        app.store.onepassword.account = Some(crate::model::OnePasswordAccount::default());
+        app.store.save().unwrap();
+        app.editor = Some(HostEditor::load(app.store.hosts[0].clone()));
+        {
+            let editor = app.editor.as_mut().unwrap();
+            editor.profile.address = "10.0.0.6".into();
+            editor.profile.alias = "renamed".into();
+            editor.profile.advanced.require_call_approval = true;
+        }
+
+        // The item is written first; the store waits for it.
+        assert!(!app.persist_editor().unwrap());
+        assert!(app.vault_job.is_some() && app.pending_vault_save.is_some());
+        assert_eq!(stored_host().address, "10.0.0.5");
+        let write = app.editor.as_ref().unwrap().vault_write();
+        assert_eq!(write.provider, crate::model::VaultProvider::OnePassword);
+        assert_eq!(
+            write.external_id.as_deref(),
+            Some("testitem000000000000000000")
+        );
+        assert_eq!(write.name, "renamed");
+        assert_eq!(write.host_uri, "ssh://10.0.0.6:22");
+        assert_eq!(
+            app.persist_editor().unwrap_err(),
+            app.catalog.text("op_saving"),
+            "a second save waits, in 1Password's words"
+        );
     }
 
     #[test]
@@ -2211,6 +2259,11 @@ mod tests {
                 !has(&mut app, "editor_subtitle"),
                 "{locale}: a vault host does not claim Credential Manager"
             );
+            assert!(has(&mut app, "delete"), "{locale}: a Bitwarden item can go");
+            let vault = app.editor.as_mut().unwrap().profile.vault.as_mut().unwrap();
+            vault.provider = crate::model::VaultProvider::OnePassword;
+            assert!(has(&mut app, "delete"), "{locale}: so can a 1Password item");
+            assert!(has(&mut app, "op_host_title"), "{locale}: named as such");
 
             app.new_host();
             assert!(
@@ -2271,7 +2324,7 @@ mod tests {
         // The item write lands: the store takes what the item now says plus
         // the local settings from the form; Credential Manager stays empty.
         app.vault_job = None;
-        let facts = crate::bitwarden::hosts::HostFacts {
+        let facts = crate::vault_hosts::HostFacts {
             alias: "example".into(),
             protocol: Protocol::Ssh,
             address: "10.0.0.6".into(),
@@ -2281,7 +2334,7 @@ mod tests {
             tags: Vec::new(),
             revision: "rev-2".into(),
         };
-        app.finish_vault_save(id, &facts);
+        app.finish_vault_save(&crate::vault_hosts::ItemKey::bitwarden(id), &facts);
         let stored = stored_host();
         assert_eq!(stored.address, "10.0.0.6");
         assert_eq!(stored.description, "front");
@@ -2376,7 +2429,7 @@ mod tests {
         app.store.bitwarden.cli_path = Some(std::path::PathBuf::from("C:/missing/bw.exe"));
         app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
         app.store.save().unwrap();
-        app.new_vault_host();
+        app.new_vault_host(crate::model::VaultProvider::Bitwarden);
         let editor = app.editor.as_ref().unwrap();
         assert!(editor.draft && editor.is_vault_host());
         assert!(
@@ -2400,7 +2453,7 @@ mod tests {
         assert_eq!(write.expected_revision, "");
         app.vault_job = None;
         let item_id = uuid::Uuid::new_v4();
-        let facts = crate::bitwarden::hosts::HostFacts {
+        let facts = crate::vault_hosts::HostFacts {
             alias: "new-box".into(),
             protocol: Protocol::Ssh,
             address: "10.0.0.9".into(),
@@ -2410,7 +2463,7 @@ mod tests {
             tags: Vec::new(),
             revision: "rev-1".into(),
         };
-        app.finish_vault_save(item_id, &facts);
+        app.finish_vault_save(&crate::vault_hosts::ItemKey::bitwarden(item_id), &facts);
         let created = app.store.find_alias("new-box").unwrap();
         assert_eq!(created.id, item_id, "the profile id is the item id");
         assert_eq!(created.vault.as_ref().unwrap().item_id, item_id);

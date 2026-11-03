@@ -22,15 +22,17 @@ use super::dialogs::dialog_shell;
 use super::host_list::HostGroup;
 use super::theme;
 use super::{EditorSwitch, HostsApp};
-use crate::bitwarden::hosts::{self, HostFacts, ItemProblem, Reconciled};
+use crate::bitwarden::hosts;
 use crate::bitwarden::vault::LoginStep;
 use crate::bitwarden::{Account, Vault, VaultError, session};
 use crate::i18n::Catalog;
+use crate::model::VaultProvider;
 use crate::model::{
     BitwardenProfile, BitwardenSettings, DEFAULT_BITWARDEN_FOLDER, DEFAULT_REAUTH_IDLE_MINUTES,
     MAX_REAUTH_IDLE_MINUTES, ReauthPolicy, SYNC_MAX_AGE_CHOICES,
 };
 use crate::ssh::RemoteFailure;
+use crate::vault_hosts::{self, HostFacts, HostWrite, ItemKey, ItemProblem, Reconciled};
 
 const US_SERVER: &str = "https://vault.bitwarden.com";
 const EU_SERVER: &str = "https://vault.bitwarden.eu";
@@ -58,6 +60,9 @@ pub(super) fn explain(catalog: &Catalog, error: &VaultError) -> String {
 }
 
 fn explain_remote(catalog: &Catalog, error: &RemoteFailure) -> String {
+    if let Some(text) = super::onepassword::explain_code(catalog, error) {
+        return text;
+    }
     match error.code {
         "BITWARDEN_LOCKED" => catalog.text("bw_err_locked").to_owned(),
         "BITWARDEN_SIGNED_OUT" => catalog.text("bw_err_signed_out").to_owned(),
@@ -70,7 +75,7 @@ fn explain_remote(catalog: &Catalog, error: &RemoteFailure) -> String {
 /// The window's wording for why a folder item is not served as a host.
 pub(super) fn problem_key(problem: &ItemProblem) -> &'static str {
     match problem {
-        ItemProblem::NotLogin(_) => "vault_problem_not_login",
+        ItemProblem::NotLogin => "vault_problem_not_login",
         ItemProblem::NoName => "vault_problem_no_name",
         ItemProblem::NoHostUri => "vault_problem_no_uri",
         ItemProblem::NoUsername => "vault_problem_no_username",
@@ -82,11 +87,11 @@ pub(super) fn problem_key(problem: &ItemProblem) -> &'static str {
 // Worker jobs
 
 /// A worker result the dialog polls for.
-struct Job<T>(Receiver<Result<T, String>>);
+pub(super) struct Job<T>(Receiver<Result<T, String>>);
 
 impl<T> Job<T> {
     /// `None` while the worker runs.
-    fn poll(&self) -> Option<Result<T, String>> {
+    pub(super) fn poll(&self) -> Option<Result<T, String>> {
         match self.0.try_recv() {
             Ok(result) => Some(result),
             Err(TryRecvError::Empty) => None,
@@ -95,7 +100,7 @@ impl<T> Job<T> {
     }
 }
 
-fn spawn_job<T: Send + 'static>(
+pub(super) fn spawn_job<T: Send + 'static>(
     repaint: egui::Context,
     work: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Job<T> {
@@ -109,7 +114,7 @@ fn spawn_job<T: Send + 'static>(
     Job(receiver)
 }
 
-fn block_on<T>(future: impl std::future::Future<Output = T>) -> Result<T, String> {
+pub(super) fn block_on<T>(future: impl std::future::Future<Output = T>) -> Result<T, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -267,7 +272,7 @@ fn sync_if_stale(account: &Account, vault: &mut Vault, max_age_seconds: u64) -> 
 
 /// The JSON of a new host item: a Login item in the folder with the host
 /// URI and the codex-hosts fields.
-fn host_item_json(write: &VaultWrite, folder: Option<Uuid>) -> Zeroizing<Vec<u8>> {
+fn host_item_json(write: &HostWrite, folder: Option<Uuid>) -> Zeroizing<Vec<u8>> {
     let password = match &write.password {
         FieldEdit::Set(password) => serde_json::Value::String(password.as_str().to_owned()),
         FieldEdit::Keep | FieldEdit::Clear => serde_json::Value::Null,
@@ -279,7 +284,7 @@ fn host_item_json(write: &VaultWrite, folder: Option<Uuid>) -> Zeroizing<Vec<u8>
         "favorite": false,
         "reprompt": 0,
         "folderId": folder,
-        "fields": codex_fields(write).iter().map(|(key, value)| serde_json::json!({
+        "fields": write.codex_fields().iter().map(|(key, value)| serde_json::json!({
             "name": format!("{}{key}", codex_hosts_bw::CODEX_FIELD_PREFIX),
             "value": value,
             "type": 0,
@@ -294,57 +299,45 @@ fn host_item_json(write: &VaultWrite, folder: Option<Uuid>) -> Zeroizing<Vec<u8>
     Zeroizing::new(item.to_string().into_bytes())
 }
 
-fn codex_fields(write: &VaultWrite) -> BTreeMap<String, String> {
-    let mut fields = BTreeMap::new();
-    if !write.description.trim().is_empty() {
-        fields.insert(
-            hosts::DESCRIPTION_FIELD.to_owned(),
-            write.description.trim().to_owned(),
-        );
-    }
-    if !write.tags.is_empty() {
-        fields.insert(
-            hosts::TAGS_FIELD.to_owned(),
-            hosts::format_tags(&write.tags),
-        );
-    }
-    fields
-}
-
 // ---------------------------------------------------------------------------
 // Vault-backed hosts: refresh, save, delete
 
-/// What the editor wants written into the host's item. No `Debug`: the
-/// password edit is a secret.
-pub(super) struct VaultWrite {
-    /// `None` creates the item.
-    pub(super) item_id: Option<Uuid>,
-    pub(super) name: String,
-    pub(super) host_uri: String,
-    pub(super) username: String,
-    pub(super) password: FieldEdit<Zeroizing<String>>,
-    pub(super) description: String,
-    pub(super) tags: Vec<String>,
-    /// The revision the editor read; a different one in the vault means
-    /// someone else changed the item meanwhile.
-    pub(super) expected_revision: String,
-}
-
-/// A job on the vault the window runs for its hosts.
+/// A job on a password manager the window runs for its hosts. Saves and
+/// deletes go to the provider of their host; one runs at a time.
 pub(super) enum VaultTask {
-    /// Mirror the folder into the host list. A quiet refresh never asks for
-    /// the master password: without a usable key it only reports the lock.
+    /// Mirror the Bitwarden folder into the host list. A quiet refresh never
+    /// asks for the master password: without a usable key it only reports
+    /// the lock.
     Refresh { quiet: bool },
     /// Write the editor's draft into its item (or create it).
-    Save(VaultWrite),
-    /// Move the host's item to the Bitwarden trash.
+    Save(HostWrite),
+    /// Move the host's item to the provider's trash or archive.
     Delete(Uuid),
 }
 
 pub(super) enum VaultOutcome {
     Refreshed(Reconciled),
-    Saved { item_id: Uuid, facts: HostFacts },
+    Saved { key: ItemKey, facts: HostFacts },
     Deleted(Uuid),
+}
+
+impl From<vault_hosts::WriteFailure> for JobError {
+    fn from(error: vault_hosts::WriteFailure) -> Self {
+        match error {
+            vault_hosts::WriteFailure::Conflict => Self::Conflict,
+            vault_hosts::WriteFailure::Problem(problem) => Self::Problem(problem),
+            vault_hosts::WriteFailure::Remote(error) => Self::Remote(error),
+        }
+    }
+}
+
+/// Runs a 1Password write on a worker; `op` itself waits for the app's
+/// prompt, so there is no unlock step to come back to.
+fn onepassword_job(
+    reporter: &Reporter,
+    work: impl FnOnce() -> JobResult<VaultOutcome> + Send + 'static,
+) -> Job<Result<VaultOutcome, JobError>> {
+    spawn_job(reporter.repaint.clone(), move || Ok(work()))
 }
 
 impl HostsApp {
@@ -450,8 +443,36 @@ impl HostsApp {
             .profile
             .as_ref()
             .and_then(|profile| profile.folder_id);
-        let (kind, job) = match task {
-            VaultTask::Refresh { quiet } => (
+        // A 1Password host is archived through `op`, not `bw`.
+        let onepassword_host = match &task {
+            VaultTask::Delete(id) => self
+                .store
+                .hosts
+                .iter()
+                .find(|host| {
+                    host.id == *id && host.vault_provider() == Some(VaultProvider::OnePassword)
+                })
+                .cloned(),
+            _ => None,
+        };
+        let (kind, job, provider) = match (task, onepassword_host) {
+            (VaultTask::Save(write), _) if write.provider == VaultProvider::OnePassword => (
+                VaultTaskKind::Save(write.clone_without_password()),
+                onepassword_job(&reporter, move || {
+                    let (key, facts) = block_on(crate::onepassword::save_item(&write))??;
+                    Ok(VaultOutcome::Saved { key, facts })
+                }),
+                VaultProvider::OnePassword,
+            ),
+            (VaultTask::Delete(id), Some(host)) => (
+                VaultTaskKind::Delete(id),
+                onepassword_job(&reporter, move || {
+                    block_on(crate::onepassword::archive_item(&host))??;
+                    Ok(VaultOutcome::Deleted(id))
+                }),
+                VaultProvider::OnePassword,
+            ),
+            (VaultTask::Refresh { quiet }, _) => (
                 VaultTaskKind::Refresh { quiet },
                 vault_job(&reporter, settings, move |account| {
                     let mut vault = if quiet {
@@ -468,8 +489,9 @@ impl HostsApp {
                     ))??;
                     Ok(VaultOutcome::Refreshed(result))
                 }),
+                VaultProvider::Bitwarden,
             ),
-            VaultTask::Save(write) => (
+            (VaultTask::Save(write), _) => (
                 VaultTaskKind::Save(write.clone_without_password()),
                 vault_job(&reporter, settings, move |account| {
                     let mut vault = unlocked(&account, memory)?;
@@ -483,9 +505,9 @@ impl HostsApp {
                             {
                                 return Err(JobError::Conflict);
                             }
-                            let fields = codex_fields(&write);
+                            let fields = write.codex_fields();
                             let name = write.name.trim().to_owned();
-                            let VaultWrite {
+                            let HostWrite {
                                 username,
                                 password,
                                 host_uri,
@@ -510,21 +532,27 @@ impl HostsApp {
                     };
                     let facts = hosts::facts(item.summary()).map_err(JobError::Problem)?;
                     Ok(VaultOutcome::Saved {
-                        item_id: item.summary().id,
+                        key: ItemKey::bitwarden(item.summary().id),
                         facts,
                     })
                 }),
+                VaultProvider::Bitwarden,
             ),
-            VaultTask::Delete(item_id) => (
+            (VaultTask::Delete(item_id), None) => (
                 VaultTaskKind::Delete(item_id),
                 vault_job(&reporter, settings, move |account| {
                     let mut vault = unlocked(&account, memory)?;
                     block_on(vault.delete_item(item_id))??;
                     Ok(VaultOutcome::Deleted(item_id))
                 }),
+                VaultProvider::Bitwarden,
             ),
         };
-        self.vault_job = Some(VaultJob { kind, job });
+        self.vault_job = Some(VaultJob {
+            kind,
+            provider,
+            job,
+        });
     }
 
     /// Picks up a finished vault job: updates the host list or the editor,
@@ -537,9 +565,16 @@ impl HostsApp {
         else {
             return;
         };
-        let Some(VaultJob { kind, .. }) = self.vault_job.take() else {
+        let Some(VaultJob { kind, provider, .. }) = self.vault_job.take() else {
             return;
         };
+        if provider == VaultProvider::OnePassword {
+            self.onepassword.note_result(match &result {
+                Ok(Err(JobError::Remote(error))) => Some(error.code),
+                Ok(_) => None,
+                Err(_) => Some(""),
+            });
+        }
         match result {
             Ok(Ok(VaultOutcome::Refreshed(reconciled))) => {
                 self.vault_state = Some(VaultState::Unlocked);
@@ -567,8 +602,8 @@ impl HostsApp {
                     );
                 }
             }
-            Ok(Ok(VaultOutcome::Saved { item_id, facts })) => {
-                self.finish_vault_save(item_id, &facts);
+            Ok(Ok(VaultOutcome::Saved { key, facts })) => {
+                self.finish_vault_save(&key, &facts);
             }
             Ok(Ok(VaultOutcome::Deleted(item_id))) => {
                 self.finish_vault_delete(item_id);
@@ -582,7 +617,15 @@ impl HostsApp {
                 }
             }
             Ok(Err(error)) => {
-                let text = word(&self.catalog, &error);
+                let text = match error {
+                    JobError::Conflict => {
+                        let group = HostGroup::of_provider(Some(provider));
+                        self.catalog
+                            .text(Self::vault_key(group, |texts| texts.conflict))
+                            .to_owned()
+                    }
+                    _ => word(&self.catalog, &error),
+                };
                 if let VaultTaskKind::Save(_) = kind {
                     self.editor_save_failed(text);
                 } else {
@@ -629,7 +672,7 @@ impl HostsApp {
 /// still holds the typed password and rebuilds the write.
 enum VaultTaskKind {
     Refresh { quiet: bool },
-    Save(VaultWrite),
+    Save(HostWrite),
     Delete(Uuid),
 }
 
@@ -646,23 +689,9 @@ impl VaultTaskKind {
     }
 }
 
-impl VaultWrite {
-    fn clone_without_password(&self) -> Self {
-        Self {
-            item_id: self.item_id,
-            name: self.name.clone(),
-            host_uri: self.host_uri.clone(),
-            username: self.username.clone(),
-            password: FieldEdit::Keep,
-            description: self.description.clone(),
-            tags: self.tags.clone(),
-            expected_revision: self.expected_revision.clone(),
-        }
-    }
-}
-
 pub(super) struct VaultJob {
     kind: VaultTaskKind,
+    provider: VaultProvider,
     job: Job<Result<VaultOutcome, JobError>>,
 }
 
@@ -732,13 +761,16 @@ pub(super) enum VaultState {
     SignedOut,
 }
 
-/// What the setup confirmation tells the user.
+/// What the confirmation after a password manager's setup tells the user.
 pub(super) struct SetupDone {
-    email: String,
-    folder: String,
+    pub(super) service: HostGroup,
+    /// The account's email (or sign-in address).
+    pub(super) account: String,
+    /// The folder or vault whose items are the hosts.
+    pub(super) place: String,
     /// Keeping the session in Credential Manager failed; the vault is
     /// unlocked for this window only.
-    store_error: Option<String>,
+    pub(super) store_error: Option<String>,
 }
 
 pub(super) struct CredentialManager {
@@ -995,6 +1027,7 @@ impl HostsApp {
             Some(ReauthPolicy::Idle { minutes }) => minutes,
             _ => DEFAULT_REAUTH_IDLE_MINUTES,
         };
+        self.onepassword.close();
         self.credential_manager = Some(CredentialManager {
             view: ManagerView::Services,
             tab: ManagerTab::Account,
@@ -1042,6 +1075,7 @@ impl HostsApp {
         match action {
             ManagerAction::Close => {
                 self.credential_manager = None;
+                self.onepassword.close();
             }
             ManagerAction::OpenBitwarden => {
                 manager.view = ManagerView::Bitwarden;
@@ -1154,7 +1188,7 @@ impl HostsApp {
                 }
                 // The mirrors are defined by the account; without it they
                 // are meaningless rows.
-                self.store.hosts.retain(|host| !host.is_vault_host());
+                self.store.hosts.retain(|host| !host.is_bitwarden_host());
                 self.vault_session = None;
                 self.vault_state = None;
                 self.vault_note = None;
@@ -1428,21 +1462,22 @@ impl HostsApp {
                     .as_ref()
                     .map(|profile| profile.id);
                 let done = settings.profile.as_ref().map(|profile| SetupDone {
-                    email: profile.email.clone(),
-                    folder: profile.folder_name.clone(),
+                    service: HostGroup::Bitwarden,
+                    account: profile.email.clone(),
+                    place: profile.folder_name.clone(),
                     store_error,
                 });
                 self.store.bitwarden = settings;
                 if let Some(previous) = previous.filter(|id| *id != wizard.profile_id) {
                     session::remove_account(previous);
-                    self.store.hosts.retain(|host| !host.is_vault_host());
+                    self.store.hosts.retain(|host| !host.is_bitwarden_host());
                 }
                 self.save_bitwarden_settings();
                 self.set_status_key("bw_setup_done");
                 // The wizard's job is done: the window says so and offers
                 // the next step instead of leaving the user on a settings page.
                 self.credential_manager = None;
-                self.bitwarden_setup_done = done;
+                self.setup_done = done;
                 // The folder's items become hosts right away.
                 self.refresh_vault_hosts();
             }
@@ -1618,6 +1653,7 @@ impl HostsApp {
     pub(super) fn bitwarden_dialogs(&mut self, context: &egui::Context) {
         self.enforce_vault_policy();
         self.poll_vault_job();
+        self.poll_onepassword();
         self.approval_unlock();
         self.unlock_prompt_dialog(context);
         self.credential_manager_dialog(context);
@@ -1627,35 +1663,41 @@ impl HostsApp {
     pub(super) fn bitwarden_dialog_open(&self) -> bool {
         self.unlock_prompt.is_some()
             || self.credential_manager.is_some()
-            || self.bitwarden_setup_done.is_some()
+            || self.setup_done.is_some()
     }
 
-    /// Says the setup is finished and what the user can do now.
+    /// Says a password manager's setup is finished and what the user can do
+    /// now.
     fn setup_done_dialog(&mut self, context: &egui::Context) {
-        let Some(done) = &self.bitwarden_setup_done else {
+        let Some(done) = &self.setup_done else {
             return;
         };
+        let Some(texts) = done.service.texts() else {
+            self.setup_done = None;
+            return;
+        };
+        let service = done.service;
         let catalog = &self.catalog;
         let choice = super::dialogs::dialog_shell(
             context,
-            "bitwarden_setup_done",
+            "setup_done",
             520.0,
-            catalog.text("bw_done_title"),
+            catalog.text(texts.done_title),
             |ui| {
-                let folder = if done.folder.is_empty() {
+                let place = if done.place.is_empty() {
                     catalog.text("none")
                 } else {
-                    done.folder.as_str()
+                    done.place.as_str()
                 };
                 ui.add(
                     egui::Label::new(catalog.format(
-                        "bw_done_text",
-                        &[("email", done.email.as_str()), ("folder", folder)],
+                        texts.done_text,
+                        &[("account", done.account.as_str()), ("place", place)],
                     ))
                     .wrap(),
                 );
                 ui.add_space(8.0);
-                for key in ["bw_done_next_add", "bw_done_next_edit"] {
+                for key in texts.done_next {
                     ui.add(egui::Label::new(format!("•  {}", catalog.text(key))).wrap());
                 }
                 if let Some(error) = &done.store_error {
@@ -1667,7 +1709,7 @@ impl HostsApp {
                 }
                 super::dialogs::dialog_button_row(
                     ui,
-                    catalog.text("bw_done_add_host"),
+                    catalog.text(texts.done_add_host),
                     false,
                     catalog.text("bw_done_close"),
                 )
@@ -1675,10 +1717,10 @@ impl HostsApp {
         );
         match choice {
             Some(true) => {
-                self.bitwarden_setup_done = None;
-                self.switch_editor(EditorSwitch::New(HostGroup::Bitwarden));
+                self.setup_done = None;
+                self.switch_editor(EditorSwitch::New(service));
             }
-            Some(false) => self.bitwarden_setup_done = None,
+            Some(false) => self.setup_done = None,
             None => {}
         }
     }
@@ -1879,9 +1921,13 @@ impl HostsApp {
             return;
         };
         let mut action = None;
+        let mut onepassword_action = None;
+        let onepassword_open = self.onepassword.showing();
         // Each page names itself; a service page leads with the way back.
         let title = if manager.wizard.is_some() {
             catalog.text("bw_setup_title")
+        } else if onepassword_open {
+            self.onepassword.title(&catalog)
         } else if manager.view == ManagerView::Bitwarden {
             "Bitwarden"
         } else {
@@ -1892,50 +1938,73 @@ impl HostsApp {
                 action = wizard_body(ui, &catalog, wizard);
                 return;
             }
+            if onepassword_open {
+                onepassword_action =
+                    super::onepassword::page(ui, &catalog, &self.store, &mut self.onepassword);
+                return;
+            }
             if manager.view == ManagerView::Bitwarden {
-                let back = format!("‹  {}", catalog.text("back_to_services"));
-                if ui
-                    .add(egui::Button::new(back).frame(false))
-                    .on_hover_text(catalog.text("back_to_services_hint"))
-                    .clicked()
-                {
+                if back_link(ui, &catalog) {
                     action = Some(ManagerAction::BackToServices);
                 }
                 ui.add_space(4.0);
             }
-            {
-                if manager.view == ManagerView::Services {
-                    services_overview(
-                        ui,
-                        &catalog,
-                        &settings,
-                        &hosts,
-                        &mut enabled,
-                        manager,
-                        &mut action,
-                    );
-                } else {
-                    bitwarden_page(ui, &catalog, &settings, &hosts, manager, &mut action);
-                }
+            if manager.view == ManagerView::Services {
+                services_overview(
+                    ui,
+                    &catalog,
+                    &settings,
+                    &hosts,
+                    &mut enabled,
+                    manager,
+                    &mut action,
+                );
+                ui.add_space(6.0);
+                onepassword_action =
+                    super::onepassword::card(ui, &catalog, &self.store, &mut self.onepassword);
+            } else {
+                bitwarden_page(ui, &catalog, &settings, &hosts, manager, &mut action);
             }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button(catalog.text("close")).clicked() {
-                    action = Some(ManagerAction::Close);
-                }
-            });
+            if close_row(ui, &catalog) {
+                action = Some(ManagerAction::Close);
+            }
         });
         if enabled != settings.enabled {
             self.store.bitwarden.enabled = enabled;
             self.save_bitwarden_settings();
         }
+        if let Some(act) = onepassword_action {
+            self.onepassword_act(act);
+        }
         if let Some(action) = action {
             self.manager_act(action);
         }
     }
+
+    /// Closes the credential-services dialog, whichever page it shows.
+    pub(super) fn close_credential_manager(&mut self) {
+        self.onepassword.close();
+        self.manager_act(ManagerAction::Close);
+    }
 }
 
+/// "‹ Back to credential services" at the top of a service page.
+pub(super) fn back_link(ui: &mut egui::Ui, catalog: &Catalog) -> bool {
+    let back = format!("‹  {}", catalog.text("back_to_services"));
+    ui.add(egui::Button::new(back).frame(false))
+        .on_hover_text(catalog.text("back_to_services_hint"))
+        .clicked()
+}
+
+/// The dialog's closing row.
+pub(super) fn close_row(ui: &mut egui::Ui, catalog: &Catalog) -> bool {
+    ui.add_space(12.0);
+    ui.separator();
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        ui.button(catalog.text("close")).clicked()
+    })
+    .inner
+}
 /// The first page: every credential service codex-hosts knows, what it
 /// holds, whether it is on, and the way into its own management page.
 fn services_overview(
@@ -1951,115 +2020,78 @@ fn services_overview(
     ui.add(egui::Label::new(catalog.text("services_intro")).wrap());
     ui.add_space(8.0);
     let local_hosts = hosts.iter().filter(|host| !host.is_vault_host()).count();
-    let vault_hosts = hosts.iter().filter(|host| host.is_vault_host()).count();
+    let vault_hosts = hosts.iter().filter(|host| host.is_bitwarden_host()).count();
     let busy = manager.job.is_some();
 
     // Windows Credential Manager: built in, always on.
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(catalog.text("service_local_name")).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(
-                        catalog.format("service_hosts", &[("count", &local_hosts.to_string())]),
-                    )
-                    .weak(),
-                );
-            });
-        });
-        ui.add(
-            egui::Label::new(
-                RichText::new(catalog.text("service_local_text"))
-                    .weak()
-                    .small(),
-            )
-            .wrap(),
-        );
-        ui.label(RichText::new(catalog.text("service_local_status")).small());
-    });
+    super::services::service_card(
+        ui,
+        catalog,
+        super::services::ServiceCard {
+            name: catalog.text("service_local_name"),
+            text: catalog.text("service_local_text"),
+            hosts: local_hosts,
+            enabled: None,
+            status: catalog.text("service_local_status").to_owned(),
+            busy: false,
+            button: None,
+        },
+    );
     ui.add_space(6.0);
 
     // Bitwarden: switchable once set up, with its own page.
-    egui::Frame::group(ui.style()).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Bitwarden").strong());
-            if settings.profile.is_some() && settings.cli_path.is_some() {
-                ui.checkbox(enabled, catalog.text("service_enabled"));
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(
-                        catalog.format("service_hosts", &[("count", &vault_hosts.to_string())]),
-                    )
-                    .weak(),
-                );
-            });
-        });
-        ui.add(
-            egui::Label::new(
-                RichText::new(catalog.text("service_bitwarden_text"))
-                    .weak()
-                    .small(),
-            )
-            .wrap(),
-        );
-        let status = match settings
-            .profile
-            .as_ref()
-            .filter(|_| settings.cli_path.is_some())
-        {
-            None => catalog.text("bw_not_configured").to_owned(),
-            Some(profile) => {
-                let state = if !*enabled {
-                    catalog.text("service_status_disabled")
-                } else {
-                    match &manager.status {
+    let configured = settings.profile.is_some() && settings.cli_path.is_some();
+    let status = match settings.profile.as_ref().filter(|_| configured) {
+        None => catalog.text("bw_not_configured").to_owned(),
+        Some(profile) => {
+            let state = if !*enabled {
+                catalog.text("service_status_disabled")
+            } else {
+                match &manager.status {
+                    None => catalog.text("bw_status_unknown"),
+                    Some(status) => match status.report.as_ref().map(|report| report.status) {
+                        Some(VaultStatus::Unauthenticated) => catalog.text("bw_status_signed_out"),
+                        Some(_) if status.unlocked => catalog.text("bw_status_unlocked"),
+                        Some(_) => catalog.text("bw_status_locked"),
                         None => catalog.text("bw_status_unknown"),
-                        Some(status) => match status.report.as_ref().map(|report| report.status) {
-                            Some(VaultStatus::Unauthenticated) => {
-                                catalog.text("bw_status_signed_out")
-                            }
-                            Some(_) if status.unlocked => catalog.text("bw_status_unlocked"),
-                            Some(_) => catalog.text("bw_status_locked"),
-                            None => catalog.text("bw_status_unknown"),
-                        },
-                    }
-                };
-                format!(
-                    "{state}  ·  {}  ·  {}",
-                    profile.email,
-                    if profile.folder_name.is_empty() {
-                        catalog.text("none")
-                    } else {
-                        &profile.folder_name
-                    }
-                )
-            }
-        };
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(status).small());
-            if busy {
-                ui.spinner();
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if settings.profile.is_some() && settings.cli_path.is_some() {
-                    if ui
-                        .add(theme::primary_button(ui, catalog.text("service_manage")))
-                        .clicked()
-                    {
-                        *action = Some(ManagerAction::OpenBitwarden);
-                    }
-                } else if ui
-                    .add(theme::primary_button(ui, catalog.text("bw_start_setup")))
-                    .clicked()
-                {
-                    *action = Some(ManagerAction::StartWizard);
+                    },
                 }
-            });
+            };
+            format!(
+                "{state}  ·  {}  ·  {}",
+                profile.email,
+                if profile.folder_name.is_empty() {
+                    catalog.text("none")
+                } else {
+                    &profile.folder_name
+                }
+            )
+        }
+    };
+    let clicked = super::services::service_card(
+        ui,
+        catalog,
+        super::services::ServiceCard {
+            name: "Bitwarden",
+            text: catalog.text("service_bitwarden_text"),
+            hosts: vault_hosts,
+            enabled: configured.then_some(enabled),
+            status,
+            busy,
+            button: Some(catalog.text(if configured {
+                "service_manage"
+            } else {
+                "bw_start_setup"
+            })),
+        },
+    );
+    if clicked {
+        *action = Some(if configured {
+            ManagerAction::OpenBitwarden
+        } else {
+            ManagerAction::StartWizard
         });
-    });
+    }
     if let Some((is_error, text)) = &manager.message {
         ui.add_space(6.0);
         let color = if *is_error {
@@ -2736,35 +2768,29 @@ fn terminal_handoff(
 fn wizard_body(ui: &mut egui::Ui, catalog: &Catalog, wizard: &mut Wizard) -> Option<ManagerAction> {
     let mut action = None;
     let steps = [
-        (WizardStep::Cli, "wizard_step_cli"),
-        (WizardStep::Login, "wizard_step_login"),
-        (WizardStep::Code, "wizard_step_code"),
-        (WizardStep::Folder, "wizard_step_folder"),
-        (WizardStep::Policy, "wizard_step_policy"),
+        WizardStep::Cli,
+        WizardStep::Login,
+        WizardStep::Code,
+        WizardStep::Folder,
+        WizardStep::Policy,
     ];
-    ui.horizontal_wrapped(|ui| {
-        for (index, (step, key)) in steps.iter().enumerate() {
-            let text = format!("{}. {}", index + 1, catalog.text(key));
-            if *step == wizard.step {
-                ui.label(RichText::new(text).strong());
-            } else {
-                ui.label(RichText::new(text).weak());
-            }
-            if index + 1 < steps.len() {
-                ui.label(RichText::new("›").weak());
-            }
-        }
-    });
-    ui.separator();
-    if let Some(error) = &wizard.error {
-        ui.colored_label(ui.visuals().error_fg_color, error);
-    }
-    if wizard.busy {
-        ui.horizontal(|ui| {
-            ui.spinner();
-            ui.label(catalog.text("busy"));
-        });
-    }
+    super::dialogs::wizard_header(
+        ui,
+        catalog,
+        &[
+            "wizard_step_cli",
+            "wizard_step_login",
+            "wizard_step_code",
+            "wizard_step_folder",
+            "wizard_step_policy",
+        ],
+        steps
+            .iter()
+            .position(|step| *step == wizard.step)
+            .unwrap_or_default(),
+        wizard.error.as_deref(),
+        wizard.busy.then(|| catalog.text("busy")),
+    );
     let busy = wizard.busy;
     match wizard.step {
         WizardStep::Cli => {
@@ -3123,8 +3149,10 @@ mod tests {
 
     #[test]
     fn a_new_host_item_carries_the_uri_the_fields_and_the_folder() {
-        let write = VaultWrite {
+        let write = HostWrite {
+            provider: VaultProvider::Bitwarden,
             item_id: None,
+            external_id: None,
             name: "build-box".to_owned(),
             host_uri: "ssh://10.0.0.5:2222".to_owned(),
             username: "deploy".to_owned(),
@@ -3290,9 +3318,10 @@ mod tests {
                 ..BitwardenProfile::default()
             });
             app.vault_state = Some(VaultState::Unlocked);
-            app.bitwarden_setup_done = Some(SetupDone {
-                email: "me@example.com".into(),
-                folder: "codex-hosts".into(),
+            app.setup_done = Some(SetupDone {
+                service: HostGroup::Bitwarden,
+                account: "me@example.com".into(),
+                place: "codex-hosts".into(),
                 store_error: None,
             });
             let texts = window_texts(&mut app, &context);
@@ -3301,7 +3330,7 @@ mod tests {
             assert!(
                 texts.contains(&catalog.format(
                     "bw_done_text",
-                    &[("email", "me@example.com"), ("folder", "codex-hosts")]
+                    &[("account", "me@example.com"), ("place", "codex-hosts")]
                 )),
                 "{locale}: completion text"
             );
@@ -3315,7 +3344,7 @@ mod tests {
                 "{locale}: vault state in the toolbar"
             );
 
-            app.bitwarden_setup_done = None;
+            app.setup_done = None;
             for (state, key) in [
                 (VaultState::Locked, "bw_status_locked"),
                 (VaultState::SignedOut, "bw_status_signed_out"),

@@ -18,13 +18,16 @@ mod bitwarden;
 mod dialogs;
 mod host_form;
 mod host_list;
+mod onepassword;
+mod services;
 mod status;
 pub(crate) mod theme;
 mod toolbar;
 
 pub(crate) use theme::{configure_fonts, forget_password_history};
 
-use bitwarden::{VaultTask, VaultWrite};
+use crate::vault_hosts::HostWrite;
+use bitwarden::VaultTask;
 use codex_hosts_bw::FieldEdit;
 use status::{StatusKind, StatusMessage};
 use theme::apply_style;
@@ -36,7 +39,7 @@ use crate::i18n::Catalog;
 use crate::import;
 use crate::model::{
     AuthPersistence, HostFilter, HostProfile, Prefill, Protocol, SshAuth, VaultHostRef,
-    normalize_tags,
+    VaultProvider, normalize_tags,
 };
 use crate::ssh::{
     OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE, VerifiedHostKey,
@@ -98,7 +101,7 @@ enum PendingAction {
 
 /// The item write that changes only the tags of a vault host, built from
 /// the stored mirror so nothing else in the form leaks into it.
-fn tags_write(stored: &HostProfile, tags: &[String]) -> VaultWrite {
+fn tags_write(stored: &HostProfile, tags: &[String]) -> HostWrite {
     let scheme = match stored.protocol {
         Protocol::Ssh => codex_hosts_bw::UriScheme::Ssh,
         Protocol::Telnet => codex_hosts_bw::UriScheme::Telnet,
@@ -109,8 +112,10 @@ fn tags_write(stored: &HostProfile, tags: &[String]) -> VaultWrite {
         host: stored.address.trim().to_owned(),
         port: Some(stored.port),
     };
-    VaultWrite {
+    HostWrite {
+        provider: stored.vault_provider().unwrap_or_default(),
         item_id: Some(stored.id),
+        external_id: stored.vault().and_then(|vault| vault.external_id.clone()),
         name: stored.alias.clone(),
         host_uri: uri.to_string(),
         username: stored.username.clone(),
@@ -309,14 +314,19 @@ impl HostEditor {
         self.profile.protocol == Protocol::Telnet || self.profile.ssh_auth == SshAuth::Password
     }
 
-    /// The host is defined by a Bitwarden item: the password and the
-    /// connection facts go to the item, never to Credential Manager.
+    /// The host is defined by a password-manager item: the password and
+    /// the connection facts go to the item, never to Credential Manager.
     fn is_vault_host(&self) -> bool {
         self.profile.is_vault_host()
     }
 
+    /// What the form says about the password manager behind the host.
+    fn vault_texts(&self) -> Option<&'static services::VaultTexts> {
+        services::HostGroup::of(&self.profile).texts()
+    }
+
     /// What the vault item should hold after this save.
-    fn vault_write(&self) -> VaultWrite {
+    fn vault_write(&self) -> HostWrite {
         let profile = &self.profile;
         let scheme = match profile.protocol {
             Protocol::Ssh => codex_hosts_bw::UriScheme::Ssh,
@@ -340,8 +350,12 @@ impl HostEditor {
                 PasswordMode::NoPassword => FieldEdit::Clear,
             }
         };
-        VaultWrite {
+        HostWrite {
+            provider: profile.vault_provider().unwrap_or_default(),
             item_id: (!self.draft).then_some(profile.id),
+            external_id: (!self.draft)
+                .then(|| profile.vault().and_then(|vault| vault.external_id.clone()))
+                .flatten(),
             name: profile.alias.trim().to_owned(),
             host_uri: uri.to_string(),
             username: profile.username.trim().to_owned(),
@@ -362,7 +376,7 @@ impl HostEditor {
 
     /// The write to retry after an unlock: the current form when it still
     /// edits the same item, else the kept write.
-    pub(super) fn vault_write_or(&self, fallback: VaultWrite) -> VaultWrite {
+    pub(super) fn vault_write_or(&self, fallback: HostWrite) -> HostWrite {
         if self.is_vault_host() && (self.draft == fallback.item_id.is_none()) {
             self.vault_write()
         } else {
@@ -622,6 +636,8 @@ pub struct HostsApp {
     approval_unlock: Option<bitwarden::ApprovalUnlock>,
     /// The vault job the window runs for its hosts (refresh, save, delete).
     vault_job: Option<bitwarden::VaultJob>,
+    /// The 1Password card and its refresh job.
+    onepassword: onepassword::OnePasswordUi,
     /// The store side of a vault save, written once the item write lands.
     pending_vault_save: Option<SavePlan>,
     /// The session the window unlocked, reused by its own vault jobs.
@@ -630,7 +646,7 @@ pub struct HostsApp {
     /// status.
     vault_state: Option<bitwarden::VaultState>,
     /// The confirmation shown once the Bitwarden setup finished.
-    bitwarden_setup_done: Option<bitwarden::SetupDone>,
+    setup_done: Option<bitwarden::SetupDone>,
     /// Where the form was asked to go while it held unsaved changes; the
     /// unsaved-changes dialog asks before it goes.
     pending_switch: Option<EditorSwitch>,
@@ -639,7 +655,7 @@ pub struct HostsApp {
     /// Why the Bitwarden section is empty, once known.
     vault_note: Option<String>,
     /// Folder items that are not served as hosts, from the last refresh.
-    vault_problems: Vec<(String, crate::bitwarden::hosts::ItemProblem)>,
+    vault_problems: Vec<(String, crate::vault_hosts::ItemProblem)>,
     /// Host-list groups the user folded away.
     collapsed_groups: host_list::GroupFolds,
 }
@@ -814,10 +830,11 @@ impl HostsApp {
             unlock_prompt: None,
             approval_unlock: None,
             vault_job: None,
+            onepassword: onepassword::OnePasswordUi::default(),
             pending_vault_save: None,
             vault_session: None,
             vault_state: None,
-            bitwarden_setup_done: None,
+            setup_done: None,
             pending_switch: None,
             vault_policy_checked: None,
             vault_note: None,
@@ -829,14 +846,13 @@ impl HostsApp {
         Ok(app)
     }
 
-    /// Hosts the list can show: vault hosts are hidden while Bitwarden is
-    /// switched off.
+    /// Hosts the list can show: vault hosts are hidden while their password
+    /// manager is switched off.
     fn visible_host_count(&self) -> usize {
-        let vault_shown = self.store.bitwarden.enabled;
         self.store
             .hosts
             .iter()
-            .filter(|host| vault_shown || !host.is_vault_host())
+            .filter(|host| self.store.serves(host))
             .count()
     }
 
@@ -883,8 +899,7 @@ impl HostsApp {
                 }
                 self.start_test();
             }
-            EditorSwitch::New(host_list::HostGroup::Local) => self.new_host(),
-            EditorSwitch::New(host_list::HostGroup::Bitwarden) => self.new_vault_host(),
+            EditorSwitch::New(group) => self.new_service_host(group),
         }
     }
 
@@ -931,14 +946,16 @@ impl HostsApp {
         editor.draft = true;
         self.selected = None;
         self.editor = Some(editor);
-        self.collapsed_groups.local = false;
     }
 
-    /// Opens the form on a new host of the Bitwarden folder; the first save
-    /// creates the item.
-    pub(super) fn new_vault_host(&mut self) {
-        if !self.store.bitwarden.available() {
-            self.set_status_key("bw_not_configured");
+    /// Opens the form on a new host of a password manager's folder or vault;
+    /// the first save creates the item.
+    pub(super) fn new_vault_host(&mut self, provider: VaultProvider) {
+        if !self.service_ready(services::HostGroup::of_provider(Some(provider))) {
+            self.set_status_key(match provider {
+                VaultProvider::Bitwarden => "bw_not_configured",
+                VaultProvider::OnePassword => "op_not_configured",
+            });
             return;
         }
         let mut profile = HostProfile::new(String::new());
@@ -947,13 +964,14 @@ impl HostsApp {
             item_id: profile.id,
             item_name: String::new(),
             revision_date: String::new(),
+            provider,
+            external_id: None,
         });
         let mut editor = HostEditor::fresh(profile);
         editor.draft = true;
         editor.saved_password_mode = None;
         self.selected = None;
         self.editor = Some(editor);
-        self.collapsed_groups.bitwarden = false;
     }
 
     /// Reloads the open saved host from the store, dropping its edits.
@@ -984,9 +1002,10 @@ impl HostsApp {
         {
             return Err(self.catalog.text("host_changed").to_owned());
         }
+        let saving = Self::vault_key(self.editor_group(), |texts| texts.saving);
         let editor = self.editor.as_mut().ok_or_else(|| "NO_EDITOR".to_owned())?;
         if editor.saving {
-            return Err(self.catalog.text("vault_saving").to_owned());
+            return Err(self.catalog.text(saving).to_owned());
         }
         let missing = editor.missing_required_fields();
         if !missing.is_empty() {
@@ -1252,14 +1271,16 @@ impl HostsApp {
     /// describes it, plus the local settings from the form.
     pub(super) fn finish_vault_save(
         &mut self,
-        item_id: Uuid,
-        facts: &crate::bitwarden::hosts::HostFacts,
+        key: &crate::vault_hosts::ItemKey,
+        facts: &crate::vault_hosts::HostFacts,
     ) {
+        let item_id = key.id;
         let Some(mut plan) = self.pending_vault_save.take() else {
             // No form save pending: a tag write. The stored mirror takes
             // what the item says now.
             if let Some(stored) = self.store.hosts.iter_mut().find(|host| host.id == item_id) {
-                crate::bitwarden::hosts::apply(facts, item_id, stored);
+                crate::vault_hosts::apply(facts, key, stored);
+
                 let stored = stored.clone();
                 match self.store.save() {
                     Ok(()) => {
@@ -1285,11 +1306,12 @@ impl HostsApp {
             plan.profile.id = item_id;
             plan.profile.login_password_id = None;
         }
-        crate::bitwarden::hosts::apply(facts, item_id, &mut plan.profile);
+        crate::vault_hosts::apply(facts, key, &mut plan.profile);
         let saved_alias = plan.profile.alias.clone();
+        let group = services::HostGroup::of_provider(Some(key.provider));
         match self.commit_editor_save(plan) {
             Ok(()) => {
-                self.set_status_key("vault_saved");
+                self.set_vault_status(group, |texts| texts.saved);
                 if self.launch.codex_edit {
                     match self.write_callback("saved", Some(&saved_alias)) {
                         Ok(()) => self
@@ -1314,9 +1336,10 @@ impl HostsApp {
         self.set_status(StatusKind::Error, error);
     }
 
-    /// The host's item is in the Bitwarden trash: its mirror and local
-    /// secrets go too.
+    /// The host's item is in the provider's trash or archive: its mirror and
+    /// local secrets go too.
     pub(super) fn finish_vault_delete(&mut self, item_id: Uuid) {
+        let mut group = services::HostGroup::Bitwarden;
         if let Some(profile) = self
             .store
             .hosts
@@ -1324,6 +1347,7 @@ impl HostsApp {
             .find(|host| host.id == item_id)
             .cloned()
         {
+            group = services::HostGroup::of(&profile);
             let _ = credentials::delete_host(&profile);
         }
         self.store.hosts.retain(|host| host.id != item_id);
@@ -1337,7 +1361,7 @@ impl HostsApp {
         }
         self.test_states.remove(&item_id);
         crate::ssh::invalidate_profile(item_id);
-        self.set_status_key("vault_deleted");
+        self.set_vault_status(group, |texts| texts.deleted);
     }
 
     /// Writes only the tag list; every other field in the form stays a draft until Save.
@@ -1374,6 +1398,7 @@ impl HostsApp {
         if self.launch.codex_edit || self.editor.as_ref().is_some_and(|editor| editor.draft) {
             return;
         }
+
         // Tags of a vault host live in its item: the write goes there first
         // and the store follows when it lands.
         if let Some(write) = self
@@ -1393,7 +1418,7 @@ impl HostsApp {
                 return;
             }
             self.start_vault_task(VaultTask::Save(write));
-            self.set_status_key("vault_saving");
+            self.set_vault_status(self.editor_group(), |texts| texts.saving);
             return;
         }
         match self.persist_tags() {
@@ -1448,7 +1473,7 @@ impl HostsApp {
             return;
         }
         match self.persist_editor() {
-            Ok(false) => self.set_status_key("vault_saving"),
+            Ok(false) => self.set_vault_status(self.editor_group(), |texts| texts.saving),
             Ok(true) => {
                 self.set_status_key("status_saved");
                 if self.launch.codex_edit {
@@ -1476,7 +1501,7 @@ impl HostsApp {
         match self.persist_editor() {
             Ok(true) => {}
             Ok(false) => {
-                self.set_status_key("vault_saving");
+                self.set_vault_status(self.editor_group(), |texts| texts.saving);
                 return;
             }
             Err(error) => {
@@ -1560,7 +1585,7 @@ impl HostsApp {
             match self.persist_editor() {
                 Ok(true) => {}
                 Ok(false) => {
-                    self.set_status_key("vault_saving");
+                    self.set_vault_status(self.editor_group(), |texts| texts.saving);
                     return;
                 }
                 Err(error) => {
@@ -1862,8 +1887,9 @@ impl HostsApp {
             self.set_status_key("chain_in_use");
             return;
         }
+
         // A vault-backed host is its item: deleting it moves the item to the
-        // Bitwarden trash first; the mirror goes when that write lands.
+        // provider's trash or archive first; the mirror goes when that lands.
         if self
             .store
             .hosts
@@ -2784,10 +2810,11 @@ mod tests {
             unlock_prompt: None,
             approval_unlock: None,
             vault_job: None,
+            onepassword: onepassword::OnePasswordUi::default(),
             pending_vault_save: None,
             vault_session: None,
             vault_state: None,
-            bitwarden_setup_done: None,
+            setup_done: None,
             pending_switch: None,
             vault_policy_checked: None,
             vault_note: None,
@@ -3632,36 +3659,58 @@ mod tests {
     }
 
     #[test]
-    fn the_status_bar_counts_hosts_per_store_once_bitwarden_is_set_up() {
+    fn the_status_bar_counts_hosts_per_ready_store() {
         let context = egui::Context::default();
         theme::configure_fonts(&context, "en");
         let mut app = metadata_test_app(&context, "en", HostProfile::new("local".into()));
-        let mut vault = HostProfile::new("vaulted".into());
-        vault.vault = Some(VaultHostRef {
-            item_id: vault.id,
-            item_name: "vaulted".into(),
-            revision_date: String::new(),
-        });
-        app.store.hosts.push(vault);
+        for (alias, provider) in [
+            ("vaulted", VaultProvider::Bitwarden),
+            ("op-host", VaultProvider::OnePassword),
+        ] {
+            let mut host = HostProfile::new(alias.into());
+            host.vault = Some(VaultHostRef {
+                item_id: host.id,
+                item_name: alias.into(),
+                provider,
+                ..Default::default()
+            });
+            app.store.hosts.push(host);
+        }
+        let part = |app: &HostsApp, key: &str| {
+            app.catalog.format(
+                "host_count_part",
+                &[("name", app.catalog.text(key)), ("count", "1")],
+            )
+        };
         let texts = render_texts(&mut app, &context);
         assert!(
-            texts.contains(&app.catalog.format("host_count", &[("count", "2")])),
-            "{texts:?}"
+            texts.contains(&app.catalog.format("host_count", &[("count", "3")])),
+            "nothing set up, one plain count: {texts:?}"
         );
 
         app.store.bitwarden.cli_path = Some(PathBuf::from("C:/bw/bw.exe"));
         app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+        app.store.onepassword.cli_path = Some(PathBuf::from("C:/op/op.exe"));
+        app.store.onepassword.account = Some(crate::model::OnePasswordAccount::default());
         let texts = render_texts(&mut app, &context);
-        assert!(
-            texts.contains(
-                &app.catalog
-                    .format("host_count_split", &[("local", "1"), ("vault", "1")])
-            ),
-            "{texts:?}"
-        );
+        let all = [
+            part(&app, "host_count_local"),
+            part(&app, "group_bitwarden"),
+            part(&app, "group_onepassword"),
+        ]
+        .join(" · ");
+        assert!(texts.contains(&all), "{texts:?}");
 
-        // Switched off, the vault hosts are hidden and not counted.
+        // A service switched off is hidden and not counted.
         app.store.bitwarden.enabled = false;
+        let texts = render_texts(&mut app, &context);
+        let two = [
+            part(&app, "host_count_local"),
+            part(&app, "group_onepassword"),
+        ]
+        .join(" · ");
+        assert!(texts.contains(&two), "{texts:?}");
+        app.store.onepassword.enabled = false;
         let texts = render_texts(&mut app, &context);
         assert!(
             texts.contains(&app.catalog.format("host_count", &[("count", "1")])),

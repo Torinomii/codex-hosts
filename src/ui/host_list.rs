@@ -1,6 +1,7 @@
 use eframe::egui::{self, Color32, RichText};
 
 use super::bitwarden::VaultState;
+use super::services::Section;
 use super::{EditorSwitch, HostTestState, HostsApp, retain_visible_selection};
 use crate::i18n::Catalog;
 use crate::model::{HostFilter, HostProfile, Protocol, normalize_tags};
@@ -25,46 +26,7 @@ const BADGE_PADDING_X: f32 = 4.0;
 /// Badges that would squeeze the alias below this width stay in the hover text only.
 const MIN_ALIAS_WIDTH: f32 = 72.0;
 
-/// Which credential store defines a host; the list keeps the two apart once
-/// Bitwarden is set up.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HostGroup {
-    Local,
-    Bitwarden,
-}
-
-impl HostGroup {
-    fn of(host: &HostProfile) -> Self {
-        if host.is_vault_host() {
-            Self::Bitwarden
-        } else {
-            Self::Local
-        }
-    }
-
-    fn label_key(self) -> &'static str {
-        match self {
-            Self::Local => "group_local",
-            Self::Bitwarden => "group_bitwarden",
-        }
-    }
-}
-
-/// Which groups the user folded away.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct GroupFolds {
-    pub(super) local: bool,
-    pub(super) bitwarden: bool,
-}
-
-impl GroupFolds {
-    fn collapsed(self, group: HostGroup) -> bool {
-        match group {
-            HostGroup::Local => self.local,
-            HostGroup::Bitwarden => self.bitwarden,
-        }
-    }
-}
+pub(super) use super::services::{GroupFolds, HostGroup};
 
 enum ListRow<'a> {
     Header {
@@ -73,36 +35,39 @@ enum ListRow<'a> {
         collapsed: bool,
     },
     Host(&'a HostProfile),
-    /// A line under an empty Bitwarden section saying why it is empty.
+    /// A line under an empty password-manager section saying why it is empty.
     Note(&'a str),
 }
 
-/// The rows to draw: a flat list while Bitwarden is not set up and every
-/// host is local, otherwise one header per group with its hosts under it
-/// (none while folded). With Bitwarden set up both headers always appear,
-/// so the two stores are never mixed; an empty Bitwarden section shows
-/// `vault_note` instead of hosts.
+/// The rows to draw: a flat list while no password manager is set up and
+/// every host is local, otherwise one header per group with its hosts under
+/// it (none while folded). A password manager that is set up always shows
+/// its header, so the stores are never mixed; its empty section shows the
+/// note given with it in `sections` instead of hosts.
 fn group_rows<'a>(
     hosts: &[&'a HostProfile],
     folds: GroupFolds,
-    split: bool,
-    vault_note: &'a str,
+    sections: &[(HostGroup, &'a str)],
 ) -> Vec<ListRow<'a>> {
-    if !split
+    if sections.is_empty()
         && hosts
             .iter()
             .all(|host| HostGroup::of(host) == HostGroup::Local)
     {
         return hosts.iter().map(|host| ListRow::Host(host)).collect();
     }
-    let mut rows = Vec::with_capacity(hosts.len() + 3);
-    for group in [HostGroup::Local, HostGroup::Bitwarden] {
+    let mut rows = Vec::with_capacity(hosts.len() + 4);
+    for group in HostGroup::ALL {
         let members: Vec<&HostProfile> = hosts
             .iter()
             .copied()
             .filter(|host| HostGroup::of(host) == group)
             .collect();
-        if members.is_empty() && !(split && group == HostGroup::Bitwarden) {
+        let note = sections
+            .iter()
+            .find(|(section, _)| *section == group)
+            .map(|(_, note)| *note);
+        if members.is_empty() && note.is_none() {
             continue;
         }
         let collapsed = folds.collapsed(group);
@@ -115,7 +80,7 @@ fn group_rows<'a>(
             continue;
         }
         if members.is_empty() {
-            rows.push(ListRow::Note(vault_note));
+            rows.extend(note.map(ListRow::Note));
         } else {
             rows.extend(members.into_iter().map(ListRow::Host));
         }
@@ -127,7 +92,7 @@ fn group_rows<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeaderClick {
     Fold,
-    /// The Bitwarden header's action button.
+    /// The password-manager header's action button.
     Vault,
 }
 
@@ -171,8 +136,8 @@ impl VaultAction {
     }
 }
 
-/// A header row: the fold arrow, label and count at the left; the
-/// Bitwarden group also carries one labelled button at the right
+/// A header row: the fold arrow, label and count at the left; a
+/// password-manager group also carries one labelled button at the right
 /// ([`VaultAction`]). Adding hosts goes through "＋ New host" above the list.
 fn group_row(
     ui: &mut egui::Ui,
@@ -181,7 +146,7 @@ fn group_row(
     count: usize,
     collapsed: bool,
     row_height: f32,
-    vault_action: VaultAction,
+    vault_action: Option<VaultAction>,
 ) -> Option<HeaderClick> {
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
@@ -203,7 +168,7 @@ fn group_row(
             ui.visuals().strong_text_color(),
         );
     }
-    if group == HostGroup::Bitwarden {
+    if let Some(vault_action) = vault_action {
         // A real widget on top of the row, so it gets its own hover and
         // click and the row folds only when clicked elsewhere.
         let mut child = ui.new_child(
@@ -588,21 +553,28 @@ impl HostsApp {
                 ui.add_space(LIST_INSET);
                 self.host_actions_menu(ui);
                 let label = format!("＋ {}", self.catalog.text("new_host"));
-                if self.store.bitwarden.available() {
-                    // Two stores: the button asks which one the host goes to.
+                let vaults = self.ready_vaults();
+                if !vaults.is_empty() {
+                    // Several stores: the button asks which one the host goes to.
                     let mut choice = None;
                     ui.menu_button(label, |ui| {
                         if ui.button(self.catalog.text("group_local")).clicked() {
                             choice = Some(HostGroup::Local);
                             ui.close();
                         }
-                        if ui
-                            .button(self.catalog.text("new_vault_host"))
-                            .on_hover_text(self.catalog.text("new_vault_host_hint"))
-                            .clicked()
-                        {
-                            choice = Some(HostGroup::Bitwarden);
-                            ui.close();
+                        for group in vaults {
+                            let hint = group.texts().map_or("", |texts| texts.new_host_hint);
+                            if ui
+                                .button(self.catalog.format(
+                                    "new_service_host",
+                                    &[("service", self.catalog.text(group.label_key()))],
+                                ))
+                                .on_hover_text(self.catalog.text(hint))
+                                .clicked()
+                            {
+                                choice = Some(group);
+                                ui.close();
+                            }
                         }
                     });
                     if let Some(group) = choice {
@@ -621,30 +593,34 @@ impl HostsApp {
             &self.host_filter,
             &mut self.batch_selected,
         );
-        let bitwarden_enabled = self.store.bitwarden.enabled;
         let hosts = self
             .store
             .hosts
             .iter()
             .filter(|host| self.host_filter.matches(host))
-            .filter(|host| bitwarden_enabled || !host.is_vault_host())
+            .filter(|host| self.store.serves(host))
             .collect::<Vec<_>>();
-        let split = self.store.bitwarden.available();
-        if hosts.is_empty() && !split {
+        let services: Vec<(HostGroup, Section)> = HostGroup::VAULTS
+            .into_iter()
+            .filter_map(|group| self.service_section(group).map(|section| (group, section)))
+            .collect();
+        if hosts.is_empty() && services.is_empty() {
             ui.add_space(12.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new(self.catalog.text("no_matching_hosts")).weak());
             });
         }
-        let vault_note = if self.vault_state == Some(VaultState::SignedOut) {
-            self.catalog.text("vault_section_signed_out").to_owned()
-        } else {
-            self.vault_note
-                .clone()
-                .unwrap_or_else(|| self.catalog.text("vault_section_unloaded").to_owned())
+        let sections: Vec<(HostGroup, &str)> = services
+            .iter()
+            .map(|(group, section)| (*group, section.note.as_str()))
+            .collect();
+        let action_of = |group: HostGroup| {
+            services
+                .iter()
+                .find(|(service, _)| *service == group)
+                .map(|(_, section)| section.action)
         };
-        let vault_action = VaultAction::for_state(self.vault_state, self.vault_job_running());
-        let rows = group_rows(&hosts, self.collapsed_groups, split, &vault_note);
+        let rows = group_rows(&hosts, self.collapsed_groups, &sections);
         let selected_id = self.selected;
         let batch_mode = self.batch_mode;
         let batch_selected = &self.batch_selected;
@@ -657,7 +633,7 @@ impl HostsApp {
         let mut test_request = None;
         let mut batch_toggle_request = None;
         let mut fold_request = None;
-        let mut vault_request = false;
+        let mut vault_request = None;
         let three_lines = hosts
             .iter()
             .any(|host| !host.tags.is_empty() || !host.description.trim().is_empty());
@@ -698,10 +674,10 @@ impl HostsApp {
                             *count,
                             *collapsed,
                             row_height,
-                            vault_action,
+                            action_of(*group),
                         ) {
                             Some(HeaderClick::Fold) => fold_request = Some(*group),
-                            Some(HeaderClick::Vault) => vault_request = true,
+                            Some(HeaderClick::Vault) => vault_request = Some(*group),
                             None => {}
                         }
                         continue;
@@ -769,19 +745,12 @@ impl HostsApp {
         }
 
         if let Some(group) = fold_request {
-            match group {
-                HostGroup::Local => self.collapsed_groups.local = !self.collapsed_groups.local,
-                HostGroup::Bitwarden => {
-                    self.collapsed_groups.bitwarden = !self.collapsed_groups.bitwarden
-                }
-            }
+            self.collapsed_groups.toggle(group);
         }
-        if vault_request {
-            match vault_action {
-                VaultAction::LogIn => self.open_bitwarden_page(),
-                VaultAction::Refresh | VaultAction::Unlock => self.refresh_vault_hosts(),
-                VaultAction::Reading => {}
-            }
+        if let Some(group) = vault_request
+            && let Some(action) = action_of(group)
+        {
+            self.service_header_act(group, action);
         }
         if let Some((id, checked)) = batch_toggle_request {
             if checked {
@@ -880,7 +849,7 @@ impl HostsApp {
 mod tests {
     use super::super::tests::{find_text_rect, in_isolated_store, metadata_test_app};
     use super::*;
-    use crate::model::{HostProfile, SshAuth, SuSettings, SudoSettings};
+    use crate::model::{HostProfile, SshAuth, SuSettings, SudoSettings, VaultProvider};
     use uuid::Uuid;
 
     fn list_frame(
@@ -985,6 +954,7 @@ mod tests {
             item_id: host.id,
             item_name: alias.into(),
             revision_date: String::new(),
+            ..Default::default()
         });
         host
     }
@@ -995,6 +965,46 @@ mod tests {
             if collapsed { "▸" } else { "▾" },
             app.catalog.text(group.label_key())
         )
+    }
+
+    #[test]
+    fn each_password_manager_gets_its_own_section() {
+        let local = HostProfile::new("local".into());
+        let bitwarden = bitwarden_host("bw");
+        let mut onepassword = bitwarden_host("op");
+        onepassword.vault.as_mut().unwrap().provider = VaultProvider::OnePassword;
+        let hosts = [&local, &bitwarden, &onepassword];
+        let headers = |rows: &[ListRow]| -> Vec<(HostGroup, usize)> {
+            rows.iter()
+                .filter_map(|row| match row {
+                    ListRow::Header { group, count, .. } => Some((*group, *count)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let rows = group_rows(&hosts, GroupFolds::default(), &[]);
+        assert_eq!(
+            headers(&rows),
+            [
+                (HostGroup::Local, 1),
+                (HostGroup::Bitwarden, 1),
+                (HostGroup::OnePassword, 1)
+            ]
+        );
+        // A set-up but empty 1Password vault keeps its header and says why.
+        let rows = group_rows(
+            &[&local],
+            GroupFolds::default(),
+            &[(HostGroup::OnePassword, "why")],
+        );
+        assert_eq!(
+            headers(&rows),
+            [(HostGroup::Local, 1), (HostGroup::OnePassword, 0)]
+        );
+        assert!(matches!(rows.last(), Some(ListRow::Note("why"))));
+        let mut folds = GroupFolds::default();
+        folds.toggle(HostGroup::OnePassword);
+        assert!(folds.collapsed(HostGroup::OnePassword) && !folds.collapsed(HostGroup::Local));
     }
 
     #[test]
@@ -1144,7 +1154,10 @@ mod tests {
                 click(vault.center(), egui::PointerButton::Primary),
             );
             let output = list_frame(&mut app, &context, 340.0, vec![]);
-            assert!(app.collapsed_groups.bitwarden, "{locale}: fold state");
+            assert!(
+                app.collapsed_groups.collapsed(HostGroup::Bitwarden),
+                "{locale}: fold state"
+            );
             assert!(
                 find_text_rect(
                     &output.shapes,

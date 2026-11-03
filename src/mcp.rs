@@ -970,6 +970,18 @@ BITWARDEN_DISABLED mean the user must log in or enable Bitwarden in the window (
 hosts are not listed). Never ask for the master password in chat or run bw yourself. \
 BITWARDEN_ITEM_MISSING or BITWARDEN_ITEM_MISMATCH means the item was removed or no longer describes a \
 host, which the user fixes in Bitwarden or through open_host_editor. \
+A host whose list entry reports credential_source onepassword is a Login item in one vault of the \
+user's 1Password account (title = alias, ssh:// or telnet:// URL = endpoint, username and password = \
+login), read through the official op CLI and the 1Password app before every use; the app's window \
+creates, edits and archives such items, changes made in 1Password apply at once, and list_hosts \
+shows the host as last read. A call to such a host may wait while the \
+1Password app asks the user to allow codex-hosts. ONEPASSWORD_LOCKED means that prompt was declined \
+or not answered; ONEPASSWORD_UNAVAILABLE, ONEPASSWORD_NOT_CONFIGURED, ONEPASSWORD_CLI_UNSUPPORTED, \
+and ONEPASSWORD_DISABLED mean the user must open the 1Password app or finish or enable its setup in \
+the codex-hosts window; ONEPASSWORD_ITEM_MISSING or ONEPASSWORD_ITEM_MISMATCH means the item was \
+removed or no longer describes a host, which the user fixes in 1Password or through open_host_editor. \
+Never ask for 1Password \
+credentials in chat or run op yourself. \
 exec_sudo accepts an absolute program and argv, \
 requires an explicit user on every call (choose root explicitly), and normally reuses the saved login password of the current SSH user when that user \
 is requested for sudo authentication. Each Advanced switch authorizes saved-password supply for its own purpose; false never rules out passwordless execution. Optional saved account passwords override it. An empty sudo_credentials \
@@ -1248,5 +1260,7 @@ mod tests {
         assert!(text.contains("120000"));
         assert!(text.contains("600000"));
         assert!(text.contains("256 hosts"));
+        assert!(text.contains("credential_source onepassword"));
+        assert!(text.contains("ONEPASSWORD_LOCKED"));
     }
 }

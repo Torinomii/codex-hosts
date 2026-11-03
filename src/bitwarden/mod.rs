@@ -29,6 +29,7 @@ use zeroize::Zeroizing;
 use crate::model::{BitwardenProfile, BitwardenSettings, HostProfile};
 use crate::ssh::RemoteFailure;
 use crate::storage::HostStore;
+use crate::vault_hosts::{self, ItemKey, ItemProblem, Reconciled};
 
 pub(crate) use vault::{RealRunner, Vault, VaultError};
 
@@ -218,60 +219,14 @@ fn item_failure(error: VaultError, account: &Account, alias: &str) -> RemoteFail
     error.into_remote(alias)
 }
 
-fn problem_failure(alias: &str, problem: &hosts::ItemProblem) -> RemoteFailure {
-    let reason = match problem {
-        hosts::ItemProblem::NotLogin(_) => "it is no longer a Login item",
-        hosts::ItemProblem::NoName => "its name is empty",
-        hosts::ItemProblem::NoHostUri => "it has no ssh:// or telnet:// URI",
-        hosts::ItemProblem::NoUsername => "neither the item nor its URI names a user",
-        hosts::ItemProblem::NameTaken => "its name is used by another host",
-    };
+fn problem_failure(alias: &str, problem: &ItemProblem) -> RemoteFailure {
     RemoteFailure::new(
         "BITWARDEN_ITEM_MISMATCH",
-        format!("The Bitwarden item behind {alias} no longer describes a host: {reason}."),
+        format!(
+            "The Bitwarden item behind {alias} no longer describes a host: {}.",
+            problem.reason()
+        ),
     )
-}
-
-/// Writes the refreshed facts of one item into the stored mirror and returns
-/// the stored profile. A renamed item whose new name clashes with another
-/// host keeps its previous alias in the store. `None` when the mirror is
-/// not in the store (removed meanwhile).
-fn persist_refreshed(
-    item_id: Uuid,
-    facts: &hosts::HostFacts,
-) -> Result<Option<HostProfile>, String> {
-    let _write = crate::storage::write_lock();
-    let mut store = HostStore::load().map_err(|error| error.to_string())?;
-    let clash = store
-        .hosts
-        .iter()
-        .any(|host| host.id != item_id && host.alias.trim().eq_ignore_ascii_case(&facts.alias));
-    let Some(host) = store.hosts.iter_mut().find(|host| host.id == item_id) else {
-        return Ok(None);
-    };
-    let previous_alias = host.alias.clone();
-    let mut changed = hosts::apply(facts, item_id, host);
-    if clash {
-        host.alias = previous_alias;
-        changed = true;
-    }
-    let refreshed = host.clone();
-    if changed {
-        store.save().map_err(|error| error.to_string())?;
-    }
-    Ok(Some(refreshed))
-}
-
-/// Removes the mirror of an item that no longer exists; best effort.
-fn drop_mirror(item_id: Uuid) {
-    let _write = crate::storage::write_lock();
-    if let Ok(mut store) = HostStore::load() {
-        let before = store.hosts.len();
-        store.hosts.retain(|host| host.id != item_id);
-        if store.hosts.len() != before {
-            let _ = store.save();
-        }
-    }
 }
 
 /// An admitted login: the refreshed host, the pool key material, and the
@@ -304,10 +259,9 @@ pub(crate) struct VaultLogin {
 /// the endpoint, account and password the vault holds now. Every call goes
 /// through here, including one that reuses a retained session.
 pub(crate) async fn admit(host: &HostProfile) -> Result<AdmittedLogin, RemoteFailure> {
-    let item_id = host
-        .vault()
-        .ok_or_else(|| RemoteFailure::new("BITWARDEN_UNAVAILABLE", "not a vault host"))?
-        .item_id;
+    let item_key = ItemKey::of(host)
+        .ok_or_else(|| RemoteFailure::new("BITWARDEN_UNAVAILABLE", "not a vault host"))?;
+    let item_id = item_key.id;
     let _turn = CLI_GATE.lock().await;
     let settings = settings()?;
     let account = Account::from_settings(&settings)?;
@@ -316,23 +270,23 @@ pub(crate) async fn admit(host: &HostProfile) -> Result<AdmittedLogin, RemoteFai
     let item = match vault.get_item(item_id).await {
         Ok(item) => item,
         Err(VaultError::ItemMissing) => {
-            drop_mirror(item_id);
+            vault_hosts::drop_mirror(item_id);
             return Err(VaultError::ItemMissing.into_remote(&host.alias));
         }
         Err(error) => return Err(item_failure(error, &account, &host.alias)),
     };
     if item.is_deleted() {
-        drop_mirror(item_id);
+        vault_hosts::drop_mirror(item_id);
         return Err(VaultError::ItemDeleted.into_remote(&host.alias));
     }
     let facts =
         hosts::facts(item.summary()).map_err(|problem| problem_failure(&host.alias, &problem))?;
     let password = item.login_password().ok().flatten();
-    let refreshed = match persist_refreshed(item_id, &facts) {
+    let refreshed = match vault_hosts::persist_refreshed(&item_key, &facts) {
         Ok(Some(stored)) => stored,
         _ => {
             let mut copy = host.clone();
-            hosts::apply(&facts, item_id, &mut copy);
+            vault_hosts::apply(&facts, &item_key, &mut copy);
             copy
         }
     };
@@ -389,7 +343,7 @@ pub(crate) async fn refresh_store(
     account: &Account,
     vault: &mut Vault,
     max_age_seconds: u64,
-) -> Result<(hosts::Reconciled, Vec<codex_hosts_bw::ItemSummary>), RemoteFailure> {
+) -> Result<(Reconciled, Vec<codex_hosts_bw::ItemSummary>), RemoteFailure> {
     let folder = folder_of(account)?;
     ensure_fresh(account, vault, max_age_seconds).await?;
     let items = vault
@@ -428,7 +382,7 @@ pub(crate) async fn discover() -> Result<bool, RemoteFailure> {
 /// Mirrors the folder for a listing when that costs the user nothing: a
 /// stored key that is not spent by being read (never under "every call")
 /// and no prompt. `Ok(None)` when it could not run.
-pub(crate) async fn refresh_quietly() -> Result<Option<hosts::Reconciled>, RemoteFailure> {
+pub(crate) async fn refresh_quietly() -> Result<Option<Reconciled>, RemoteFailure> {
     let settings = settings()?;
     if !settings.available() {
         return Ok(None);

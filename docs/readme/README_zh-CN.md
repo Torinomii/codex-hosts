@@ -3,7 +3,7 @@
 <p align="center">保存主机，掌握凭据，让 Codex 完成远程任务。</p>
 
 <p align="center">
-  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.3.3"><img src="https://img.shields.io/badge/version-0.3.3-2563eb" alt="v0.3.3" /></a>
+  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.4.0"><img src="https://img.shields.io/badge/version-0.4.0-2563eb" alt="v0.4.0" /></a>
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="构建 Release" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 许可证" /></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D4?logo=windows&logoColor=white" alt="Windows 10 或更高版本" />
@@ -18,10 +18,10 @@
   <a href="https://github.com/Torinomii/codex-hosts/releases">下载</a> · <a href="#安装">安装</a> · <a href="#快速上手">快速上手</a> · <a href="#版本记录">版本记录</a> · <a href="#技术参考">技术参考</a>
 </p>
 
-供 Codex 使用的 Windows SSH / Telnet 主机管理工具与 MCP 服务器。保存主机后，就能让 Codex 连接、执行命令或批量操作多台机器。密码、私钥口令和 FIDO PIN 在本机输入，不进入对话或工具参数。
+供 Codex 使用的 Windows SSH / Telnet 主机管理工具与 MCP 服务器。将主机保存在本地，或 Bitwarden、1Password 保管库中，就能让 Codex 连接、执行命令或批量操作多台机器。密码、私钥口令和 FIDO PIN 在本机输入，不进入对话或工具参数。
 
 <p align="center">
-  <img src="../../Main.png" alt="Codex Hosts 主界面" width="960" />
+  <img src="../../Main.png" alt="显示本地、Bitwarden 与 1Password 主机的 Codex Hosts 主界面" width="960" />
 </p>
 
 ## 功能概览
@@ -29,6 +29,7 @@
 | 能力 | 可以做什么 |
 | --- | --- |
 | 主机管理 | 保存 SSH / Telnet 配置、备注和标签，支持搜索、筛选、导入和导出。 |
+| 凭据服务 | 主机登录凭据可保存在 Windows 凭据管理器、Bitwarden 文件夹或 1Password 保险库；每个服务都有自己的列表分区、设置向导和工具栏状态。 |
 | 多种认证 | 支持密码、OpenSSH 私钥、FIDO / YubiKey、Windows OpenSSH Agent 和 Pageant。 |
 | 远程命令 | 执行命令、通过 stdin 发送文本，或用 sudo / su 明确指定执行用户。 |
 | 并发与批量 | 在同一 SSH 连接上运行多条命令，或对明确指定的主机列表进行探测和执行。 |
@@ -36,15 +37,16 @@
 | 调用审批 | 查看 SSH 完整命令和等待批次，为临时秘密的每个字段独立设置审批。 |
 | 临时秘密 | 将 API Key、Token 保存在进程内存中，注入指定本地程序的环境变量。 |
 
-## 0.3.3 更新亮点
+## 0.4.0 更新亮点
 
-- **sudo / su：** 每次指定执行用户、绝对路径程序和原样参数；保存密码供给分别授权，关闭时仍可免密执行。
-- **SSH 调用审批：** 每次调用前查看完整命令、输入和批次，保持连接也不会复用审批。
-- **临时秘密：** 每个字段默认开启审批，保存或清除字段会撤销等待中的执行。
-- **编辑器与凭据：** 可选账号密码默认折叠并按账号绑定，切换登录账号不会转移或泄露另一账号的保存密码。
-- **引导安装：** 完整 Skill 统一使用符号链接，支持环境检查、替换确认与备份。
+- **Bitwarden 主机：** Bitwarden 某个文件夹中的登录项目即主机：项目名称 = 别名，`ssh://` 或 `telnet://` URI = 连接地址，用户名和密码 = 登录凭据。每次使用前都通过官方 `bw` CLI 重新读取，保管库中的修改在下一次调用时生效。
+- **1Password 主机：** 1Password 某个保险库中的登录项目即主机，通过官方 `op` CLI 与 1Password 桌面 App 读取，由 App 请求你允许 codex-hosts。
+- **设置向导：** Bitwarden 依次设置 CLI、服务器、含新设备验证的登录和文件夹；1Password 自动搜索 `op.exe`，在授权窗口出现前先行说明，并选择或新建保险库。
+- **所有凭据服务共用一套主机管理：** 本地、Bitwarden 与 1Password 主机共用列表、编辑器和对话框；保存或删除保管库主机会写入对应项目（1Password 项目改为归档）。工具栏显示各服务状态，状态栏按服务统计主机数量。
+- **每次调用只弹一个对话框：** 需要审批的调用遇到 Bitwarden 保管库已锁定时，直接在审批对话框中输入主密码。sudo 和 su 复用从项目读取的登录密码。
+- **编辑器：** 放弃未保存的修改前先确认，并提供“还原修改”和“删除”。密码框可切换显示，且不保留撤销记录。
 
-[查看版本差异](https://github.com/Torinomii/codex-hosts/compare/v0.3.2...v0.3.3)
+[查看版本差异](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
 
 ## 安装
 
@@ -153,7 +155,7 @@ Windows 必须允许创建符号链接。检查失败时，请自行开启「开
 
 ### 1. 添加主机
 
-打开 `codex-hosts.exe`，新建主机，填写别名、地址、端口、用户名、协议和认证方式。按需添加备注与标签，然后保存。
+打开 `codex-hosts.exe`，选择“新建主机”，填写别名、地址、端口、用户名、协议和认证方式。按需添加备注与标签，然后保存。设置密码管理器后，同一菜单也能新建 Bitwarden 或 1Password 主机。
 
 ### 2. 选择认证方式
 
@@ -166,7 +168,16 @@ Windows 必须允许创建符号链接。检查失败时，请自行开启「开
 
 这些认证方式中的敏感值不会通过 Codex 对话传递。
 
-### 3. 让 Codex 使用主机
+### 3. 可选：把主机放在 Bitwarden 或 1Password
+
+在工具栏打开“凭据服务”，为某个服务选择“开始设置…”。向导检查官方 CLI 并连接账户后，主机列表中会出现该服务的分区，工具栏也会显示其状态。
+
+| 服务 | 需要 | 哪些项目是主机 |
+| --- | --- | --- |
+| Bitwarden | 官方 Bitwarden CLI（`bw.exe`），以及 bitwarden.com、bitwarden.eu 或自托管服务器上的账户 | 一个文件夹中的登录项目 |
+| 1Password | 正在运行、并开启“设置 › 开发者 › 与 1Password CLI 集成”的 1Password 桌面 App，以及官方 1Password CLI（`op.exe`） | 一个保险库中的登录项目；建议使用专用保险库 |
+
+### 4. 让 Codex 使用主机
 
 告诉 Codex 已保存的主机别名和任务即可，例如：
 
@@ -182,7 +193,8 @@ Skill 会查找主机、验证指纹、完成认证并返回结构化执行结�
 
 | 控制项 | 行为 |
 | --- | --- |
-| 登录凭据 | 密码和私钥口令保存在 Windows 凭据管理器；FIDO PIN 不保存。 |
+| 登录凭据 | 密码和私钥口令保存在 Windows 凭据管理器，保管库主机则保存在其 Bitwarden / 1Password 项目中；FIDO PIN 不保存。 |
+| Bitwarden / 1Password | 每次使用前重新读取项目。主密码和新设备验证码只在本程序中输入；1Password 只在其自身 App 中解锁。 |
 | 主机身份 | 未知或变化的 SSH 指纹需要确认，跳板链中的每一跳也会验证。 |
 | 会话保持 | 复用会话会跳过后续认证和硬件密钥触碰；调用审批是独立设置。 |
 | sudo / su | 每次调用明确选择用户；保存密码供给分别授权，仅处理最外层认证。 |
@@ -191,7 +203,7 @@ Skill 会查找主机、验证指纹、完成认证并返回结构化执行结�
 > **Telnet 不提供加密。** 凭据、命令和结果可能以明文传输。仅在接受此风险的可信网络中使用，互联网连接优先选择 SSH。
 
 <details>
-<summary><strong>凭据存储、主机信任、认证保持与临时秘密的详细说明</strong></summary>
+<summary><strong>凭据存储、密码管理器、主机信任、认证保持与临时秘密的详细说明</strong></summary>
 
 ### 登录凭据
 
@@ -205,6 +217,13 @@ Skill 会查找主机、验证指纹、完成认证并返回结构化执行结�
 - 返回给 Codex
 
 FIDO PIN 只用于当前操作，不会保存。
+
+### Bitwarden 与 1Password 主机
+
+主机可以存放在密码管理器中，而不是凭据管理器。登录项目保存别名、连接地址、用户名、密码、备注和标签；其余设置（认证保持、调用审批、跳板主机和高级选项）留在 `codex-hosts`。每次使用前都通过厂商的官方 CLI 重新读取项目，保管库中的修改在下一次调用时生效；在窗口中保存主机会写回项目。
+
+- **Bitwarden：** `codex-hosts` 在自己的提示框中请求主密码；调用需要审批时，则在审批对话框中请求。“重新验证”决定会话密钥保留多久：每次调取、闲置一段时间后、直到 `codex-hosts` 关闭，或直到你按“锁定”。保留的密钥存于 Windows 凭据管理器，结束时也会执行 `bw lock`。
+- **1Password：** `codex-hosts` 不会接触你的账户密码。1Password App 请求你允许 codex-hosts，并以 Windows Hello 或账户密码确认；闲置 10 分钟后、且至少每 12 小时会再次请求。删除主机会归档对应项目。
 
 ### SSH Host Key
 
@@ -246,7 +265,22 @@ SSH 主机指纹必须由用户明确确认。
 
 ## 版本记录
 
-展开版本可查看完整变更。当前 0.3.3 的亮点见上方。
+展开版本可查看完整变更。当前 0.4.0 的亮点见上方。
+
+<details>
+<summary><strong>0.4.0 · Bitwarden 与 1Password 主机</strong></summary>
+
+- **Bitwarden 主机：** 一个文件夹中的登录项目即主机（名称 = 别名，`ssh://` 或 `telnet://` URI = 连接地址，用户名和密码 = 登录凭据，备注和标签存于 `codex-hosts:` 自定义字段）。每次使用前，官方 `bw` CLI 会在不超过所选时限的同步之后重新读取项目。在文件夹中新建的主机，列表刷新前也能按别名找到。
+- **Bitwarden 设置与锁定：** 向导依次设置 CLI、服务器（bitwarden.com、bitwarden.eu 或自托管）、含新设备验证的登录和文件夹。“重新验证”决定保管库保持解锁多久：每次调取、闲置一段时间后、直到窗口关闭，或直到手动锁定。保留的密钥存于 Windows 凭据管理器，结束时也会执行 `bw lock`。
+- **1Password 主机：** 一个保险库中的登录项目即主机，通过官方 `op` CLI 与 1Password 桌面 App 读取。向导自动搜索 `op.exe`（winget、Scoop、Chocolatey、Program Files、PATH），在 App 授权窗口出现前和等待时给出说明，并选择或新建保险库。编辑前先比对项目版本，若期间在 1Password 中被改动，会提示而不覆盖。
+- **共用主机管理：** 本地与保管库主机使用相同的列表分区、编辑器、删除对话框和按服务统计的主机数量。“凭据服务”列出所有服务，已设置的服务在工具栏显示状态。不能作为主机的项目会在服务页面列出，并说明缺少什么。
+- **调用：** 每次调用只弹一个对话框。需要审批且 Bitwarden 保管库已锁定时，在审批对话框中输入主密码。sudo 和 su 复用该次调用从项目读取的登录密码。新增的 `BITWARDEN_*` 与 `ONEPASSWORD_*` 错误码告诉 Codex 用户需要做什么。
+- **编辑器：** 放弃未保存的修改前先确认，并提供“还原修改”和“删除”。密码框可切换显示，且不保留撤销记录。破坏性操作的确认按钮改为红色实心。
+- **Skill 与 MCP：** `list_hosts` 返回 `credential_source`；说明与 Skill 描述了保管库主机、授权提示及其错误码。
+
+[查看版本差异](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
+
+</details>
 
 <details>
 <summary><strong>0.3.3 · sudo / su、调用审批与引导安装</strong></summary>
@@ -312,7 +346,7 @@ Codex 通过 stdio 与 `codex-hosts.exe --mcp` 通信。每个工具都同时以
 
 | 工具 | 用途 |
 | --- | --- |
-| `list_hosts` | 已保存主机的非敏感信息、信任状态、`auth_persistence`、`require_call_approval`、sudo/su 供密权限、`max_channels`、`remote_env` |
+| `list_hosts` | 已保存主机的非敏感信息、`credential_source`、信任状态、`auth_persistence`、`require_call_approval`、sudo/su 供密权限、`max_channels`、`remote_env` |
 | `agent_identities`、`fido_identities` | 已加载 Agent 身份与 FIDO Handle 的公开信息 |
 | `probe`、`batch_probe` | 认证并运行 `hostname`；暴露未知或变更的主机密钥 |
 | `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 执行命令；`exec_stdin` 单独成工具，因为 stdin 里的程序正文对审查不透明 |

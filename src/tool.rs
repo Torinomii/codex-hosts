@@ -11,13 +11,12 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 
-use crate::bitwarden;
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
 use crate::fido::{self, FidoKeyInfo};
 use crate::model::{
     AuthPersistence, CredentialSource, HostFilter, HostProfile, Protocol, RemoteEnv, SshAuth,
-    normalize_tags,
+    VaultProvider, normalize_tags,
 };
 use crate::ssh::{self, AgentKeyInfo, OperationLimits, RemoteFailure, VerifiedHostKey};
 use crate::storage::HostStore;
@@ -642,11 +641,11 @@ pub(crate) fn list_hosts(
         tags: normalize_tags(tags),
     };
     let mut hosts = Vec::with_capacity(store.hosts.len());
-    for host in store.hosts.iter().filter(|host| {
-        !host.advanced.codex_hidden
-            && filter.matches(host)
-            && (store.bitwarden.enabled || !host.is_vault_host())
-    }) {
+    for host in store
+        .hosts
+        .iter()
+        .filter(|host| !host.advanced.codex_hidden && filter.matches(host) && store.serves(host))
+    {
         // A Credential Manager read that fails for one host should not hide
         // the whole list; that host simply reports no usable secret. A
         // vault-backed host counts by reference: the vault is never read here.
@@ -1166,11 +1165,15 @@ pub(crate) fn find_host<'a>(
     alias: &str,
 ) -> Result<&'a HostProfile, RemoteFailure> {
     let host = find_host_in(&store.hosts, alias)?;
-    if host.is_vault_host() && !store.bitwarden.enabled {
+    if !store.serves(host) {
+        let (code, manager) = match host.vault_provider() {
+            Some(VaultProvider::OnePassword) => ("ONEPASSWORD_DISABLED", "1Password"),
+            _ => ("BITWARDEN_DISABLED", "Bitwarden"),
+        };
         return Err(RemoteFailure::new(
-            "BITWARDEN_DISABLED",
+            code,
             format!(
-                "The host {alias} is defined in Bitwarden, which is switched off in codex-hosts."
+                "The host {alias} is defined in {manager}, which is switched off in codex-hosts."
             ),
         ));
     }
@@ -1185,8 +1188,8 @@ pub(crate) async fn load_host(alias: &str) -> Result<(HostStore, HostProfile), R
     let found = find_host(&store, alias).cloned();
     match found {
         Ok(host) => Ok((store, host)),
-        Err(error) if error.code == "ALIAS_NOT_FOUND" && store.bitwarden.available() => {
-            if !bitwarden::discover().await? {
+        Err(error) if error.code == "ALIAS_NOT_FOUND" => {
+            if !crate::vault_hosts::discover(&store).await? {
                 return Err(error);
             }
             let store = load_store()?;
@@ -1204,7 +1207,7 @@ pub(crate) async fn load_store_for_aliases(aliases: &[String]) -> Result<HostSto
     let unknown = aliases
         .iter()
         .any(|alias| crate::model::find_alias(&store.hosts, alias).is_none());
-    if unknown && store.bitwarden.available() && bitwarden::discover().await? {
+    if unknown && crate::vault_hosts::discover(&store).await? {
         return load_store();
     }
     Ok(store)
@@ -1214,13 +1217,11 @@ pub(crate) async fn load_store_for_aliases(aliases: &[String]) -> Result<HostSto
 /// that costs nothing (a stored key that is not spent by being read).
 pub(crate) async fn load_store_for_listing() -> Result<HostStore, RemoteFailure> {
     let store = load_store()?;
-    if !store.bitwarden.available() {
-        return Ok(store);
-    }
-    match bitwarden::refresh_quietly().await {
-        Ok(Some(_)) => load_store(),
-        // A locked vault or a failed sync leaves the listing on the mirrors.
-        Ok(None) | Err(_) => Ok(store),
+    // A locked vault or a failed sync leaves the listing on the mirrors.
+    if crate::vault_hosts::refresh_quietly(&store).await {
+        load_store()
+    } else {
+        Ok(store)
     }
 }
 

@@ -10,6 +10,7 @@ Read this when a host must be created, completed, or corrected, or its host key 
 
 - Omit unknown fields. There is no parameter for a password, passphrase, or PIN; the user types those in the window.
 - Use the exact alias the user gave. An existing alias opens its saved profile, and the given fields overwrite those draft fields; a new alias creates a profile, saved immediately with the given fields.
+- A new alias always creates a local host. The alias of a Bitwarden or 1Password host opens that host; saving writes its item, so the vault may need unlocking or the 1Password app may ask to allow codex-hosts. Fix an `*_ITEM_MISSING` or `*_ITEM_MISMATCH` item this way, or let the user fix it in the vault.
 - `auth` is `password`, `private-key` (alias `fido-handle`), or `ssh-agent`. In the GUI, `private-key` is **Key file / hardware key** and `ssh-agent` is **SSH Agent / Pageant**; do not present `ssh-agent` as the general hardware-key option.
 - `jump_host` must be an existing verified SSH alias, the only kind the editor offers. An unknown or empty value clears the draft's jump host, so omit it to keep the saved chain.
 - Omitting `description` or `tags` keeps the saved values; `description: ""` clears the notes and `tags: [""]` clears the tags. Tags are trimmed and de-duplicated ignoring case, keeping the first spelling.

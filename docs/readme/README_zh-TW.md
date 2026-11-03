@@ -3,7 +3,7 @@
 <p align="center">儲存主機，掌握憑據，讓 Codex 完成遠端任務。</p>
 
 <p align="center">
-  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.3.3"><img src="https://img.shields.io/badge/version-0.3.3-2563eb" alt="v0.3.3" /></a>
+  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.4.0"><img src="https://img.shields.io/badge/version-0.4.0-2563eb" alt="v0.4.0" /></a>
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="建置 Release" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 授權條款" /></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D4?logo=windows&logoColor=white" alt="Windows 10 或更新版本" />
@@ -18,10 +18,10 @@
   <a href="https://github.com/Torinomii/codex-hosts/releases">下載</a> · <a href="#安裝">安裝</a> · <a href="#快速上手">快速上手</a> · <a href="#版本記錄">版本記錄</a> · <a href="#技術參考">技術參考</a>
 </p>
 
-供 Codex 使用的 Windows SSH / Telnet 主機管理工具與 MCP 伺服器。儲存主機後，就能讓 Codex 連線、執行命令或批次操作多台機器。密碼、私鑰密碼片語和 FIDO PIN 在本機輸入，不進入對話或工具參數。
+供 Codex 使用的 Windows SSH / Telnet 主機管理工具與 MCP 伺服器。將主機儲存在本機，或 Bitwarden、1Password 保管庫中，就能讓 Codex 連線、執行命令或批次操作多台機器。密碼、私鑰密碼片語和 FIDO PIN 在本機輸入，不進入對話或工具參數。
 
 <p align="center">
-  <img src="../../Main.png" alt="Codex Hosts 主視窗" width="960" />
+  <img src="../../Main.png" alt="顯示本地、Bitwarden 與 1Password 主機的 Codex Hosts 主視窗" width="960" />
 </p>
 
 ## 功能概覽
@@ -29,6 +29,7 @@
 | 能力 | 可以做什麼 |
 | --- | --- |
 | 主機管理 | 儲存 SSH / Telnet 設定、備註與標籤，支援搜尋、篩選、匯入及匯出。 |
+| 憑據服務 | 主機登入憑據可儲存在 Windows 認證管理員、Bitwarden 資料夾或 1Password 保管庫；每個服務都有自己的清單分區、設定精靈與工具列狀態。 |
 | 多種驗證 | 支援密碼、OpenSSH 私鑰、FIDO / YubiKey、Windows OpenSSH Agent 與 Pageant。 |
 | 遠端命令 | 執行命令、透過 stdin 傳送文字，或用 sudo / su 明確指定執行使用者。 |
 | 並行與批次 | 在同一條 SSH 連線上執行多條命令，或對明確指定的主機清單進行探測及執行。 |
@@ -36,15 +37,16 @@
 | 呼叫審批 | 查看 SSH 完整命令與等待批次，為臨時秘密的每個欄位獨立設定審批。 |
 | 臨時秘密 | 將 API Key、Token 保存在行程記憶體中，注入指定本機程式的環境變數。 |
 
-## 0.3.3 更新亮點
+## 0.4.0 更新亮點
 
-- **sudo / su：** 每次指定執行使用者、絕對路徑程式與原樣參數；儲存密碼供給分別授權，關閉時仍可免密執行。
-- **SSH 呼叫審批：** 每次呼叫前查看完整命令、輸入與批次，保持連線也不會重用審批。
-- **臨時秘密：** 每個欄位預設開啟審批，儲存或清除欄位會撤銷等待中的執行。
-- **編輯器與憑據：** 選用帳號密碼預設摺疊並依帳號綁定，切換登入帳號不會轉移或洩露另一帳號的儲存密碼。
-- **引導安裝：** 完整 Skill 統一使用符號連結，支援環境檢查、替換確認與備份。
+- **Bitwarden 主機：** Bitwarden 某個資料夾中的登入項目即主機：項目名稱 = 別名，`ssh://` 或 `telnet://` URI = 連線位址，使用者名稱與密碼 = 登入憑據。每次使用前都透過官方 `bw` CLI 重新讀取，保管庫中的修改在下一次呼叫時生效。
+- **1Password 主機：** 1Password 某個保管庫中的登入項目即主機，透過官方 `op` CLI 與 1Password 桌面 App 讀取，由 App 請求你允許 codex-hosts。
+- **設定精靈：** Bitwarden 依序設定 CLI、伺服器、含新裝置驗證的登入與資料夾；1Password 自動搜尋 `op.exe`，在授權視窗出現前先行說明，並選擇或新建保管庫。
+- **所有憑據服務共用一套主機管理：** 本地、Bitwarden 與 1Password 主機共用清單、編輯器與對話框；儲存或刪除保管庫主機會寫入對應項目（1Password 項目改為封存）。工具列顯示各服務狀態，狀態列依服務統計主機數量。
+- **每次呼叫只跳一個對話框：** 需要審批的呼叫遇到 Bitwarden 保管庫已鎖定時，直接在審批對話框中輸入主密碼。sudo 與 su 重用從項目讀取的登入密碼。
+- **編輯器：** 放棄未儲存的修改前先確認，並提供「還原修改」與「刪除」。密碼欄可切換顯示，且不保留復原記錄。
 
-[查看版本差異](https://github.com/Torinomii/codex-hosts/compare/v0.3.2...v0.3.3)
+[查看版本差異](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
 
 ## 安裝
 
@@ -153,7 +155,7 @@ Windows 必須允許建立符號連結。檢查失敗時，請自行開啟「開
 
 ### 1. 新增主機
 
-開啟 `codex-hosts.exe`，新增主機，填寫別名、位址、連接埠、使用者名稱、協定與驗證方式。按需加入備註與標籤，再儲存。
+開啟 `codex-hosts.exe`，選擇「新增主機」，填寫別名、位址、連接埠、使用者名稱、協定與驗證方式。按需加入備註與標籤，再儲存。設定密碼管理器後，同一選單也能新增 Bitwarden 或 1Password 主機。
 
 ### 2. 選擇驗證方式
 
@@ -166,7 +168,16 @@ Windows 必須允許建立符號連結。檢查失敗時，請自行開啟「開
 
 這些驗證方式中的敏感值不會透過 Codex 對話傳遞。
 
-### 3. 讓 Codex 使用主機
+### 3. 選用：把主機放在 Bitwarden 或 1Password
+
+在工具列開啟「憑據服務」，為某個服務選擇「開始設定…」。精靈檢查官方 CLI 並連接帳戶後，主機清單中會出現該服務的分區，工具列也會顯示其狀態。
+
+| 服務 | 需要 | 哪些項目是主機 |
+| --- | --- | --- |
+| Bitwarden | 官方 Bitwarden CLI（`bw.exe`），以及 bitwarden.com、bitwarden.eu 或自架伺服器上的帳戶 | 一個資料夾中的登入項目 |
+| 1Password | 正在執行、並開啟「設定 › 開發者 › 與 1Password CLI 整合」的 1Password 桌面 App，以及官方 1Password CLI（`op.exe`） | 一個保管庫中的登入項目；建議使用專用保管庫 |
+
+### 4. 讓 Codex 使用主機
 
 告訴 Codex 已儲存的主機別名與任務即可，例如：
 
@@ -182,7 +193,8 @@ Skill 會查找主機、驗證指紋、完成認證並回傳結構化執行結�
 
 | 控制項 | 行為 |
 | --- | --- |
-| 登入憑據 | 密碼與私鑰密碼片語儲存在 Windows 認證管理員；FIDO PIN 不儲存。 |
+| 登入憑據 | 密碼與私鑰密碼片語儲存在 Windows 認證管理員，保管庫主機則儲存在其 Bitwarden / 1Password 項目中；FIDO PIN 不儲存。 |
+| Bitwarden / 1Password | 每次使用前重新讀取項目。主密碼與新裝置驗證碼只在本程式中輸入；1Password 只在其自身 App 中解鎖。 |
 | 主機身分 | 未知或變更的 SSH 指紋需要確認，跳板鏈中的每一跳也會驗證。 |
 | 工作階段保持 | 重用工作階段會略過後續認證與硬體金鑰觸碰；呼叫審批是獨立設定。 |
 | sudo / su | 每次呼叫明確選擇使用者；儲存密碼供給分別授權，只處理最外層認證。 |
@@ -191,7 +203,7 @@ Skill 會查找主機、驗證指紋、完成認證並回傳結構化執行結�
 > **Telnet 不提供加密。** 憑據、命令與結果可能以明文傳輸。僅在接受此風險的可信網路中使用，網際網路連線優先選擇 SSH。
 
 <details>
-<summary><strong>憑據儲存、主機信任、認證保持與臨時秘密的詳細說明</strong></summary>
+<summary><strong>憑據儲存、密碼管理器、主機信任、認證保持與臨時秘密的詳細說明</strong></summary>
 
 ### 登入憑據
 
@@ -205,6 +217,13 @@ Skill 會查找主機、驗證指紋、完成認證並回傳結構化執行結�
 - 傳回給 Codex
 
 FIDO PIN 只用於目前操作，不會儲存。
+
+### Bitwarden 與 1Password 主機
+
+主機可以存放在密碼管理器中，而不是認證管理員。登入項目保存別名、連線位址、使用者名稱、密碼、備註與標籤；其餘設定（認證保持、呼叫審批、跳板主機與進階選項）留在 `codex-hosts`。每次使用前都透過廠商的官方 CLI 重新讀取項目，保管庫中的修改在下一次呼叫時生效；在視窗中儲存主機會寫回項目。
+
+- **Bitwarden：** `codex-hosts` 在自己的提示框中請求主密碼；呼叫需要審批時，則在審批對話框中請求。「重新驗證」決定工作階段金鑰保留多久：每次調取、閒置一段時間後、直到 `codex-hosts` 關閉，或直到你按「鎖定」。保留的金鑰存於 Windows 認證管理員，結束時也會執行 `bw lock`。
+- **1Password：** `codex-hosts` 不會接觸你的帳戶密碼。1Password App 請求你允許 codex-hosts，並以 Windows Hello 或帳戶密碼確認；閒置 10 分鐘後、且至少每 12 小時會再次請求。刪除主機會封存對應項目。
 
 ### SSH Host Key
 
@@ -246,7 +265,22 @@ SSH 主機指紋必須由使用者明確確認。
 
 ## 版本記錄
 
-展開版本可查看完整變更。目前 0.3.3 的亮點見上方。
+展開版本可查看完整變更。目前 0.4.0 的亮點見上方。
+
+<details>
+<summary><strong>0.4.0 · Bitwarden 與 1Password 主機</strong></summary>
+
+- **Bitwarden 主機：** 一個資料夾中的登入項目即主機（名稱 = 別名，`ssh://` 或 `telnet://` URI = 連線位址，使用者名稱與密碼 = 登入憑據，備註與標籤存於 `codex-hosts:` 自訂欄位）。每次使用前，官方 `bw` CLI 會在不超過所選時限的同步之後重新讀取項目。在資料夾中新建的主機，清單重新整理前也能依別名找到。
+- **Bitwarden 設定與鎖定：** 精靈依序設定 CLI、伺服器（bitwarden.com、bitwarden.eu 或自架）、含新裝置驗證的登入與資料夾。「重新驗證」決定保管庫保持解鎖多久：每次調取、閒置一段時間後、直到視窗關閉，或直到手動鎖定。保留的金鑰存於 Windows 認證管理員，結束時也會執行 `bw lock`。
+- **1Password 主機：** 一個保管庫中的登入項目即主機，透過官方 `op` CLI 與 1Password 桌面 App 讀取。精靈自動搜尋 `op.exe`（winget、Scoop、Chocolatey、Program Files、PATH），在 App 授權視窗出現前與等待時給出說明，並選擇或新建保管庫。編輯前先比對項目版本，若期間在 1Password 中被改動，會提示而不覆寫。
+- **共用主機管理：** 本地與保管庫主機使用相同的清單分區、編輯器、刪除對話框與依服務統計的主機數量。「憑據服務」列出所有服務，已設定的服務在工具列顯示狀態。不能作為主機的項目會在服務頁面列出，並說明缺少什麼。
+- **呼叫：** 每次呼叫只跳一個對話框。需要審批且 Bitwarden 保管庫已鎖定時，在審批對話框中輸入主密碼。sudo 與 su 重用該次呼叫從項目讀取的登入密碼。新增的 `BITWARDEN_*` 與 `ONEPASSWORD_*` 錯誤碼告訴 Codex 使用者需要做什麼。
+- **編輯器：** 放棄未儲存的修改前先確認，並提供「還原修改」與「刪除」。密碼欄可切換顯示，且不保留復原記錄。破壞性操作的確認按鈕改為紅色實心。
+- **Skill 與 MCP：** `list_hosts` 回傳 `credential_source`；說明與 Skill 描述了保管庫主機、授權提示及其錯誤碼。
+
+[查看版本差異](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
+
+</details>
 
 <details>
 <summary><strong>0.3.3 · sudo / su、呼叫審批與引導安裝</strong></summary>
@@ -312,7 +346,7 @@ Codex 透過 stdio 與 `codex-hosts.exe --mcp` 通訊。每個工具都同時以
 
 | 工具 | 用途 |
 | --- | --- |
-| `list_hosts` | 已儲存主機的非敏感資訊、信任狀態、`auth_persistence`、`require_call_approval`、sudo/su 供密權限、`max_channels`、`remote_env` |
+| `list_hosts` | 已儲存主機的非敏感資訊、`credential_source`、信任狀態、`auth_persistence`、`require_call_approval`、sudo/su 供密權限、`max_channels`、`remote_env` |
 | `agent_identities`、`fido_identities` | 已載入 Agent 身分與 FIDO Handle 的公開資訊 |
 | `probe`、`batch_probe` | 認證並執行 `hostname`；揭露未知或變更的主機金鑰 |
 | `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 執行命令；`exec_stdin` 單獨成工具，因為 stdin 中的程式內容對審查不透明 |

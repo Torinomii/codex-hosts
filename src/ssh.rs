@@ -23,10 +23,10 @@ use windows_sys::Win32::Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0}
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
-use crate::bitwarden;
 use crate::credentials::{self, CredentialKind};
 use crate::fido;
 use crate::model::{HostProfile, Retention, SshAuth, chain_retention, resolve_ssh_chain};
+use crate::vault_hosts;
 
 const MAX_CAPTURE_BYTES: usize = 1024 * 1024;
 #[cfg(test)]
@@ -235,16 +235,16 @@ struct SessionKey {
     agent_key_fingerprint: String,
     host_fingerprint: Option<String>,
     host_key_algorithm: Option<String>,
-    /// The Bitwarden item and session this operation was admitted under; a
-    /// session opened under another admission (or after a lock) is not reused.
-    bitwarden: Option<bitwarden::Admission>,
+    /// The vault item (and Bitwarden session) this operation was admitted
+    /// under; a session opened under another admission is not reused.
+    vault: Option<vault_hosts::Admission>,
 }
 
 impl SessionKey {
     fn new(
         host: &HostProfile,
         parent: Option<&SessionKey>,
-        admission: Option<&bitwarden::Admission>,
+        admission: Option<&vault_hosts::Admission>,
     ) -> Self {
         let private_key_version = (host.ssh_auth == SshAuth::PrivateKey)
             .then(|| fs::metadata(host.private_key_path.trim()).ok())
@@ -270,7 +270,7 @@ impl SessionKey {
             agent_key_fingerprint: host.agent_key_fingerprint.trim().to_owned(),
             host_fingerprint: host.host_fingerprint.clone(),
             host_key_algorithm: host.host_key_algorithm.clone(),
-            bitwarden: admission.cloned(),
+            vault: admission.cloned(),
         }
     }
 }
@@ -1300,14 +1300,14 @@ async fn pooled_connection(
     let mut vault_password = None;
     let refreshed;
     let host: &HostProfile = if host.is_vault_host() {
-        let admitted = bitwarden::admit(host).await?;
-        admission = Some(admitted.admission.clone());
-        refreshed = admitted.host.clone();
-        let login = admitted.into_login();
+        let admitted = vault_hosts::admit(host).await?;
+        admission = Some(admitted.admission);
+        refreshed = admitted.host;
+        let login = admitted.login;
         // Handed to sudo/su only for the account the call was made for; an
         // item whose username moved meanwhile goes back to the vault check.
         if refreshed.username == host.username {
-            vault_password = login.password.clone();
+            vault_password = login.password().cloned();
         }
         vault_login = Some(login);
         &refreshed
@@ -1364,7 +1364,7 @@ async fn connect_one(
     key: SessionKey,
     limits: OperationLimits,
     retention: Option<Retention>,
-    vault_login: Option<bitwarden::VaultLogin>,
+    vault_login: Option<vault_hosts::VaultLogin>,
 ) -> Result<Arc<PooledSession>, RemoteFailure> {
     // A retained session must survive quiet stretches between calls, so the
     // link is watched with keepalives instead of the first call's command timeout.
@@ -1487,22 +1487,20 @@ async fn connect_one(
 async fn authenticate(
     session: &mut client::Handle<ServerKeyObserver>,
     host: &HostProfile,
-    vault_login: Option<bitwarden::VaultLogin>,
+    vault_login: Option<vault_hosts::VaultLogin>,
 ) -> Result<Option<String>, RemoteFailure> {
     match host.ssh_auth {
         SshAuth::Password => {
             let password = if host.is_vault_host() {
                 // The admission read the item moments ago; only a missing
                 // password goes back to the vault (which then reports it).
-                match vault_login {
-                    Some(bitwarden::VaultLogin {
-                        password: Some(password),
-                        ..
-                    }) => password,
-                    other => {
-                        bitwarden::resolve_login_password(host, other.map(|login| login.session))
-                            .await?
-                    }
+                let mut login = vault_login;
+                match login
+                    .as_mut()
+                    .and_then(vault_hosts::VaultLogin::take_password)
+                {
+                    Some(password) => password,
+                    None => vault_hosts::resolve_login_password(host, login).await?,
                 }
             } else {
                 credentials::load(host.id, credentials::login_password_kind(host))

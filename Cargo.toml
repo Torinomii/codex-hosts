@@ -35,7 +35,7 @@ sys-locale = "0.3.2"
 thiserror = "2"
 tokio-util = "0.7"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 zeroize = "1"
 
 [target.'cfg(windows)'.dependencies]

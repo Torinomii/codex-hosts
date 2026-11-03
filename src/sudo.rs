@@ -167,7 +167,7 @@ async fn password_for_method_async(
                 Some(password) => Some(password.clone()),
                 // Vault refusals keep their own codes: the user acts in the
                 // credential manager, not in this host's Advanced settings.
-                None => Some(crate::bitwarden::resolve_login_password(profile, None).await?),
+                None => Some(crate::vault_hosts::resolve_login_password(profile, None).await?),
             },
             candidate => credentials::load(profile.id, candidate.kind(profile))
                 .map_err(|_| method.failure("read", username))?,
@@ -604,6 +604,7 @@ mod tests {
             item_id: Uuid::new_v4(),
             item_name: "alice@host".into(),
             revision_date: String::new(),
+            ..Default::default()
         });
         assert!(login_password_available(&host));
         host.ssh_auth = SshAuth::PrivateKey;
@@ -628,6 +629,7 @@ mod tests {
             item_id: Uuid::new_v4(),
             item_name: "alice@host".into(),
             revision_date: String::new(),
+            ..Default::default()
         });
         let admitted = Zeroizing::new("from-the-item".to_owned());
         let runtime = tokio::runtime::Builder::new_current_thread()

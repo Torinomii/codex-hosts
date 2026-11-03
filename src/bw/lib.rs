@@ -39,4 +39,4 @@ pub use policy::{
     MasterPassword, NO_INTERACTION_ENV, PASSWORD_ENV, SESSION_ENV, SessionKey, TwoFactorMethod,
     encode_item_json,
 };
-pub use runner::{BwOutput, BwRunError, run};
+pub use runner::{BwOutput, BwRunError, run, run_command};

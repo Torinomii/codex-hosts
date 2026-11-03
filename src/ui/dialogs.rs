@@ -6,7 +6,7 @@ use eframe::egui::{self, RichText};
 
 use super::{FidoSetupAction, FidoSetupPrompt, HostsApp};
 use crate::i18n::Catalog;
-use crate::model::{AuthPersistence, HostProfile};
+use crate::model::AuthPersistence;
 use zeroize::Zeroizing;
 
 pub(super) enum DialogResult<T> {
@@ -41,6 +41,41 @@ pub(super) fn dialog_shell<R>(
             body(ui)
         })
         .inner
+}
+
+/// A setup wizard's step line ("1. bw.exe › 2. Sign in › …"), the current
+/// step strong, then the wizard's error and its busy line.
+pub(super) fn wizard_header(
+    ui: &mut egui::Ui,
+    catalog: &Catalog,
+    steps: &[&str],
+    current: usize,
+    error: Option<&str>,
+    busy: Option<&str>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        for (index, key) in steps.iter().enumerate() {
+            let text = format!("{}. {}", index + 1, catalog.text(key));
+            if index == current {
+                ui.label(RichText::new(text).strong());
+            } else {
+                ui.label(RichText::new(text).weak());
+            }
+            if index + 1 < steps.len() {
+                ui.label(RichText::new("›").weak());
+            }
+        }
+    });
+    ui.separator();
+    if let Some(error) = error {
+        ui.add(egui::Label::new(RichText::new(error).color(ui.visuals().error_fg_color)).wrap());
+    }
+    if let Some(busy) = busy {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.add(egui::Label::new(busy).wrap());
+        });
+    }
 }
 
 pub(super) fn dialog_button_row(
@@ -457,19 +492,15 @@ impl HostsApp {
             return;
         }
         let catalog = &self.catalog;
-        let vault_host = self
+        let texts = self
             .selected
             .and_then(|id| self.store.hosts.iter().find(|host| host.id == id))
-            .is_some_and(HostProfile::is_vault_host);
+            .and_then(|host| super::services::HostGroup::of(host).texts());
         let choice = confirm_dialog(
             context,
             "delete_confirmation",
             catalog.text("delete_title"),
-            catalog.text(if vault_host {
-                "vault_delete_message"
-            } else {
-                "delete_message"
-            }),
+            catalog.text(texts.map_or("delete_message", |texts| texts.delete_message)),
             catalog.text("confirm_delete"),
             catalog.text("cancel"),
             true,

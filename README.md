@@ -3,7 +3,7 @@
 <p align="center">Your saved hosts. Your credentials. Codex at work.</p>
 
 <p align="center">
-  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.3.3"><img src="https://img.shields.io/badge/version-0.3.3-2563eb" alt="v0.3.3" /></a>
+  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.4.0"><img src="https://img.shields.io/badge/version-0.4.0-2563eb" alt="v0.4.0" /></a>
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="Build release" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 License" /></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D4?logo=windows&logoColor=white" alt="Windows 10 or newer" />
@@ -18,10 +18,10 @@
   <a href="https://github.com/Torinomii/codex-hosts/releases">Download</a> · <a href="#installation">Installation</a> · <a href="#quick-start">Quick start</a> · <a href="#release-history">Release history</a> · <a href="#technical-reference">Technical reference</a>
 </p>
 
-A Windows SSH / Telnet host manager and MCP server for Codex. Save a host once, then ask Codex to connect, run commands or work across several machines. Passwords, private-key passphrases and FIDO PINs are collected locally and kept out of the conversation and tool parameters.
+A Windows SSH / Telnet host manager and MCP server for Codex. Save a host once, locally or in a Bitwarden or 1Password vault, then ask Codex to connect, run commands or work across several machines. Passwords, private-key passphrases and FIDO PINs are collected locally and kept out of the conversation and tool parameters.
 
 <p align="center">
-  <img src="Main.png" alt="Codex Hosts main window" width="960" />
+  <img src="Main.png" alt="Codex Hosts main window with local, Bitwarden and 1Password hosts" width="960" />
 </p>
 
 ## At a glance
@@ -29,6 +29,7 @@ A Windows SSH / Telnet host manager and MCP server for Codex. Save a host once, 
 | Capability | What you can do |
 | --- | --- |
 | Host management | Save SSH / Telnet profiles with descriptions and tags; search, filter, import and export them. |
+| Credential stores | Keep host logins in Windows Credential Manager, a Bitwarden folder or a 1Password vault; each store has its own list section, setup wizard and toolbar status. |
 | Authentication | Use passwords, OpenSSH private keys, FIDO / YubiKey handles, Windows OpenSSH Agent or Pageant. |
 | Remote commands | Run a command, send text over stdin, or select an execution user explicitly with sudo / su. |
 | Parallel work | Run several commands over one SSH connection, or probe and execute across an explicit host list. |
@@ -36,15 +37,16 @@ A Windows SSH / Telnet host manager and MCP server for Codex. Save a host once, 
 | Call approval | Review complete SSH commands and waiting batches; set approval separately for each temporary-secret field. |
 | Temporary secrets | Keep API keys and tokens in process memory and inject them into a chosen local program's environment. |
 
-## What's new in 0.3.3
+## What's new in 0.4.0
 
-- **Sudo / su:** Choose an execution user and pass an absolute program with exact arguments. Saved-password supply is separately authorized; passwordless paths work with it off.
-- **SSH call approval:** Review full commands, inputs and batches before each call. Retained connections never reuse an approval.
-- **Temporary secrets:** Approval is enabled per field by default. Saving or clearing a field revokes waiting runs.
-- **Editor and credentials:** Optional account passwords stay collapsed and account-bound. Changing a login cannot transfer or expose another account's saved password.
-- **Guided installation:** Install the complete Skill through symbolic links, with environment checks, confirmed replacements and backups.
+- **Bitwarden hosts:** The Login items of one Bitwarden folder are hosts: item name = alias, `ssh://` or `telnet://` URI = endpoint, username and password = login. Each use re-reads the item through the official `bw` CLI, so vault edits apply on the next call.
+- **1Password hosts:** The Login items of one 1Password vault are hosts, read through the official `op` CLI and the 1Password desktop app, which asks you to allow codex-hosts.
+- **Setup wizards:** Bitwarden walks through the CLI, server, login with new-device verification and folder. 1Password finds `op.exe`, explains the authorization prompt before it appears, and picks or creates the vault.
+- **One host manager for every store:** Local, Bitwarden and 1Password hosts share the list, editor and dialogs. Saving or deleting a vault host writes its item (1Password items are archived). The toolbar shows each store's status; the status bar counts hosts per store.
+- **One dialog per call:** When a call needs approval and the Bitwarden vault is locked, the approval dialog asks for the master password. Sudo and su reuse the login password read from the item.
+- **Editor:** Asks before discarding unsaved edits and offers **Revert changes** and **Delete**. Password fields have a show/hide toggle and keep no undo history.
 
-[Compare changes](https://github.com/Torinomii/codex-hosts/compare/v0.3.2...v0.3.3)
+[Compare changes](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
 
 ## Installation
 
@@ -153,7 +155,7 @@ Confirm that the installed codex-hosts Skill directory is one symbolic link and 
 
 ### 1. Add a host
 
-Open `codex-hosts.exe`, create a host, and enter its alias, address, port, user, protocol and authentication method. Add a description or tags if useful, then save.
+Open `codex-hosts.exe`, choose **New host**, and enter its alias, address, port, user, protocol and authentication method. Add a description or tags if useful, then save. Once a password manager is set up, the same menu also creates a Bitwarden or 1Password host.
 
 ### 2. Choose an authentication method
 
@@ -166,7 +168,16 @@ Open `codex-hosts.exe`, create a host, and enter its alias, address, port, user,
 
 Sensitive authentication values are not passed through the Codex conversation.
 
-### 3. Use the host from Codex
+### 3. Optional: keep hosts in Bitwarden or 1Password
+
+Open **Credential services** in the toolbar and choose **Start setup…** for a store. Its wizard checks the official CLI and connects your account; the store then gets its own section in the host list and a status in the toolbar.
+
+| Store | You need | Hosts are |
+| --- | --- | --- |
+| Bitwarden | The official Bitwarden CLI (`bw.exe`) and an account on bitwarden.com, bitwarden.eu or your own server | The Login items in one folder |
+| 1Password | The 1Password desktop app, running, with **Settings › Developer › Integrate with 1Password CLI** on, and the official 1Password CLI (`op.exe`) | The Login items in one vault; a vault of its own is recommended |
+
+### 4. Use the host from Codex
 
 Tell Codex the saved alias and the task. For example:
 
@@ -182,7 +193,8 @@ The Skill looks up the host, verifies its key, authenticates and returns structu
 
 | Control | Behaviour |
 | --- | --- |
-| Login credentials | Passwords and key passphrases stay in Windows Credential Manager; FIDO PINs are never saved. |
+| Login credentials | Passwords and key passphrases stay in Windows Credential Manager, or in the Bitwarden / 1Password item of a vault host; FIDO PINs are never saved. |
+| Bitwarden / 1Password | Items are read again before each use. The master password and new-device code are typed only in the app; 1Password unlocks only in its own app. |
 | Host identity | Unknown or changed SSH fingerprints require your confirmation, including each jump hop. |
 | Retained connections | Reusing a session skips later authentication and key touches. Call approval is a separate setting. |
 | Sudo / su | Choose the user on each call. Saved-password supply has independent permissions and handles only the outer authentication. |
@@ -191,7 +203,7 @@ The Skill looks up the host, verifies its key, authenticates and returns structu
 > **Telnet has no encryption.** Credentials, commands and results may cross the network in plaintext. Use it only on trusted networks where you accept that risk; prefer SSH for Internet connections.
 
 <details>
-<summary><strong>Credential storage, host trust, session persistence and temporary secrets</strong></summary>
+<summary><strong>Credential storage, password managers, host trust, session persistence and temporary secrets</strong></summary>
 
 ### Login credentials
 
@@ -207,6 +219,13 @@ These sensitive values are not:
 A FIDO PIN is used only for the current operation and is not saved.
 
 The host store (`hosts.json`) must be owned by the Windows account running `codex-hosts`. The MCP server refuses to start when another account owns it and prints the `icacls /setowner` command that repairs it to stderr (visible in Codex's MCP log); the GUI only warns. This catches a store copied from another account, not an attacker who already runs as you.
+
+### Bitwarden and 1Password hosts
+
+A host can live in a password manager instead of Credential Manager. Its Login item holds the alias, endpoint, username, password, description and tags; the other settings (authentication persistence, call approval, jump host and Advanced options) stay in `codex-hosts`. The item is read through the vendor's official CLI before every use, so changes made in the vault apply on the next call, and saving the host in the window writes the item back.
+
+- **Bitwarden:** `codex-hosts` asks for the master password in its own prompt, or inside the approval dialog when the call needs approval. **Ask again** sets how long the session key is kept: every call, an idle time, until `codex-hosts` closes, or until you press Lock. The kept key is stored in Windows Credential Manager, and ending it also runs `bw lock`.
+- **1Password:** `codex-hosts` never sees your account password. The 1Password app asks you to allow codex-hosts and confirms with Windows Hello or the account password; it asks again after 10 idle minutes and at least every 12 hours. Deleting a host archives its item.
 
 ### SSH host keys
 
@@ -246,7 +265,22 @@ See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md) 
 
 ## Release history
 
-Expand a release for its complete changes. The current 0.3.3 highlights are above.
+Expand a release for its complete changes. The current 0.4.0 highlights are above.
+
+<details>
+<summary><strong>0.4.0 · Bitwarden and 1Password hosts</strong></summary>
+
+- **Bitwarden hosts:** the Login items of one folder are hosts (name = alias, `ssh://` or `telnet://` URI = endpoint, username and password = login; description and tags in `codex-hosts:` custom fields). The official `bw` CLI re-reads the item before every use, after a sync no older than the chosen window. A host created in the folder is found by alias before the list refreshes.
+- **Bitwarden setup and locking:** the wizard covers the CLI, server (bitwarden.com, bitwarden.eu or your own), login with new-device verification, and folder. **Ask again** keeps the vault unlocked for every call, an idle time, until the window closes, or until you lock it. The kept key sits in Windows Credential Manager, and ending it also runs `bw lock`.
+- **1Password hosts:** the Login items of one vault are hosts, read through the official `op` CLI and the 1Password desktop app. The wizard finds `op.exe` (winget, Scoop, Chocolatey, Program Files, PATH), explains the app's authorization prompt before and while it is up, and picks or creates the vault. Edits check the item version first, so a change made in 1Password meanwhile is reported, not overwritten.
+- **Shared host management:** local and vault hosts use the same list sections, editor, delete dialog and per-store host counts. **Credential services** lists every store; the toolbar shows a status for each one that is set up. Items that do not describe a host are listed on the store's page with what is missing.
+- **Calls:** one dialog per call. If the call needs approval and the Bitwarden vault is locked, the approval dialog asks for the master password. Sudo and su reuse the login password the call read from the item. New `BITWARDEN_*` and `ONEPASSWORD_*` error codes tell Codex what the user has to do.
+- **Editor:** asks before discarding unsaved edits and offers **Revert changes** and **Delete**. Password fields have a show/hide toggle and keep no undo history. Confirm buttons of destructive actions use a solid red fill.
+- **Skill and MCP:** `list_hosts` reports `credential_source`; the instructions and Skill describe vault hosts, their prompts and error codes.
+
+[Compare changes](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
+
+</details>
 
 <details>
 <summary><strong>0.3.3 · Sudo / su, call approval and guided installation</strong></summary>
@@ -312,7 +346,7 @@ Codex talks to `codex-hosts.exe --mcp` over stdio. Every tool returns the same J
 
 | Tool | Purpose |
 | --- | --- |
-| `list_hosts` | Saved hosts with non-secret details, trust state, `auth_persistence`, `require_call_approval`, sudo/su supply permissions, `max_channels`, `remote_env` |
+| `list_hosts` | Saved hosts with non-secret details, `credential_source`, trust state, `auth_persistence`, `require_call_approval`, sudo/su supply permissions, `max_channels`, `remote_env` |
 | `agent_identities`, `fido_identities` | Public identity details of loaded Agent keys and FIDO handles |
 | `probe`, `batch_probe` | Authenticate and run `hostname`; surface unknown or changed host keys |
 | `exec`, `exec_stdin`, `exec_many`, `batch_exec` | Run commands; `exec_stdin` is separate because program text on stdin is opaque to review |

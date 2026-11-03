@@ -104,7 +104,7 @@ async fn execute_async(
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
     let password = if profile.is_vault_host() {
-        crate::bitwarden::resolve_login_password(profile, None).await?
+        crate::vault_hosts::resolve_login_password(profile, None).await?
     } else {
         credentials::load(profile.id, credentials::login_password_kind(profile))
             .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?

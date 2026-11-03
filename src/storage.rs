@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::model::{BitwardenSettings, HostProfile};
+use crate::model::{BitwardenSettings, HostProfile, OnePasswordSettings, VaultProvider};
 
 const STORE_VERSION: u32 = 2;
 
@@ -20,6 +20,8 @@ pub struct HostStore {
     pub hosts: Vec<HostProfile>,
     /// Credential-manager choice and the Bitwarden account; non-secret.
     pub bitwarden: BitwardenSettings,
+    /// The 1Password account and vault; non-secret.
+    pub onepassword: OnePasswordSettings,
     #[serde(skip)]
     write_blocked: Option<String>,
     // Exact loaded bytes (None means no primary). Never written into hosts.json.
@@ -45,6 +47,7 @@ impl Default for HostStore {
             preferred_locale: None,
             hosts: Vec::new(),
             bitwarden: BitwardenSettings::default(),
+            onepassword: OnePasswordSettings::default(),
             write_blocked: None,
             revision: RefCell::new(None),
         }
@@ -52,6 +55,21 @@ impl Default for HostStore {
 }
 
 impl HostStore {
+    /// Whether hosts of `provider` are shown and served (it is switched on).
+    pub fn provider_enabled(&self, provider: VaultProvider) -> bool {
+        match provider {
+            VaultProvider::Bitwarden => self.bitwarden.enabled,
+            VaultProvider::OnePassword => self.onepassword.enabled,
+        }
+    }
+
+    /// Whether `host` is shown and served: a local host, or one from a
+    /// password manager that is switched on.
+    pub fn serves(&self, host: &HostProfile) -> bool {
+        host.vault_provider()
+            .is_none_or(|provider| self.provider_enabled(provider))
+    }
+
     pub fn load() -> Result<Self, StorageError> {
         let primary = hosts_path()?;
         if let Some(store) = load_primary_strict(&primary)? {

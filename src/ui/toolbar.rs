@@ -1,7 +1,8 @@
 use eframe::egui::{self, RichText};
 
-use super::bitwarden::VaultState;
-use super::{HostsApp, retain_visible_selection, theme};
+use super::services::HostGroup;
+use super::theme;
+use super::{HostsApp, retain_visible_selection};
 use crate::i18n::Catalog;
 
 impl HostsApp {
@@ -10,7 +11,7 @@ impl HostsApp {
     /// beside the list ([`HostsApp::host_actions_menu`]).
     pub(super) fn toolbar(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
         let mut open_credentials = false;
-        let mut open_bitwarden = false;
+        let mut open_service = None;
         ui.horizontal(|ui| {
             ui.add_space(8.0);
             if !self.launch.codex_edit
@@ -41,43 +42,42 @@ impl HostsApp {
                     self.exiting = true;
                     context.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
-                if !self.launch.codex_edit && self.vault_chip(ui) {
-                    open_bitwarden = true;
+                if !self.launch.codex_edit {
+                    open_service = self.service_chips(ui);
                 }
             });
         });
         if open_credentials {
             self.open_credential_manager();
-        } else if open_bitwarden {
-            self.open_bitwarden_page();
+        } else if let Some(group) = open_service {
+            self.open_service_page(group);
         }
     }
 
-    /// "Bitwarden · unlocked/locked/off" once an account is set up; a click
-    /// opens the Bitwarden page of the credential services.
-    fn vault_chip(&self, ui: &mut egui::Ui) -> bool {
-        let settings = &self.store.bitwarden;
-        if settings.profile.is_none() || settings.cli_path.is_none() {
-            return false;
+    /// "Bitwarden · unlocked", "1Password · connected", … for each password
+    /// manager that is set up, left to right in the services' order; the one
+    /// clicked is returned, to open its page.
+    fn service_chips(&self, ui: &mut egui::Ui) -> Option<HostGroup> {
+        let mut clicked = None;
+        // Right to left: the last service is drawn first.
+        for group in HostGroup::VAULTS.into_iter().rev() {
+            let Some((text, color)) = self.service_chip(group, ui.visuals()) else {
+                continue;
+            };
+            let hint = group.texts().map_or("", |texts| texts.chip_hint);
+            if ui
+                .add_enabled(
+                    self.credential_manager.is_none(),
+                    egui::Button::new(RichText::new(format!("●  {text}")).color(color))
+                        .frame(false),
+                )
+                .on_hover_text(self.catalog.text(hint))
+                .clicked()
+            {
+                clicked = Some(group);
+            }
         }
-        let (key, color) = match (settings.enabled, self.vault_state) {
-            (false, _) => ("service_status_disabled", ui.visuals().weak_text_color()),
-            (true, Some(VaultState::Unlocked)) => {
-                ("bw_status_unlocked", theme::success_color(ui.visuals()))
-            }
-            (true, Some(VaultState::Locked)) => ("bw_status_locked", ui.visuals().warn_fg_color),
-            (true, Some(VaultState::SignedOut)) => {
-                ("bw_status_signed_out", ui.visuals().warn_fg_color)
-            }
-            (true, None) => ("bw_status_unknown", ui.visuals().weak_text_color()),
-        };
-        let text = RichText::new(format!("●  Bitwarden · {}", self.catalog.text(key))).color(color);
-        ui.add_enabled(
-            self.credential_manager.is_none(),
-            egui::Button::new(text).frame(false),
-        )
-        .on_hover_text(self.catalog.text("vault_chip_hint"))
-        .clicked()
+        clicked
     }
 
     /// The host list's own actions (import, test all, batch), in one menu

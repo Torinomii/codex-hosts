@@ -1,57 +1,21 @@
-//! Vault-backed hosts: the Login items of the configured Bitwarden folder,
-//! mirrored into the host store so the window, the tools, and the session
-//! pool see them as ordinary profiles with local state attached.
-//!
-//! The item is the source of truth. Its name is the alias; its first
-//! `ssh://` or `telnet://` URI is the endpoint; its username and password
-//! are the login; the `codex-hosts:description` and `codex-hosts:tags`
-//! custom fields carry the remark and the tags. Everything else in the
-//! profile (host-key trust, privilege settings, approval, retention, jump
-//! host, advanced limits) is local and survives every refresh.
+//! Bitwarden's side of vault-backed hosts: reading the Login items of the
+//! configured folder into [`HostFacts`]. The item's custom fields are named
+//! `codex-hosts:description` and `codex-hosts:tags`; the mapping into
+//! profiles is shared with other providers in [`crate::vault_hosts`].
 
 use codex_hosts_bw::{ItemKind, ItemSummary};
 use uuid::Uuid;
 
-use crate::model::{HostProfile, Protocol, VaultHostRef, normalize_tags};
+use crate::model::{Protocol, VaultProvider};
 use crate::storage::HostStore;
-
-/// Custom field holding the host description.
-pub(crate) const DESCRIPTION_FIELD: &str = "description";
-/// Custom field holding the tags, comma separated.
-pub(crate) const TAGS_FIELD: &str = "tags";
-
-/// Why an item of the folder is not served as a host.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ItemProblem {
-    /// Not a Login item.
-    NotLogin(ItemKind),
-    /// The name is empty.
-    NoName,
-    /// No `ssh://` or `telnet://` URI.
-    NoHostUri,
-    /// Neither the item nor its URI names a user.
-    NoUsername,
-    /// A local host or another item already uses the name.
-    NameTaken,
-}
-
-/// What a Login item says about its host.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct HostFacts {
-    pub(crate) alias: String,
-    pub(crate) protocol: Protocol,
-    pub(crate) address: String,
-    pub(crate) port: u16,
-    pub(crate) username: String,
-    pub(crate) description: String,
-    pub(crate) tags: Vec<String>,
-    pub(crate) revision: String,
-}
+use crate::vault_hosts::{
+    self, DESCRIPTION_FIELD, HostFacts, ItemKey, ItemProblem, Listed, Reconciled, TAGS_FIELD,
+};
 
 /// Reads the host facts out of an item summary.
 pub(crate) fn facts(item: &ItemSummary) -> Result<HostFacts, ItemProblem> {
     if item.kind != ItemKind::Login {
-        return Err(ItemProblem::NotLogin(item.kind));
+        return Err(ItemProblem::NotLogin);
     }
     let alias = item.name.trim();
     if alias.is_empty() {
@@ -76,133 +40,27 @@ pub(crate) fn facts(item: &ItemSummary) -> Result<HostFacts, ItemProblem> {
         address: uri.host.clone(),
         port: uri.port_or_default(),
         username,
-        description: item
-            .codex_field(DESCRIPTION_FIELD)
-            .and_then(|text| text.lines().next())
-            .unwrap_or_default()
-            .trim()
-            .to_owned(),
-        tags: parse_tags(item.codex_field(TAGS_FIELD).unwrap_or_default()),
+        description: vault_hosts::description_line(
+            item.codex_field(DESCRIPTION_FIELD).unwrap_or_default(),
+        ),
+        tags: vault_hosts::parse_tags(item.codex_field(TAGS_FIELD).unwrap_or_default()),
         revision: item.revision_date.clone().unwrap_or_default(),
     })
 }
 
-/// Splits the `codex-hosts:tags` value (commas or whitespace).
-pub(crate) fn parse_tags(text: &str) -> Vec<String> {
-    normalize_tags(text.split([',', ';', '\n']).flat_map(str::split_whitespace))
-}
-
-/// Joins tags for the `codex-hosts:tags` value.
-pub(crate) fn format_tags(tags: &[String]) -> String {
-    normalize_tags(tags).join(", ")
-}
-
-/// Writes the facts into a mirror profile; local state (including the SSH
-/// authentication method: a vault host may log in with a local key or the
-/// agent, the item password serves password logins) is untouched. A changed
-/// endpoint drops the host-key trust, as the editor does, so the next
-/// connection verifies the new server afresh.
-pub(crate) fn apply(facts: &HostFacts, item_id: Uuid, host: &mut HostProfile) -> bool {
-    let before = host.clone();
-    let endpoint_changed = host.address.trim() != facts.address
-        || host.port != facts.port
-        || host.protocol != facts.protocol;
-    host.alias = facts.alias.clone();
-    host.description = facts.description.clone();
-    host.tags = facts.tags.clone();
-    host.address = facts.address.clone();
-    host.port = facts.port;
-    host.protocol = facts.protocol;
-    host.username = facts.username.clone();
-    host.login_password_id = None;
-    host.vault = Some(VaultHostRef {
-        item_id,
-        item_name: facts.alias.clone(),
-        revision_date: facts.revision.clone(),
-    });
-    if endpoint_changed {
-        host.host_fingerprint = None;
-        host.host_key_algorithm = None;
-        host.host_key_first_seen_unix = None;
-        host.host_key_last_verified_unix = None;
-        host.verified = false;
-    }
-    *host != before
-}
-
-/// A fresh mirror for an item seen for the first time. The profile id is the
-/// item id, so Credential Manager records (sudo passwords) and pool keys stay
-/// stable even if the mirror is rebuilt.
-pub(crate) fn mirror(facts: &HostFacts, item_id: Uuid) -> HostProfile {
-    let mut host = HostProfile::new(facts.alias.clone());
-    host.id = item_id;
-    apply(facts, item_id, &mut host);
-    host
-}
-
-/// Result of bringing the store's mirrors in line with the folder.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Reconciled {
-    /// Whether the store needs saving.
-    pub(crate) changed: bool,
-    /// Number of vault hosts after the pass.
-    pub(crate) hosts: usize,
-    /// Items of the folder that are not served, by name.
-    pub(crate) problems: Vec<(String, ItemProblem)>,
-}
-
-/// Mirrors `items` (the folder's listing) into `store.hosts`: updates or
-/// creates one profile per usable Login item, drops mirrors whose item is
-/// gone, and leaves local hosts alone. Names are compared like aliases
-/// (trimmed, ASCII case-insensitive); a clash with a local host or an
-/// already-served item is reported, not resolved.
+/// Mirrors `items` (the folder's listing) into `store.hosts`; items outside
+/// `folder` or in the trash are ignored.
 pub(crate) fn reconcile(store: &mut HostStore, items: &[ItemSummary], folder: Uuid) -> Reconciled {
-    let mut result = Reconciled::default();
-    let mut taken: Vec<String> = store
-        .hosts
-        .iter()
-        .filter(|host| !host.is_vault_host())
-        .map(|host| host.alias.trim().to_ascii_lowercase())
-        .collect();
-    // Items already mirrored keep their name against newcomers.
-    let mut candidates: Vec<&ItemSummary> = items
+    let listed = items
         .iter()
         .filter(|item| item.folder_id == Some(folder) && item.deleted_date.is_none())
+        .map(|item| Listed {
+            key: ItemKey::bitwarden(item.id),
+            name: item.name.clone(),
+            facts: facts(item),
+        })
         .collect();
-    candidates.sort_by_key(|item| !store.hosts.iter().any(|host| host.id == item.id));
-    let mut accepted: Vec<(Uuid, HostFacts)> = Vec::new();
-    for item in candidates {
-        match facts(item) {
-            Ok(facts) => {
-                let key = facts.alias.to_ascii_lowercase();
-                if taken.contains(&key) {
-                    result
-                        .problems
-                        .push((item.name.clone(), ItemProblem::NameTaken));
-                } else {
-                    taken.push(key);
-                    accepted.push((item.id, facts));
-                }
-            }
-            Err(problem) => result.problems.push((item.name.clone(), problem)),
-        }
-    }
-    let before = store.hosts.len();
-    store
-        .hosts
-        .retain(|host| !host.is_vault_host() || accepted.iter().any(|(id, _)| *id == host.id));
-    result.changed |= store.hosts.len() != before;
-    for (item_id, facts) in &accepted {
-        match store.hosts.iter_mut().find(|host| host.id == *item_id) {
-            Some(host) => result.changed |= apply(facts, *item_id, host),
-            None => {
-                store.hosts.push(mirror(facts, *item_id));
-                result.changed = true;
-            }
-        }
-    }
-    result.hosts = accepted.len();
-    result
+    vault_hosts::reconcile(store, VaultProvider::Bitwarden, listed)
 }
 
 #[cfg(test)]
@@ -210,6 +68,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::model::HostProfile;
 
     fn item(id: u8, name: &str, uri: &str, username: Option<&str>) -> ItemSummary {
         ItemSummary {
@@ -278,15 +137,7 @@ mod tests {
         );
         let mut note = item(1, "n", "ssh://u@host", None);
         note.kind = ItemKind::SecureNote;
-        assert_eq!(
-            facts(&note),
-            Err(ItemProblem::NotLogin(ItemKind::SecureNote))
-        );
-        assert_eq!(parse_tags(" a,b;c\nd  e "), ["a", "b", "c", "d", "e"]);
-        assert_eq!(
-            format_tags(&["b".to_owned(), "a".to_owned(), "b".to_owned()]),
-            "b, a"
-        );
+        assert_eq!(facts(&note), Err(ItemProblem::NotLogin));
     }
 
     #[test]

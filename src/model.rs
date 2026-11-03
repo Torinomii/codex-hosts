@@ -248,6 +248,8 @@ pub enum CredentialSource {
     CredentialManager,
     /// A Login item in the user's Bitwarden vault, read through `bw.exe`.
     Bitwarden,
+    /// A Login item in the user's 1Password vault, read through `op.exe`.
+    OnePassword,
 }
 
 impl CredentialSource {
@@ -255,20 +257,51 @@ impl CredentialSource {
         match self {
             Self::CredentialManager => "credential_manager",
             Self::Bitwarden => "bitwarden",
+            Self::OnePassword => "onepassword",
         }
     }
 }
 
-/// The Bitwarden Login item a vault-backed host mirrors. The item is the
-/// source of truth for the alias (its name), the endpoint (its `ssh://` or
-/// `telnet://` URI), the username, the password, the description and the
-/// tags (`codex-hosts:` custom fields); the profile keeps only local state
-/// such as host-key trust, privilege settings, and approval switches.
-/// Nothing secret.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// The password manager a vault-backed host comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VaultProvider {
+    #[default]
+    #[serde(rename = "bitwarden")]
+    Bitwarden,
+    #[serde(rename = "onepassword")]
+    OnePassword,
+}
+
+impl VaultProvider {
+    fn is_bitwarden(&self) -> bool {
+        *self == Self::Bitwarden
+    }
+
+    pub fn credential_source(self) -> CredentialSource {
+        match self {
+            Self::Bitwarden => CredentialSource::Bitwarden,
+            Self::OnePassword => CredentialSource::OnePassword,
+        }
+    }
+}
+
+/// The password-manager Login item a vault-backed host mirrors. The item is
+/// the source of truth for the alias (its name), the endpoint (its `ssh://`
+/// or `telnet://` URI), the username, the password, the description and the
+/// tags (codex-hosts custom fields); the profile keeps only local state such
+/// as host-key trust, privilege settings, and approval switches. Nothing
+/// secret.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultHostRef {
-    /// Vault item id; also the profile id.
+    /// Which password manager holds the item; Bitwarden for older stores.
+    #[serde(default, skip_serializing_if = "VaultProvider::is_bitwarden")]
+    pub provider: VaultProvider,
+    /// Item id; also the profile id. For 1Password, whose ids are not UUIDs,
+    /// it is derived from the account and [`Self::external_id`].
     pub item_id: Uuid,
+    /// The password manager's own item id when it is not `item_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
     /// Item name at the last refresh (the alias).
     pub item_name: String,
     /// `revisionDate` at the last refresh; a changed item is a new pool key.
@@ -318,6 +351,55 @@ pub const MIN_SYNC_SPACING_SECONDS: u64 = 5;
 pub const SYNC_MAX_AGE_CHOICES: [u64; 4] = [0, 60, 5 * 60, 30 * 60];
 /// Folder the wizard proposes for host credentials.
 pub const DEFAULT_BITWARDEN_FOLDER: &str = "codex-hosts";
+
+/// The 1Password account and vault whose Login items are hosts. Non-secret:
+/// signing in and authorizing `op` are the 1Password app's business.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OnePasswordAccount {
+    /// Account id as `op account list` reports it (`account_uuid`); passed
+    /// to every call as `--account`.
+    pub account_id: String,
+    /// Sign-in address, for display.
+    pub url: String,
+    /// Account e-mail, for display.
+    pub email: String,
+    /// Vault holding host Login items, by id.
+    pub vault_id: String,
+    /// Display name of that vault.
+    pub vault_name: String,
+}
+
+/// 1Password settings kept with the host store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct OnePasswordSettings {
+    /// Whether 1Password hosts are shown and served at all.
+    pub enabled: bool,
+    /// Absolute path of the native `op.exe` chosen by the user.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_path: Option<std::path::PathBuf>,
+    /// The chosen account and vault.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<OnePasswordAccount>,
+}
+
+impl Default for OnePasswordSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cli_path: None,
+            account: None,
+        }
+    }
+}
+
+impl OnePasswordSettings {
+    /// Whether 1Password hosts can be served right now.
+    pub fn available(&self) -> bool {
+        self.enabled && self.account.is_some() && self.cli_path.is_some()
+    }
+}
 
 /// The one Bitwarden account codex-hosts uses. Non-secret; the login state
 /// lives in the CLI data directory and the session key in Credential Manager.
@@ -401,7 +483,7 @@ pub struct HostProfile {
     /// Immutable credential record for this login identity. None reads legacy profiles.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub login_password_id: Option<Uuid>,
-    /// Set for a vault-backed host: the Bitwarden item that defines it.
+    /// Set for a vault-backed host: the password-manager item that defines it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vault: Option<VaultHostRef>,
     pub protocol: Protocol,
@@ -492,25 +574,34 @@ impl HostProfile {
         }
     }
 
-    /// The Bitwarden item this host mirrors, for a vault-backed host.
+    /// The password-manager item this host mirrors, for a vault-backed host.
     pub fn vault(&self) -> Option<&VaultHostRef> {
         self.vault.as_ref()
     }
 
-    /// Whether the host is defined by a Bitwarden item rather than this
-    /// profile and Credential Manager.
+    /// Whether the host is defined by a password-manager item rather than
+    /// this profile and Credential Manager.
     pub fn is_vault_host(&self) -> bool {
         self.vault.is_some()
+    }
+
+    /// The password manager that defines the host, if any.
+    pub fn vault_provider(&self) -> Option<VaultProvider> {
+        self.vault.as_ref().map(|vault| vault.provider)
+    }
+
+    /// Whether the host is defined by a Bitwarden item.
+    pub fn is_bitwarden_host(&self) -> bool {
+        self.vault_provider() == Some(VaultProvider::Bitwarden)
     }
 
     /// Where the login password comes from, when one is used at all.
     pub fn credential_source(&self) -> Option<CredentialSource> {
         self.uses_login_password().then(|| {
-            if self.is_vault_host() {
-                CredentialSource::Bitwarden
-            } else {
-                CredentialSource::CredentialManager
-            }
+            self.vault_provider().map_or(
+                CredentialSource::CredentialManager,
+                VaultProvider::credential_source,
+            )
         })
     }
 

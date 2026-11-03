@@ -64,7 +64,7 @@ impl Review {
                 vec![target]
             };
             for host in chain {
-                uses_vault |= host.is_vault_host();
+                uses_vault |= host.is_bitwarden_host();
                 let is_jump = host.id != target.id;
                 if let Some(&index) = seen.get(&host.id) {
                     hosts[index].is_jump |= is_jump;
@@ -1001,6 +1001,7 @@ mod tests {
             item_id: Uuid::new_v4(),
             item_name: "jump".into(),
             revision_date: String::new(),
+            ..Default::default()
         });
         let hosts = [jump, target.clone()];
         let mut review =

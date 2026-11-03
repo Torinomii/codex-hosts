@@ -62,6 +62,9 @@ pub(super) fn status_kind_for_key(key: &str) -> StatusKind {
         | "bw_setup_done"
         | "vault_saved"
         | "vault_deleted"
+        | "op_saved"
+        | "op_deleted"
+        | "op_setup_done"
         | "vault_refreshed"
         | "hosts_refreshed" => StatusKind::Success,
         _ if key.ends_with("_error")
@@ -116,19 +119,9 @@ impl HostsApp {
                         "status_testing_progress",
                         &[("remaining", &running.to_string())],
                     )
-                } else if self.store.bitwarden.available() {
+                } else if let Some(split) = self.host_count_summary() {
                     // The list is split by store, so the count is too.
-                    let vault = self
-                        .store
-                        .hosts
-                        .iter()
-                        .filter(|host| host.is_vault_host())
-                        .count();
-                    let local = self.store.hosts.len() - vault;
-                    self.catalog.format(
-                        "host_count_split",
-                        &[("local", &local.to_string()), ("vault", &vault.to_string())],
-                    )
+                    split
                 } else {
                     self.catalog.format(
                         "host_count",

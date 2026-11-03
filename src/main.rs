@@ -10,6 +10,7 @@ mod i18n;
 mod import;
 mod mcp;
 mod model;
+mod onepassword;
 mod ssh;
 mod storage;
 mod su;
@@ -19,6 +20,7 @@ mod temporary_secrets;
 mod tool;
 mod tray;
 mod ui;
+mod vault_hosts;
 
 use std::path::PathBuf;
 

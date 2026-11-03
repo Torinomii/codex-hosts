@@ -1,4 +1,5 @@
-//! Runs one [`BwInvocation`] with bounded output and a hard timeout.
+//! Runs one [`BwInvocation`] (or any prepared CLI command, see
+//! [`run_command`]) with bounded output and a hard timeout.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -24,13 +25,13 @@ pub struct BwOutput {
 #[derive(Debug, thiserror::Error)]
 pub enum BwRunError {
     /// The process could not be started.
-    #[error("could not start bw: {0}")]
+    #[error("could not start the CLI: {0}")]
     Spawn(std::io::Error),
     /// A stream exceeded [`MAX_OUTPUT_BYTES`]; the child was killed.
-    #[error("bw produced more than {MAX_OUTPUT_BYTES} bytes")]
+    #[error("the CLI produced more than {MAX_OUTPUT_BYTES} bytes")]
     OutputTooLarge,
     /// The child did not finish within the invocation's timeout; it was killed.
-    #[error("bw did not finish within {0:?}")]
+    #[error("the CLI did not finish within {0:?}")]
     Timeout(Duration),
     /// Reading from or writing to the child failed.
     #[error(transparent)]
@@ -41,7 +42,19 @@ pub enum BwRunError {
 pub async fn run(mut invocation: BwInvocation) -> Result<BwOutput, BwRunError> {
     let timeout = invocation.timeout();
     let payload = invocation.take_stdin();
-    let mut command = invocation.command();
+    run_command(invocation.command(), payload, timeout).await
+}
+
+/// Spawns `command` (environment, arguments and window flags already set by
+/// the caller's policy), writes `payload` to its stdin, and waits at most
+/// `timeout`; both streams are capped at [`MAX_OUTPUT_BYTES`]. Used by the
+/// other password-manager CLI adapters so every child runs under the same
+/// limits.
+pub async fn run_command(
+    mut command: tokio::process::Command,
+    payload: Option<Zeroizing<Vec<u8>>>,
+    timeout: Duration,
+) -> Result<BwOutput, BwRunError> {
     command
         .stdin(if payload.is_some() {
             Stdio::piped()
