@@ -47,8 +47,18 @@ A Windows SSH / Telnet host manager and MCP server for Codex. Save a host once, 
 
 ## Installation
 
+The quickest way is to ask Codex. Paste this into Codex:
+
+```text
+Clone https://github.com/Torinomii/codex-hosts.git to a stable directory and run scripts/install-local-skill.ps1. Let it check the build environment, then ask me before compiling, installing links or replacing old paths.
+Confirm that the installed codex-hosts Skill directory is one symbolic link and its executable resolves to the release build; register the codex-hosts MCP server in config.toml as described in SKILL.md, and keep the checkout in place.
+```
+
+Codex clones the repository, runs the guided installer (which asks you before compiling, linking or replacing anything) and registers the MCP server. This route builds from source, so it needs the source-checkout requirements below. To install by hand, follow the two steps after the table.
+
 | Route | Requirements | Entry point |
 | --- | --- | --- |
+| Ask Codex (recommended) | Codex + the source-checkout requirements | The prompt above |
 | GitHub Release | 64-bit Windows 10+ · PowerShell 7.2+ | `install.cmd` or the command below |
 | Source checkout | The above + Rust 1.92+, MSVC and Windows SDK | `scripts/install.cmd` or `scripts/install-local-skill.ps1` |
 

@@ -47,8 +47,18 @@
 
 ## 安裝
 
+最快的方式是讓 Codex 安裝。把以下內容貼給 Codex：
+
+```text
+將 https://github.com/Torinomii/codex-hosts.git 複製到固定目錄，執行 scripts/install-local-skill.ps1 檢查編譯環境；編譯、安裝軟連結與替換舊路徑前都先讓我確認。
+確認已安裝的整個 codex-hosts Skill 目錄是單一符號連結、執行檔解析至發行版建置，依 SKILL.md 在 config.toml 中註冊 codex-hosts MCP 伺服器，並保留原始碼目錄。
+```
+
+Codex 會複製儲存庫、執行引導式安裝程式（編譯、建立連結或取代任何內容前都會徵求你的確認），並註冊 MCP 伺服器。此方式從原始碼建置，因此需要下表中「原始碼建置」的環境。如需手動安裝，請依表格後的兩個步驟操作。
+
 | 方式 | 所需環境 | 入口 |
 | --- | --- | --- |
+| 讓 Codex 安裝（建議） | Codex + 「原始碼建置」的環境 | 上方提示詞 |
 | GitHub Release | 64 位元 Windows 10+、PowerShell 7.2+ | `install.cmd` 或下方命令 |
 | 原始碼建置 | 上述環境，加 Rust 1.92+、MSVC 與 Windows SDK | `scripts/install.cmd` 或 `scripts/install-local-skill.ps1` |
 
