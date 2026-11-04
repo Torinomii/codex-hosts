@@ -43,7 +43,7 @@ The running server's tool list, schemas, and `initialize` instructions define av
 1. Call `list_hosts` once per task and plan from that snapshot. Use only the aliases the user asked for; an omitted or empty alias list never means all hosts.
 2. Read each summary before connecting. `has_required_secret:false` means `exec` fails with `CREDENTIAL_MISSING`; `has_host_fingerprint:false` means the first SSH connection stops with `HOSTKEY_UNKNOWN`. `auth_persistence` other than `per_call` keeps the host authenticated between calls; mention it when planning continuous work on that host. `remote_env` is the user's hint about the remote shell family.
 3. If the alias is missing or its entry is incomplete, call `open_host_editor` with the exact alias and every known non-secret field as part of the requested work; do not stop to ask for an address or for permission to open it. Ask only when the intended host itself is ambiguous. Continue only after `saved` or `trusted`; `cancelled` or any failure means nothing was saved. Follow [references/host-editor.md](references/host-editor.md).
-4. Choose one tool: `exec` for one command; `exec_stdin` for exact text on stdin (SSH only); `exec_many` for up to 64 independent short commands on one SSH host over one authentication; `batch_probe` or `batch_exec` for an explicit list of up to 256 hosts. For an authorized user switch use `exec_sudo` or `exec_su`, choosing the mechanism and execution `user` explicitly. For work that may take more than a few minutes, follow [references/long-running.md](references/long-running.md).
+4. Choose one tool: `exec` for one command; `exec_stdin` for exact text on stdin (SSH only; also small file copies, see Copying files); `exec_many` for up to 64 independent short commands on one SSH host over one authentication; `batch_probe` or `batch_exec` for an explicit list of up to 256 hosts. For an authorized user switch use `exec_sudo` or `exec_su`, choosing the mechanism and execution `user` explicitly. For work that may take more than a few minutes, follow [references/long-running.md](references/long-running.md).
 
 ## Calling the tools
 
@@ -92,6 +92,16 @@ Parameters, result fields, limits, and every error code: [references/tool-protoc
 - Do not infer the remote OS or shell from SSH alone; use what the user said, `remote_env`, or output you already verified. Do not assume Bash, GNU utilities, `sudo`, systemd, a UTF-8 locale, or a TTY; prefer minimal non-interactive commands.
 - Partition hosts by shell family before `batch_exec`; never send a POSIX command to a known Windows group or the reverse.
 - Telnet logs in by script and needs a POSIX-style shell with `echo`. Its `exit_code` is the status that shell prints (`$?`), or 0 when it prints none, so judge success from the output as well. A rejected login reports `AUTH_FAILED`; a command that ends the shell (such as `exit`) reports `TELNET_CLOSED`.
+
+## Copying files
+
+There is no file-transfer tool. `exec_stdin` can carry a local file to an SSH host, but you must write its encoded form out in full in the call, so in practice this is for small files (a few tens of KB of base64), well under the 1 MiB stdin limit.
+
+- Encode locally: base64 of the file, or of a zip / tar.gz for a directory. Encode text files too; a Windows console input code page can change non-ASCII text.
+- Windows host: `powershell -NoProfile -NonInteractive -Command "[IO.File]::WriteAllBytes('C:\path\file.zip',[Convert]::FromBase64String([Console]::In.ReadToEnd()))"`, then `Expand-Archive` for an archive. It contains no `$`, so it runs unchanged whether the SSH shell is cmd.exe or PowerShell.
+- POSIX host: `base64 -d > /path/file`, or `base64 -d | tar -xzf - -C /path/dir` for a directory.
+- Create the target directory first, and compare the remote hash (`Get-FileHash`, `sha256sum`) with the local one before reporting success.
+- Anything larger: do not split it across many calls or switch to OpenSSH, a tunnel, or a share you set up. Have the host fetch it with `exec` from a source it can already reach (repository, release, package registry), or ask the user to copy it, for example over RDP.
 
 ## Failures
 
