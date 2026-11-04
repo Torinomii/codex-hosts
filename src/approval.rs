@@ -124,6 +124,163 @@ impl Review {
             ],
         )
     }
+
+    fn target_aliases(&self) -> String {
+        self.hosts
+            .iter()
+            .filter(|host| host.is_target)
+            .map(|host| host.alias.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl ReviewHost {
+    fn endpoint(&self) -> String {
+        let mut text = format!("{}@{}:{}", self.username, self.address, self.port);
+        if self.protocol != Protocol::Ssh {
+            text.push_str(" · ");
+            text.push_str(self.protocol.stable_name());
+        }
+        text
+    }
+}
+
+/// The overview shows this many execution hosts of a call; the rest are in
+/// details.
+const PREVIEW_HOSTS: usize = 6;
+
+/// One call in the overview: where it runs, through which jump hosts, as
+/// whom, and what it runs. Returns the details to open after a click.
+fn call_card(
+    ui: &mut egui::Ui,
+    catalog: &Catalog,
+    call: &Pending,
+    number: Option<usize>,
+) -> Option<Detail> {
+    use crate::approval_ui::{code_line, countdown_label, section, warning};
+    let review = call.review.as_ref().expect("pending review has details");
+    let mut open = None;
+    let weak = ui.visuals().weak_text_color();
+    egui::Frame::group(ui.style())
+        .inner_margin(egui::Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                if let Some(number) = number {
+                    ui.strong(
+                        catalog.format("approval_call_number", &[("number", &number.to_string())]),
+                    );
+                    ui.label("·");
+                }
+                countdown_label(ui, catalog, call.expires);
+            });
+            section(ui, catalog.text("approval_execution_hosts"));
+            let targets: Vec<_> = review.hosts.iter().filter(|host| host.is_target).collect();
+            for host in targets.iter().take(PREVIEW_HOSTS) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.strong(crate::approval_ui::preview(&host.alias));
+                    ui.label(egui::RichText::new(host.endpoint()).color(weak));
+                });
+            }
+            if targets.len() > PREVIEW_HOSTS
+                && ui
+                    .small_button(catalog.format(
+                        "approval_more_hosts",
+                        &[("count", &(targets.len() - PREVIEW_HOSTS).to_string())],
+                    ))
+                    .clicked()
+            {
+                open = Some(Detail {
+                    id: call.id,
+                    command: None,
+                    focus: true,
+                });
+            }
+            let jumps: Vec<_> = review
+                .hosts
+                .iter()
+                .filter(|host| host.is_jump)
+                .map(|host| host.alias.as_str())
+                .collect();
+            if !jumps.is_empty() {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(catalog.format(
+                            "approval_via",
+                            &[("hosts", &crate::approval_ui::preview(&jumps.join(", ")))],
+                        ))
+                        .color(weak),
+                    )
+                    .wrap(),
+                );
+            }
+            if let Some(user) = &review.sudo_user {
+                warning(ui, &catalog.format("approval_runs_as", &[("user", user)]));
+            }
+            section(ui, catalog.text("ssh_approval_commands"));
+            let numbered = review.commands.len() > 1;
+            for (index, command) in review
+                .commands
+                .iter()
+                .enumerate()
+                .take(crate::approval_ui::PREVIEW_COMMANDS)
+            {
+                let text = if numbered {
+                    format!("{}  {command}", index + 1)
+                } else {
+                    command.clone()
+                };
+                let response = code_line(ui, &text, catalog.text("approval_view_details"));
+                if response.clicked() {
+                    open = Some(Detail {
+                        id: call.id,
+                        command: Some(index),
+                        focus: true,
+                    });
+                }
+                #[cfg(test)]
+                ui.ctx().data_mut(|data| {
+                    data.insert_temp(
+                        egui::Id::new(("ssh_command_preview", call.id, index)),
+                        response.rect,
+                    )
+                });
+            }
+            let hidden = review
+                .commands
+                .len()
+                .saturating_sub(crate::approval_ui::PREVIEW_COMMANDS);
+            if hidden > 0
+                && ui
+                    .small_button(
+                        catalog.format("approval_more_commands", &[("count", &hidden.to_string())]),
+                    )
+                    .clicked()
+            {
+                open = Some(Detail {
+                    id: call.id,
+                    command: Some(crate::approval_ui::PREVIEW_COMMANDS),
+                    focus: true,
+                });
+            }
+            if let Some(stdin) = &review.stdin {
+                ui.label(catalog.format(
+                    "approval_stdin_size",
+                    &[("size", &crate::approval_ui::size(stdin.len()))],
+                ));
+            }
+            ui.add_space(4.0);
+            if ui.button(catalog.text("approval_view_details")).clicked() {
+                open = Some(Detail {
+                    id: call.id,
+                    command: None,
+                    focus: true,
+                });
+            }
+        });
+    ui.add_space(8.0);
+    open
 }
 
 /// Each tool handler calls this once before credentials, connections or workers.
@@ -376,7 +533,7 @@ impl Queue {
             });
         }
     }
-    fn start_batch(&mut self, now: f64) {
+    fn start_batch(&mut self, now: f64, arm: f64) {
         let ids: Vec<_> = self
             .calls
             .iter()
@@ -391,8 +548,27 @@ impl Queue {
         self.batch = Some(Batch {
             ids,
             serial: self.serial,
-            ready_at: now + 0.25,
+            ready_at: now + arm,
         });
+    }
+
+    /// Adds the calls that arrived after the batch was shown, at the user's
+    /// request; the buttons pause again so they decide only what is on screen.
+    fn include_new(&mut self, now: f64) {
+        let pending: Vec<_> = self
+            .calls
+            .iter()
+            .filter(|call| call.status == "pending")
+            .map(|call| call.id)
+            .collect();
+        if let Some(batch) = &mut self.batch {
+            for id in pending {
+                if !batch.ids.contains(&id) {
+                    batch.ids.push(id);
+                }
+            }
+        }
+        self.rearm(now);
     }
 
     fn active(&self, id: Uuid) -> bool {
@@ -402,7 +578,7 @@ impl Queue {
     }
     fn rearm(&mut self, now: f64) {
         if let Some(batch) = &mut self.batch {
-            batch.ready_at = now + 0.25;
+            batch.ready_at = batch.ready_at.max(now + crate::approval_ui::ARM_SECONDS);
         }
     }
 
@@ -509,9 +685,6 @@ impl Queue {
             self.feedback
                 .set(catalog.text("approval_detail_invalid").to_owned());
         }
-        if self.batch.is_none() {
-            self.start_batch(now);
-        }
         if !self.pending() {
             self.batch = None;
             self.detail = None;
@@ -520,8 +693,23 @@ impl Queue {
             self.feedback.show(context, "ssh_approval_feedback");
             return;
         }
+        // Once every call shown is decided, the calls that waited behind
+        // them take their place, after a longer pause than a plain rearm.
+        if self
+            .batch
+            .as_ref()
+            .is_none_or(|batch| !batch.ids.iter().any(|id| self.active(*id)))
+        {
+            let arm = if self.batch.is_some() {
+                crate::approval_ui::NEXT_BATCH_ARM_SECONDS
+            } else {
+                crate::approval_ui::ARM_SECONDS
+            };
+            self.start_batch(now, arm);
+        }
         let batch = self.batch.as_ref().expect("pending calls have a batch");
         let ids = batch.ids.clone();
+        let serial = batch.serial;
         let ready = now >= batch.ready_at;
         if !ready {
             context.request_repaint_after(Duration::from_millis(50));
@@ -538,156 +726,135 @@ impl Queue {
                 .is_some_and(|review| review.unlock_vault)
         });
         let busy = self.unlock.busy();
-        let next = self
+        let arrived = self
             .calls
             .iter()
             .filter(|call| call.status == "pending" && !ids.contains(&call.id))
             .count();
+        let single = active.len() == 1;
+        let count = active.len().to_string();
         let bounds = context.content_rect().shrink(24.0);
         let mut decision = None;
         let mut open_detail = None;
-        let mut next_batch = false;
-        let id = egui::Id::new(("ssh_call_batch", batch.serial));
+        let mut include = false;
+        let id = egui::Id::new(("ssh_call_batch", serial));
         let modal = egui::Modal::new(id)
             .area(
                 egui::Modal::default_area(id)
                     .default_size(egui::vec2(680.0, bounds.height()))
-                    .enabled(self.detail.is_none() && ready)
+                    .enabled(self.detail.is_none())
                     .fade_in(false),
             )
             .frame(crate::approval_ui::frame(context))
             .show(context, |ui| {
                 crate::approval_ui::style(ui);
                 ui.set_width((bounds.width() - 40.0).min(640.0));
-                ui.heading(catalog.text("ssh_approval_title"));
-                ui.add(
-                    egui::Label::new(catalog.format(
-                        "approval_batch_scope",
+                let subtitle = match active.first().and_then(|call| call.review.as_ref()) {
+                    Some(review) if single => catalog.format(
+                        "approval_single_subtitle",
                         &[
-                            ("count", &active.len().to_string()),
-                            ("next", &next.to_string()),
+                            ("commands", &review.commands.len().to_string()),
+                            (
+                                "hosts",
+                                &crate::approval_ui::preview(&review.target_aliases()),
+                            ),
                         ],
-                    ))
-                    .wrap(),
-                );
-                if !active.is_empty() {
-                    let mut submit = false;
-                    if unlock {
-                        submit = unlock_row(
-                            ui,
-                            catalog,
-                            &mut self.master_password,
-                            self.unlock_error.as_deref(),
-                            busy,
-                        );
-                    }
-                    let can_allow = !unlock || (!busy && !self.master_password.is_empty());
-                    let buttons = ui
-                        .add_enabled_ui(ready, |ui| {
-                            crate::approval_ui::actions(
-                                ui,
-                                catalog,
-                                can_allow,
-                                if unlock {
-                                    "approval_unlock_allow_all"
-                                } else {
-                                    "approval_allow_all"
-                                },
-                                "approval_reject_all",
-                            )
-                        })
-                        .inner;
-                    if ready {
-                        decision = buttons.decision;
-                        if submit && decision.is_none() {
-                            decision = Some(true);
-                        }
-                    }
-                    #[cfg(test)]
-                    for call in &active {
-                        context.data_mut(|data| {
-                            data.insert_temp(
-                                egui::Id::new(("ssh_approval_buttons", call.id)),
-                                (buttons.confirm, buttons.cancel),
-                            )
-                        });
-                    }
+                    ),
+                    _ => catalog.format("approval_batch_subtitle", &[("count", &count)]),
+                };
+                crate::approval_ui::header(ui, catalog.text("ssh_approval_title"), &subtitle);
+                let mut submit = false;
+                if unlock {
+                    submit = unlock_row(
+                        ui,
+                        catalog,
+                        &mut self.master_password,
+                        self.unlock_error.as_deref(),
+                        busy,
+                    );
+                }
+                let can_allow = !unlock || (!busy && !self.master_password.is_empty());
+                let (allow, reject) = if single {
+                    (
+                        catalog
+                            .text(if unlock {
+                                "approval_unlock_allow_call"
+                            } else {
+                                "approval_allow_call"
+                            })
+                            .to_owned(),
+                        catalog.text("approval_reject_call").to_owned(),
+                    )
                 } else {
-                    ui.strong(catalog.text("approval_batch_finished"));
-                    let response = ui.button(catalog.text("approval_next_batch"));
-                    if response.clicked() {
-                        next_batch = true;
+                    (
+                        catalog.format(
+                            if unlock {
+                                "approval_unlock_allow_all"
+                            } else {
+                                "approval_allow_all"
+                            },
+                            &[("count", &count)],
+                        ),
+                        catalog.format("approval_reject_all", &[("count", &count)]),
+                    )
+                };
+                let buttons = ui
+                    .add_enabled_ui(ready, |ui| {
+                        crate::approval_ui::actions(ui, can_allow, &allow, &reject)
+                    })
+                    .inner;
+                if ready {
+                    decision = buttons.decision;
+                    if submit && decision.is_none() {
+                        decision = Some(true);
                     }
-                    #[cfg(test)]
+                }
+                #[cfg(test)]
+                for call in &active {
                     context.data_mut(|data| {
-                        data.insert_temp(egui::Id::new("ssh_next_batch"), response.rect)
+                        data.insert_temp(
+                            egui::Id::new(("ssh_approval_buttons", call.id)),
+                            (buttons.confirm, buttons.cancel),
+                        )
+                    });
+                }
+                if arrived > 0 {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            catalog.format(
+                                "approval_new_arrivals",
+                                &[("count", &arrived.to_string())],
+                            ),
+                        );
+                        let response = ui.add_enabled(
+                            ready,
+                            egui::Button::new(catalog.text("approval_include_new")),
+                        );
+                        include = response.clicked();
+                        #[cfg(test)]
+                        context.data_mut(|data| {
+                            data.insert_temp(egui::Id::new("ssh_include_new"), response.rect)
+                        });
                     });
                 }
                 if let Some(text) = self.feedback.text() {
                     ui.add(egui::Label::new(text).wrap());
                 }
+                crate::approval_ui::key_hint(ui, catalog.text("approval_key_hint"));
                 ui.separator();
-                ui.add_space(8.0);
+                let height = (bounds.height() - ui.min_rect().height() - 40.0).clamp(70.0, 460.0);
                 egui::ScrollArea::vertical()
-                    .id_salt(("ssh_batch_list", batch.serial))
+                    .id_salt(("ssh_batch_list", serial))
                     .auto_shrink([false, true])
-                    .max_height((bounds.height() - 230.0).clamp(70.0, 400.0))
+                    .max_height(height)
                     .show(ui, |ui| {
                         for (index, call) in active.iter().enumerate() {
-                            let review = call.review.as_ref().expect("pending review has details");
-                            ui.group(|ui| {
-                                ui.strong(catalog.format(
-                                    "approval_call_number",
-                                    &[("number", &(index + 1).to_string())],
-                                ));
-                                ui.add(egui::Label::new(review.summary(catalog)).wrap());
-                                ui.label(crate::approval_ui::countdown(catalog, call.expires));
-                                let targets = review
-                                    .hosts
-                                    .iter()
-                                    .filter(|host| host.is_target)
-                                    .map(|host| host.alias.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                ui.add(
-                                    egui::Label::new(crate::approval_ui::preview(&targets)).wrap(),
-                                );
-                                if ui.button(catalog.text("approval_view_details")).clicked() {
-                                    open_detail = Some(Detail {
-                                        id: call.id,
-                                        command: None,
-                                        focus: true,
-                                    });
-                                }
-                                for (index, command) in review.commands.iter().enumerate() {
-                                    let response = ui.add(
-                                        egui::Button::new(
-                                            egui::RichText::new(format!(
-                                                "{}  {}",
-                                                index + 1,
-                                                crate::approval_ui::preview(command)
-                                            ))
-                                            .monospace(),
-                                        )
-                                        .wrap(),
-                                    );
-                                    if response.clicked() {
-                                        open_detail = Some(Detail {
-                                            id: call.id,
-                                            command: Some(index),
-                                            focus: true,
-                                        });
-                                    }
-                                    #[cfg(test)]
-                                    context.data_mut(|data| {
-                                        data.insert_temp(
-                                            egui::Id::new(("ssh_command_preview", call.id, index)),
-                                            response.rect,
-                                        )
-                                    });
-                                }
-                            });
-                            ui.add_space(8.0);
+                            if let Some(detail) =
+                                call_card(ui, catalog, call, (!single).then_some(index + 1))
+                            {
+                                open_detail = Some(detail);
+                            }
                         }
                     });
             });
@@ -725,11 +892,9 @@ impl Queue {
         }
         if decision.is_some() {
             self.rearm(now);
-        }
-        if next_batch {
-            self.start_batch(now);
-        }
-        if let Some(detail) = open_detail {
+        } else if include && ready {
+            self.include_new(now);
+        } else if let Some(detail) = open_detail.filter(|_| ready && self.detail.is_none()) {
             self.detail = Some(detail);
             self.rearm(now);
         }
@@ -768,16 +933,24 @@ impl Queue {
             .area(
                 egui::Modal::default_area(id)
                     .default_size(bounds.size())
-                    .enabled(ready)
                     .fade_in(false),
             )
             .frame(crate::approval_ui::frame(context))
             .show(context, |ui| {
                 crate::approval_ui::style(ui);
                 ui.set_width((bounds.width() - 40.0).min(760.0));
-                ui.heading(catalog.text("approval_detail_title"));
-                ui.add(egui::Label::new(catalog.text("approval_detail_scope")).wrap());
+                crate::approval_ui::header(
+                    ui,
+                    catalog.text("approval_detail_title"),
+                    catalog.text("approval_detail_scope"),
+                );
                 ui.add(egui::Label::new(review.summary(catalog)).wrap());
+                if let Some(user) = &review.sudo_user {
+                    crate::approval_ui::warning(
+                        ui,
+                        &catalog.format("approval_runs_as", &[("user", user)]),
+                    );
+                }
                 let mut submit = false;
                 if unlock {
                     submit = unlock_row(
@@ -788,20 +961,25 @@ impl Queue {
                         busy,
                     );
                 }
-                let buttons = crate::approval_ui::actions(
-                    ui,
-                    catalog,
-                    !unlock || (!busy && !self.master_password.is_empty()),
-                    if unlock {
-                        "approval_unlock_allow_call"
-                    } else {
-                        "approval_allow_call"
-                    },
-                    "approval_reject_call",
-                );
-                decision = buttons.decision;
-                if submit && decision.is_none() {
-                    decision = Some(true);
+                let buttons = ui
+                    .add_enabled_ui(ready, |ui| {
+                        crate::approval_ui::actions(
+                            ui,
+                            !unlock || (!busy && !self.master_password.is_empty()),
+                            catalog.text(if unlock {
+                                "approval_unlock_allow_call"
+                            } else {
+                                "approval_allow_call"
+                            }),
+                            catalog.text("approval_reject_call"),
+                        )
+                    })
+                    .inner;
+                if ready {
+                    decision = buttons.decision;
+                    if submit && decision.is_none() {
+                        decision = Some(true);
+                    }
                 }
                 #[cfg(test)]
                 context.data_mut(|data| {
@@ -810,49 +988,54 @@ impl Queue {
                         (buttons.confirm, buttons.cancel),
                     )
                 });
-                let response = ui.small_button(catalog.text("approval_back"));
-                if response.clicked() {
-                    back = true;
-                }
-                #[cfg(test)]
-                context.data_mut(|data| {
-                    data.insert_temp(egui::Id::new(("ssh_detail_back", detail.id)), response.rect)
+                ui.horizontal_wrapped(|ui| {
+                    let response = ui.small_button(catalog.text("approval_back"));
+                    if response.clicked() {
+                        back = true;
+                    }
+                    #[cfg(test)]
+                    context.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new(("ssh_detail_back", detail.id)),
+                            response.rect,
+                        )
+                    });
+                    crate::approval_ui::countdown_label(ui, catalog, call.expires);
                 });
-                ui.label(crate::approval_ui::countdown(catalog, call.expires));
+                crate::approval_ui::key_hint(ui, catalog.text("approval_detail_key_hint"));
                 ui.separator();
+                let height = (bounds.height() - ui.min_rect().height() - 40.0).max(40.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("ssh_full_details", detail.id))
                     .auto_shrink([false, true])
-                    .max_height((bounds.height() - 235.0).max(40.0))
+                    .max_height(height)
                     .show(ui, |ui| {
                         for (role, key) in [
                             (true, "approval_execution_hosts"),
                             (false, "approval_jump_hosts"),
                         ] {
-                            ui.strong(catalog.text(key));
-                            for host in review
+                            let mut hosts = review
                                 .hosts
                                 .iter()
                                 .filter(|host| if role { host.is_target } else { host.is_jump })
-                            {
+                                .peekable();
+                            if hosts.peek().is_none() {
+                                continue;
+                            }
+                            crate::approval_ui::section(ui, catalog.text(key));
+                            for host in hosts {
                                 ui.add(
                                     egui::Label::new(format!(
-                                        "{} · {}@{}:{} · {}",
+                                        "{} · {}",
                                         host.alias,
-                                        host.username,
-                                        host.address,
-                                        host.port,
-                                        host.protocol.stable_name()
+                                        host.endpoint()
                                     ))
                                     .selectable(true)
                                     .wrap(),
                                 );
                             }
                         }
-                        if let Some(user) = &review.sudo_user {
-                            ui.label(format!("sudo → {user}"));
-                        }
-                        ui.strong(catalog.text("ssh_approval_commands"));
+                        crate::approval_ui::section(ui, catalog.text("ssh_approval_commands"));
                         for (index, command) in review.commands.iter().enumerate() {
                             let heading = ui.strong(catalog.format(
                                 "approval_command_number",
@@ -870,7 +1053,13 @@ impl Queue {
                             ui.separator();
                         }
                         if let Some(stdin) = &review.stdin {
-                            ui.strong(catalog.text("ssh_approval_stdin"));
+                            crate::approval_ui::section(
+                                ui,
+                                &catalog.format(
+                                    "approval_stdin_size",
+                                    &[("size", &crate::approval_ui::size(stdin.len()))],
+                                ),
+                            );
                             crate::approval_ui::full_text(
                                 ui,
                                 catalog,
@@ -1144,8 +1333,14 @@ mod tests {
         }
     }
 
+    fn buttons_of(context: &egui::Context, id: Uuid) -> Option<(egui::Rect, egui::Rect)> {
+        context.data(|data| {
+            data.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new(("ssh_approval_buttons", id)))
+        })
+    }
+
     #[test]
-    fn bulk_decisions_freeze_the_displayed_batch_and_require_opening_the_next_batch() {
+    fn bulk_decisions_cover_only_the_displayed_calls_and_followers_arm_before_they_count() {
         for allow in [true, false] {
             let mut queue = Queue::default();
             let first = Uuid::new_v4();
@@ -1158,14 +1353,12 @@ mod tests {
             let catalog = Catalog::for_locale(Some("en"));
             warm(&mut queue, &context, &catalog);
             queue.submit(later, review());
-            let (confirm, reject) = context
-                .data(|data| {
-                    data.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new((
-                        "ssh_approval_buttons",
-                        first,
-                    )))
-                })
-                .unwrap();
+            warm(&mut queue, &context, &catalog);
+            let (confirm, reject) = buttons_of(&context, first).unwrap();
+            assert!(
+                buttons_of(&context, later).is_none(),
+                "a call that arrived later is not part of the displayed list"
+            );
             let at = if allow {
                 confirm.center()
             } else {
@@ -1176,40 +1369,125 @@ mod tests {
             assert_eq!(queue.take(first), status);
             assert_eq!(queue.take(second), status);
             assert_eq!(queue.take(later), "pending");
-            // Repeating the old bulk click cannot act on newly arrived calls.
+            // The follower replaces the decided list on its own, but a second
+            // click of a double click lands while its buttons still pause.
             click(&mut queue, &context, at);
             assert_eq!(queue.take(later), "pending");
+            assert!(buttons_of(&context, later).is_some());
             warm(&mut queue, &context, &catalog);
-            let next = context
-                .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("ssh_next_batch")))
-                .unwrap();
-            click(&mut queue, &context, next.center());
-            frame(
-                &mut queue,
-                &context,
-                &catalog,
-                egui::vec2(820.0, 620.0),
-                vec![],
-            );
-            let (confirm, _) = context
-                .data(|data| {
-                    data.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new((
-                        "ssh_approval_buttons",
-                        later,
-                    )))
-                })
-                .unwrap();
-            click(&mut queue, &context, confirm.center());
+            warm(&mut queue, &context, &catalog);
             assert_eq!(
                 queue.take(later),
                 "pending",
-                "a click begun during the transition must not authorize the next batch"
+                "showing the next call never decides it"
             );
-            warm(&mut queue, &context, &catalog);
+            let (confirm, _) = buttons_of(&context, later).unwrap();
             click(&mut queue, &context, confirm.center());
             assert_eq!(queue.take(later), "approved");
             assert_eq!(queue.take(later), "unavailable");
         }
+    }
+
+    #[test]
+    fn new_calls_join_the_list_only_on_request_and_rearm_the_buttons() {
+        let mut queue = Queue::default();
+        let first = Uuid::new_v4();
+        let later = Uuid::new_v4();
+        queue.submit(first, review());
+        let context = egui::Context::default();
+        crate::ui::configure_fonts(&context, "en");
+        let catalog = Catalog::for_locale(Some("en"));
+        warm(&mut queue, &context, &catalog);
+        queue.submit(later, review());
+        warm(&mut queue, &context, &catalog);
+        let include = context
+            .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("ssh_include_new")))
+            .unwrap();
+        click(&mut queue, &context, include.center());
+        frame(
+            &mut queue,
+            &context,
+            &catalog,
+            egui::vec2(820.0, 620.0),
+            vec![],
+        );
+        let (confirm, _) = buttons_of(&context, later).unwrap();
+        assert_eq!(buttons_of(&context, first).unwrap().0, confirm);
+        click(&mut queue, &context, confirm.center());
+        assert_eq!(
+            queue.take(later),
+            "pending",
+            "a click right after the list grew must not decide the added call"
+        );
+        assert_eq!(queue.take(first), "pending");
+        warm(&mut queue, &context, &catalog);
+        click(&mut queue, &context, confirm.center());
+        assert_eq!(queue.take(first), "approved");
+        assert_eq!(queue.take(later), "approved");
+    }
+
+    #[test]
+    fn overview_names_sudo_jump_hosts_and_endpoints_before_any_details() {
+        fn texts(shape: &egui::Shape, values: &mut String) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    values.push_str(&text.galley.job.text);
+                    values.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        texts(shape, values);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut queue = Queue::default();
+        let id = Uuid::new_v4();
+        let mut call = review();
+        call.hosts.push(ReviewHost {
+            alias: "bastion".into(),
+            address: "192.0.2.10".into(),
+            port: 2200,
+            username: "ops".into(),
+            requires_approval: false,
+            protocol: Protocol::Ssh,
+            is_target: false,
+            is_jump: true,
+        });
+        call.sudo_user = Some("root".into());
+        call.stdin = Some("x".repeat(2048));
+        queue.submit(id, call);
+        let context = egui::Context::default();
+        crate::ui::configure_fonts(&context, "en");
+        let catalog = Catalog::for_locale(Some("en"));
+        warm(&mut queue, &context, &catalog);
+        let (output, _) = frame(
+            &mut queue,
+            &context,
+            &catalog,
+            egui::vec2(820.0, 620.0),
+            vec![],
+        );
+        let mut painted = String::new();
+        for shape in &output.shapes {
+            texts(&shape.shape, &mut painted);
+        }
+        for expected in [
+            "Allow this call",
+            "tester@127.0.0.1:22",
+            "Connects through bastion",
+            "Runs as root through sudo",
+            "printf test",
+            "Standard input: 2.0 KiB",
+        ] {
+            assert!(
+                painted.contains(expected),
+                "{expected:?} missing in {painted}"
+            );
+        }
+        assert!(queue.detail.is_none());
+        assert_eq!(queue.take(id), "pending");
     }
 
     #[test]

@@ -830,7 +830,8 @@ impl SecretsApp {
                 .any(|o| o.result.id == id && o.result.status == "pending")
         }) {
             self.detail = None;
-            self.approval_ready_at = context.input(|input| input.time) + 0.25;
+            self.approval_ready_at =
+                context.input(|input| input.time) + crate::approval_ui::ARM_SECONDS;
             self.feedback
                 .set(self.catalog.text("approval_detail_invalid").to_owned());
         }
@@ -844,22 +845,26 @@ impl SecretsApp {
         let approval_pending = self.operations.iter().any(|o| o.result.status == "pending");
         let ssh_pending = self.ssh_approvals.pending();
         let mut open = true;
+        let blocked = approval_pending || ssh_pending || self.delete_all_prompt.is_some();
+        let frame =
+            egui::Frame::window(&context.global_style()).inner_margin(egui::Margin::same(18));
         let window = egui::Window::new(catalog.text("temp_title"))
             .id(egui::Id::new("temporary_secrets_window"))
             .open(&mut open)
-            .enabled(!approval_pending && !ssh_pending && self.delete_all_prompt.is_none())
+            .enabled(!blocked)
             .collapsible(false)
             .resizable(true)
             .default_width((context.content_rect().width() - 56.0).min(760.0))
             .max_width((context.content_rect().width() - 56.0).max(280.0))
             .min_width(280.0)
             .min_height(320.0)
-            .frame(
-                egui::Frame::window(&context.global_style()).inner_margin(egui::Margin::same(18)),
-            )
-            .show(context, |ui| {
-                self.contents(ui);
-            });
+            .frame(frame);
+        let show = || window.show(context, |ui| self.contents(ui));
+        let window = if blocked {
+            crate::approval_ui::opaque_when_disabled(context, show)
+        } else {
+            show()
+        };
         self.visible = open;
         if let Some(window) = window
             && !ssh_pending
@@ -867,7 +872,8 @@ impl SecretsApp {
         {
             self.show_approval(context, window.response.rect);
         } else if ssh_pending {
-            self.approval_ready_at = context.input(|input| input.time) + 0.25;
+            self.approval_ready_at =
+                context.input(|input| input.time) + crate::approval_ui::ARM_SECONDS;
         }
         self.ssh_approvals.show(context, catalog);
         if !ssh_pending {
@@ -889,7 +895,8 @@ impl SecretsApp {
         let id = operation.result.id;
         if self.displayed_approval != Some(id) {
             self.displayed_approval = Some(id);
-            self.approval_ready_at = context.input(|input| input.time) + 0.25;
+            self.approval_ready_at =
+                context.input(|input| input.time) + crate::approval_ui::ARM_SECONDS;
         }
         let ready = context.input(|input| input.time) >= self.approval_ready_at;
         if !ready {
@@ -914,38 +921,34 @@ impl SecretsApp {
                         egui::Align2::CENTER_CENTER,
                         bounds.center() - context.content_rect().center(),
                     )
-                    .enabled(self.detail.is_none() && ready)
+                    .enabled(self.detail.is_none())
                     .fade_in(false),
             )
             .frame(crate::approval_ui::frame(context))
             .show(context, |ui| {
                 crate::approval_ui::style(ui);
                 ui.set_width((bounds.width() - 40.0).min(600.0));
-                ui.heading(self.catalog.text("temp_approval_title"));
-                ui.add(
-                    egui::Label::new(
-                        self.catalog.format(
-                            "temp_approval_summary",
-                            &[
-                                (
-                                    "fields",
-                                    &operation
-                                        .execution
-                                        .env
-                                        .values()
-                                        .collect::<HashSet<_>>()
-                                        .len()
-                                        .to_string(),
-                                ),
-                                ("pending", &pending.to_string()),
-                            ],
-                        ),
-                    )
-                    .wrap(),
+                let fields = operation
+                    .execution
+                    .env
+                    .values()
+                    .collect::<HashSet<_>>()
+                    .len();
+                crate::approval_ui::header(
+                    ui,
+                    self.catalog.text("temp_approval_title"),
+                    &self
+                        .catalog
+                        .format("temp_approval_subtitle", &[("fields", &fields.to_string())]),
                 );
-                let buttons =
-                    crate::approval_ui::buttons(ui, &self.catalog, self.running.is_none());
-                decision = buttons.decision;
+                let buttons = ui
+                    .add_enabled_ui(ready, |ui| {
+                        crate::approval_ui::buttons(ui, &self.catalog, self.running.is_none())
+                    })
+                    .inner;
+                if ready {
+                    decision = buttons.decision;
+                }
                 #[cfg(test)]
                 context.data_mut(|data| {
                     data.insert_temp(
@@ -953,84 +956,118 @@ impl SecretsApp {
                         (buttons.confirm, buttons.cancel),
                     )
                 });
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(crate::approval_ui::countdown(
-                        &self.catalog,
-                        operation.expires,
-                    ));
-                    if ui
-                        .small_button(self.catalog.text("approval_view_details"))
-                        .clicked()
-                    {
-                        open_detail = true;
-                    }
-                });
                 if let Some(running) = &self.running {
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(
                             ui.visuals().warn_fg_color,
-                            self.catalog.text("temp_op_running"),
+                            self.catalog.text("temp_blocked_running"),
                         );
                         if ui.small_button(self.catalog.text("temp_stop")).clicked() {
                             running.cancel.store(true, Ordering::Relaxed);
                         }
                     });
                 }
+                if pending > 1 {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        self.catalog.format(
+                            "temp_more_waiting",
+                            &[("count", &(pending - 1).to_string())],
+                        ),
+                    );
+                }
+                if let Some(text) = self.feedback.text() {
+                    ui.add(egui::Label::new(text).wrap());
+                }
+                crate::approval_ui::key_hint(ui, self.catalog.text("temp_key_hint"));
                 ui.separator();
-                let height = (bounds.height() - ui.min_rect().height() - 48.0).clamp(20.0, 160.0);
+                let height = (bounds.height() - ui.min_rect().height() - 48.0).clamp(20.0, 260.0);
                 egui::ScrollArea::vertical()
                     .id_salt(("temporary_approval_summary", id))
                     .auto_shrink([false, true])
                     .min_scrolled_height(20.0)
                     .max_height(height)
                     .show(ui, |ui| {
-                        let command = format!(
-                            "{} {}",
-                            operation.execution.program.display(),
-                            serde_json::to_string(&operation.execution.args).unwrap_or_default()
-                        );
-                        let response = ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new(crate::approval_ui::preview(&command))
-                                        .monospace(),
-                                )
-                                .wrap(),
-                            )
-                            .on_hover_text(self.catalog.text("approval_view_details"));
-                        if response.clicked() {
-                            open_detail = true;
-                        }
-                        #[cfg(test)]
-                        context.data_mut(|data| {
-                            data.insert_temp(
-                                egui::Id::new(("temporary_command_preview", id)),
-                                response.rect,
-                            )
-                        });
-                        ui.add(egui::Label::new(self.catalog.text("temp_approval_notice")).wrap());
-                        if self.running.is_some() {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(self.catalog.text("temp_blocked_running"))
-                                        .color(ui.visuals().warn_fg_color),
-                                )
-                                .wrap(),
-                            );
-                        }
-                        if let Some(text) = self.feedback.text() {
-                            ui.add(egui::Label::new(text).wrap());
-                        }
-                        ui.add(
-                            egui::Label::new(format!(
-                                "{}: {}",
-                                self.catalog.text("temp_directory"),
-                                crate::approval_ui::preview(
-                                    &operation.execution.cwd.display().to_string()
-                                )
-                            ))
-                            .wrap(),
-                        );
+                        egui::Frame::group(ui.style())
+                            .inner_margin(egui::Margin::same(10))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                crate::approval_ui::countdown_label(
+                                    ui,
+                                    &self.catalog,
+                                    operation.expires,
+                                );
+                                crate::approval_ui::section(ui, self.catalog.text("temp_program"));
+                                let command = format!(
+                                    "{} {}",
+                                    operation.execution.program.display(),
+                                    serde_json::to_string(&operation.execution.args)
+                                        .unwrap_or_default()
+                                );
+                                let response = crate::approval_ui::code_line(
+                                    ui,
+                                    &command,
+                                    self.catalog.text("approval_view_details"),
+                                );
+                                if response.clicked() {
+                                    open_detail = true;
+                                }
+                                #[cfg(test)]
+                                context.data_mut(|data| {
+                                    data.insert_temp(
+                                        egui::Id::new(("temporary_command_preview", id)),
+                                        response.rect,
+                                    )
+                                });
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "{}: {}",
+                                            self.catalog.text("temp_directory"),
+                                            crate::approval_ui::preview(
+                                                &operation.execution.cwd.display().to_string()
+                                            )
+                                        ))
+                                        .color(ui.visuals().weak_text_color()),
+                                    )
+                                    .wrap(),
+                                );
+                                crate::approval_ui::section(ui, self.catalog.text("temp_mappings"));
+                                for (env, field) in operation
+                                    .execution
+                                    .env
+                                    .iter()
+                                    .take(crate::approval_ui::PREVIEW_COMMANDS)
+                                {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(crate::approval_ui::preview(
+                                                &format!("{env} ← {field}"),
+                                            ))
+                                            .monospace(),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                let hidden = operation
+                                    .execution
+                                    .env
+                                    .len()
+                                    .saturating_sub(crate::approval_ui::PREVIEW_COMMANDS);
+                                if hidden > 0 {
+                                    ui.label(self.catalog.format(
+                                        "temp_more_mappings",
+                                        &[("count", &hidden.to_string())],
+                                    ));
+                                }
+                                ui.add_space(4.0);
+                                if ui
+                                    .button(self.catalog.text("approval_view_details"))
+                                    .clicked()
+                                {
+                                    open_detail = true;
+                                }
+                            });
                     });
             });
         if modal.response.rect.center().distance(bounds.center()) > 1.0 {
@@ -1053,11 +1090,12 @@ impl SecretsApp {
         }
         if let Some(allow) = decision {
             self.decide_approval(id, allow, context);
-            self.approval_ready_at = context.input(|input| input.time) + 0.25;
-        }
-        if open_detail {
+            self.approval_ready_at =
+                context.input(|input| input.time) + crate::approval_ui::ARM_SECONDS;
+        } else if open_detail && ready {
             self.detail = Some(id);
-            self.approval_ready_at = context.input(|input| input.time) + 0.25;
+            self.approval_ready_at =
+                context.input(|input| input.time) + crate::approval_ui::ARM_SECONDS;
         }
         self.show_detail(context);
     }
@@ -1086,18 +1124,25 @@ impl SecretsApp {
             .area(
                 egui::Modal::default_area(modal_id)
                     .default_size(bounds.size())
-                    .enabled(ready)
                     .fade_in(false),
             )
             .frame(crate::approval_ui::frame(context))
             .show(context, |ui| {
                 crate::approval_ui::style(ui);
                 ui.set_width((bounds.width() - 40.0).min(760.0));
-                ui.heading(self.catalog.text("temp_detail_title"));
-                ui.add(egui::Label::new(self.catalog.text("temp_detail_scope")).wrap());
-                let buttons =
-                    crate::approval_ui::buttons(ui, &self.catalog, self.running.is_none());
-                decision = buttons.decision;
+                crate::approval_ui::header(
+                    ui,
+                    self.catalog.text("temp_detail_title"),
+                    self.catalog.text("temp_detail_scope"),
+                );
+                let buttons = ui
+                    .add_enabled_ui(ready, |ui| {
+                        crate::approval_ui::buttons(ui, &self.catalog, self.running.is_none())
+                    })
+                    .inner;
+                if ready {
+                    decision = buttons.decision;
+                }
                 #[cfg(test)]
                 context.data_mut(|data| {
                     data.insert_temp(
@@ -1105,18 +1150,21 @@ impl SecretsApp {
                         (buttons.confirm, buttons.cancel),
                     )
                 });
-                let response = ui.small_button(self.catalog.text("approval_back"));
-                if response.clicked() {
-                    back = true;
-                }
-                #[cfg(test)]
-                context.data_mut(|data| {
-                    data.insert_temp(egui::Id::new(("temporary_detail_back", id)), response.rect)
+                ui.horizontal_wrapped(|ui| {
+                    let response = ui.small_button(self.catalog.text("approval_back"));
+                    if response.clicked() {
+                        back = true;
+                    }
+                    #[cfg(test)]
+                    context.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new(("temporary_detail_back", id)),
+                            response.rect,
+                        )
+                    });
+                    crate::approval_ui::countdown_label(ui, &self.catalog, operation.expires);
                 });
-                ui.label(crate::approval_ui::countdown(
-                    &self.catalog,
-                    operation.expires,
-                ));
+                crate::approval_ui::key_hint(ui, self.catalog.text("approval_detail_key_hint"));
                 if let Some(running) = &self.running {
                     ui.add(
                         egui::Label::new(
@@ -1201,10 +1249,12 @@ impl SecretsApp {
         if let Some(allow) = decision {
             self.decide_approval(id, allow, context);
             self.detail = None;
-            self.approval_ready_at = context.input(|input| input.time) + 0.25;
+            self.approval_ready_at =
+                context.input(|input| input.time) + crate::approval_ui::ARM_SECONDS;
         } else if back {
             self.detail = None;
-            self.approval_ready_at = context.input(|input| input.time) + 0.25;
+            self.approval_ready_at =
+                context.input(|input| input.time) + crate::approval_ui::ARM_SECONDS;
         }
     }
     fn contents(&mut self, ui: &mut egui::Ui) {
@@ -1643,7 +1693,10 @@ mod tests {
             if outcome == "abandoned" {
                 task.abort();
             } else {
-                for _ in 0..4 {
+                // A fresh call can arrive before an empty UI frame clears the
+                // completed snapshot; it then replaces that batch on its own,
+                // after the longer pause for following calls.
+                for _ in 0..8 {
                     approval_frame(
                         &mut app,
                         &context,
@@ -1651,23 +1704,6 @@ mod tests {
                         egui::vec2(820.0, 620.0),
                         vec![],
                     );
-                }
-                // A fresh call can arrive before an empty UI frame clears the
-                // completed snapshot. It must explicitly open the next batch.
-                if context
-                    .data(|data| {
-                        data.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new((
-                            "ssh_approval_buttons",
-                            id,
-                        )))
-                    })
-                    .is_none()
-                {
-                    let next = context
-                        .data(|data| data.get_temp::<egui::Rect>(egui::Id::new("ssh_next_batch")))
-                        .unwrap();
-                    approval_click(&mut app, &context, &catalog, next.center());
-                    warm_approval(&mut app, &context, &catalog);
                 }
                 let (confirm, cancel) = context
                     .data(|data| {

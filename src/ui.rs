@@ -2370,11 +2370,13 @@ impl eframe::App for HostsApp {
                 }
             }
         }
+        let mut requested = false;
         if let Some(temporary) = &mut self.temporary {
             if open_secrets {
                 temporary.visible = true;
             }
-            restore |= temporary.logic(context);
+            requested = temporary.logic(context);
+            restore |= requested;
         }
         if restore && !self.exiting {
             self.host_refresh_pending = true;
@@ -2382,6 +2384,13 @@ impl eframe::App for HostsApp {
             context.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             context.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             context.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // Windows may refuse the focus to a background process; the
+            // taskbar button then flashes until the user switches over.
+            if requested && !context.input(|input| input.viewport().focused.unwrap_or(false)) {
+                context.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                    egui::UserAttentionType::Critical,
+                ));
+            }
         }
         if self.host_refresh_pending && self.tests_idle() && !self.testing_all {
             self.host_refresh_pending = false;
