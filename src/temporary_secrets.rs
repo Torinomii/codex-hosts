@@ -1456,6 +1456,9 @@ pub fn call(session: Uuid, request: Request) -> Result<Response, &'static str> {
 mod tests {
     use super::*;
     use std::path::Path;
+    /// How long a test waits for a child, pipe or GUI condition before it
+    /// fails; only a failure takes this long, and slow CI runners need it.
+    const WAIT: Duration = Duration::from_secs(60);
     fn vault() -> Vault {
         let mut vault = Vault::default();
         vault
@@ -1581,6 +1584,8 @@ mod tests {
     #[cfg(windows)]
     fn child_consumes_exact_environment_but_response_contains_no_output() {
         let mut execution = execution();
+        // A cold PowerShell start on a busy CI runner can exceed 5 s.
+        execution.timeout_ms = 60_000;
         execution.args = vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), "if ($env:API_KEY -eq 'temporary-sentinel') { Write-Output $env:API_KEY; exit 0 } else { exit 9 }".into()];
         let result = run_child(
             Uuid::new_v4(),
@@ -1678,7 +1683,7 @@ mod tests {
             .unwrap();
             let task = crate::ssh::runtime()
                 .spawn(crate::approval::authorize_session(app.session, review));
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + WAIT;
             while !app.ssh_approvals.pending() && !task.is_finished() && Instant::now() < deadline {
                 app.poll();
                 thread::sleep(Duration::from_millis(5));
@@ -1720,7 +1725,7 @@ mod tests {
                 };
                 approval_click(&mut app, &context, &catalog, button.center());
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + WAIT;
             while !task.is_finished() && Instant::now() < deadline {
                 app.poll();
                 thread::sleep(Duration::from_millis(5));
@@ -1737,7 +1742,7 @@ mod tests {
             } else {
                 assert_eq!(result.unwrap().unwrap_err().code, "APPROVAL_CANCELLED");
             }
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + WAIT;
             while app.ssh_approvals.pending() && Instant::now() < deadline {
                 app.poll();
                 thread::sleep(Duration::from_millis(5));
@@ -1782,7 +1787,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ids
         );
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         while app.running.is_some() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
             app.poll();
@@ -1899,6 +1904,8 @@ mod tests {
     fn approval_executes_then_reports_only_exit_metadata() {
         let mut app = app();
         let mut execution = execution();
+        // A cold PowerShell start on a busy CI runner can exceed 5 s.
+        execution.timeout_ms = 60_000;
         execution.args = vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
             "if ($env:API_KEY -eq 'temporary-sentinel') { Write-Output $env:API_KEY; exit 0 } else { exit 9 }".into()];
         let id = app
@@ -1906,7 +1913,7 @@ mod tests {
             .operation_id
             .unwrap();
         app.approve(id, &egui::Context::default());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + WAIT;
         while app.running.is_some() && Instant::now() < deadline {
             app.poll();
             thread::sleep(Duration::from_millis(10));

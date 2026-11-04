@@ -9,6 +9,15 @@ on:
 permissions:
   contents: read
 
+# A newer push to the same branch or pull request replaces a run in progress.
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
 jobs:
   check:
     name: Format, test, and lint
@@ -26,15 +35,23 @@ jobs:
           rustup toolchain install 1.92.0 --profile minimal --component rustfmt,clippy
           rustup default 1.92.0
 
+      # Each step runs the same command as scripts/check.ps1 locally, cheapest
+      # first, so a failure names its own step.
+      - name: Format
+        shell: pwsh
+        run: .\scripts\check.ps1 -Step format
+
       - name: Cache Cargo build
         uses: Swatinem/rust-cache@v2
 
-      - name: Verify source
+      - name: Lint
         shell: pwsh
-        run: |
-          # Without this only the last command's exit code fails the step.
-          $PSNativeCommandUseErrorActionPreference = $true
-          cargo fmt --all --check
-          cargo test --locked --all-targets
-          cargo clippy --locked --all-targets -- -D warnings
-          .\scripts\check-dependency-direction.ps1
+        run: .\scripts\check.ps1 -Step lint
+
+      - name: Test
+        shell: pwsh
+        run: .\scripts\check.ps1 -Step test
+
+      - name: Dependency guard
+        shell: pwsh
+        run: .\scripts\check.ps1 -Step guard
