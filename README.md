@@ -192,7 +192,7 @@ While a session is kept, later commands on that host run without authenticating 
 
 `codex-hosts` can hold API keys, tokens and other values unrelated to host login. They live only in the `codex-hosts` process memory, are never returned to Codex, and are injected into the environment of a local program that Codex runs.
 
-Every field requires approval by default: before a program that uses it starts, a dialog asks you. Turn approval off per field to let runs start directly. Values expire when the tray application exits, you sign out or Windows restarts; Codex restarting does not clear them.
+Every field requires approval by default: before a program that uses it starts, a dialog asks you. Turn approval off per field, or for every field at once with the window-wide switch (which also applies to fields added later and is kept after a restart; switching it off asks first), to let runs start directly. The editor's bottom bar shows the current run, the latest result and the run history. Values expire when the tray application exits, you sign out or Windows restarts; Codex restarting does not clear them.
 
 See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md).
 
@@ -218,7 +218,7 @@ See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md).
 
 - **Sudo / su:** `exec_sudo` and `exec_su` run an absolute program with exact arguments as an explicitly chosen user. Separate Advanced switches allow supplying saved passwords; passwordless execution works with them off.
 - **Call approval:** an optional per-host switch reviews each SSH call, including probes, user switches and batches, before it connects. Kept connections never reuse an approval.
-- **Temporary secrets:** each field has its own approval switch, on by default. Saving or clearing fields cancels waiting runs.
+- **Temporary secrets:** each field has its own approval switch, on by default; a window-wide switch sets them all. Saving or clearing fields cancels waiting runs.
 - **Credential safety:** saved passwords stay bound to their accounts; changing a login never hands another account's password over.
 - **Installation:** Release and source installs use symbolic links only, through a step-by-step script with environment checks and backups.
 

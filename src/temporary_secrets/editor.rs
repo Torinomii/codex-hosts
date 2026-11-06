@@ -67,6 +67,19 @@ fn name_cell(ui: &mut egui::Ui, field: &Field) {
     let _ = response;
 }
 
+fn state_label(ui: &mut egui::Ui, field: &Field, catalog: &Catalog) {
+    let (mark, key, color) = if field.value.is_some() {
+        ("●", "temp_ready", theme::success_color(ui.visuals()))
+    } else {
+        ("○", "temp_missing", ui.visuals().weak_text_color())
+    };
+    ui.label(
+        egui::RichText::new(format!("{mark} {}", catalog.text(key)))
+            .small()
+            .color(color),
+    );
+}
+
 fn secret_cell(
     ui: &mut egui::Ui,
     field: &mut Field,
@@ -75,6 +88,9 @@ fn secret_cell(
     change: &mut Option<&'static str>,
 ) {
     let key = egui::Id::new(("temporary_secret_input", &field.name));
+    // Ctrl+Enter saves; taken before the editor so it never adds a line.
+    let submit = ui.memory(|memory| memory.has_focus(key))
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter));
     let revealed = crate::ui::theme::password_revealed(ui, key);
     let reveal_width = CONTROL_HEIGHT + ui.spacing().item_spacing.x;
     let width = (ui.available_width() - reveal_width).max(80.0);
@@ -113,13 +129,21 @@ fn secret_cell(
     ui.add_space(4.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(8.0, 4.0);
-        if ui
-            .add_sized(
-                [72.0, CONTROL_HEIGHT],
-                egui::Button::new(catalog.text("temp_save")),
-            )
-            .clicked()
-        {
+        let typed = !field.draft.is_empty();
+        let save = ui
+            .add_enabled_ui(typed, |ui| {
+                ui.add_sized(
+                    [72.0, CONTROL_HEIGHT],
+                    if typed {
+                        theme::primary_button(ui, catalog.text("temp_save"))
+                    } else {
+                        egui::Button::new(catalog.text("temp_save"))
+                    },
+                )
+            })
+            .inner
+            .on_hover_text(catalog.text("temp_save_hint"));
+        if save.clicked() || (submit && typed) {
             match field.save() {
                 Ok(()) => {
                     *notice = None;
@@ -128,26 +152,19 @@ fn secret_cell(
                 Err(_) => *notice = Some("temp_invalid_value"),
             }
         }
-        if ui
-            .add_sized(
-                [72.0, CONTROL_HEIGHT],
-                egui::Button::new(catalog.text("temp_clear")),
-            )
-            .clicked()
-        {
+        let clear = ui
+            .add_enabled_ui(typed || field.value.is_some(), |ui| {
+                ui.add_sized(
+                    [72.0, CONTROL_HEIGHT],
+                    egui::Button::new(catalog.text("temp_clear")),
+                )
+            })
+            .inner;
+        if clear.clicked() {
             field.clear();
             *change = Some("ok");
         }
     });
-    ui.label(
-        egui::RichText::new(catalog.text(if field.value.is_some() {
-            "temp_ready"
-        } else {
-            "temp_missing"
-        }))
-        .small()
-        .weak(),
-    );
 }
 
 fn approval_cell(
@@ -201,7 +218,6 @@ fn delete_button(ui: &mut egui::Ui, catalog: &Catalog, enabled: bool, width: f32
 
 impl SecretsApp {
     pub(super) fn field_toolbar(&mut self, ui: &mut egui::Ui) {
-        let wide = ui.available_width() >= 600.0;
         let button_width = |key: &str| {
             ui.painter()
                 .layout_no_wrap(
@@ -216,30 +232,53 @@ impl SecretsApp {
         let add_width = button_width("temp_add").max(96.0);
         let delete_width = button_width("temp_delete_all").max(112.0);
         let mut add = false;
-        let mut delete = false;
-        let name = |ui: &mut egui::Ui, value: &mut String, width: f32| {
-            ui.add_sized(
+        ui.horizontal(|ui| {
+            let width = (ui.available_width() - add_width - ui.spacing().item_spacing.x).max(120.0);
+            let response = ui.add_sized(
                 [width, CONTROL_HEIGHT],
-                egui::TextEdit::singleline(value)
+                egui::TextEdit::singleline(&mut self.new_name)
                     .hint_text(self.catalog.text("temp_name_hint"))
                     .desired_width(width)
                     .char_limit(256),
             );
-        };
-        if wide {
-            ui.horizontal(|ui| {
-                let width = (ui.available_width()
-                    - add_width
-                    - delete_width
-                    - 2.0 * ui.spacing().item_spacing.x)
-                    .max(120.0);
-                name(ui, &mut self.new_name, width);
-                add = ui
-                    .add_sized(
+            // Enter in the name box adds the field.
+            add = response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let typed = !self.new_name.trim().is_empty();
+            add |= ui
+                .add_enabled_ui(typed, |ui| {
+                    ui.add_sized(
                         [add_width, CONTROL_HEIGHT],
-                        egui::Button::new(self.catalog.text("temp_add")),
+                        if typed {
+                            theme::primary_button(ui, self.catalog.text("temp_add"))
+                        } else {
+                            egui::Button::new(self.catalog.text("temp_add"))
+                        },
                     )
-                    .clicked();
+                })
+                .inner
+                .clicked();
+        });
+        ui.add_space(4.0);
+        let mut delete = false;
+        let mut approval = None;
+        ui.horizontal_wrapped(|ui| {
+            let mixed = self.vault.approval_mixed();
+            let mut on = !mixed && self.vault.default_requires_approval;
+            // Clicking a mixed switch turns approval on everywhere, the safe side.
+            let response = ui
+                .add(
+                    egui::Checkbox::new(&mut on, self.catalog.text("temp_global_approval"))
+                        .indeterminate(mixed),
+                )
+                .on_hover_text(self.catalog.text("temp_global_approval_hint"));
+            if response.changed() {
+                approval = Some(on);
+            }
+            #[cfg(test)]
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(egui::Id::new("temporary_global_approval"), response.rect)
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 delete = delete_button(
                     ui,
                     &self.catalog,
@@ -247,24 +286,15 @@ impl SecretsApp {
                     delete_width,
                 );
             });
-        } else {
-            name(ui, &mut self.new_name, ui.available_width());
-            ui.horizontal_wrapped(|ui| {
-                add = ui
-                    .add_sized(
-                        [add_width, CONTROL_HEIGHT],
-                        egui::Button::new(self.catalog.text("temp_add")),
-                    )
-                    .clicked();
-                delete = delete_button(
-                    ui,
-                    &self.catalog,
-                    !self.vault.fields.is_empty(),
-                    delete_width,
-                );
-            });
+        });
+        match approval {
+            // Off is kept after restart and covers fields Codex adds later,
+            // so it is confirmed first; on is the safe side and applies at once.
+            Some(false) => self.approval_off_prompt = true,
+            Some(true) => self.apply_approval_default(true),
+            None => {}
         }
-        if add {
+        if add && !self.new_name.trim().is_empty() {
             match self.vault.request(std::slice::from_ref(&self.new_name)) {
                 Ok(()) => {
                     self.new_name.clear();
@@ -354,6 +384,43 @@ impl SecretsApp {
         }
     }
 
+    pub(super) fn show_approval_off(&mut self, context: &egui::Context) {
+        if !self.approval_off_prompt {
+            return;
+        }
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal =
+            egui::Modal::new(egui::Id::new("temporary_approval_off_dialog")).show(context, |ui| {
+                ui.set_width((context.content_rect().width() - 80.0).clamp(220.0, 460.0));
+                ui.heading(self.catalog.text("temp_approval_off_title"));
+                ui.add(egui::Label::new(self.catalog.text("temp_approval_off_body")).wrap());
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    let cancel_button = ui.button(self.catalog.text("cancel"));
+                    let confirm_button = ui.add(theme::danger_confirm_button(
+                        ui,
+                        self.catalog.text("temp_approval_off_confirm"),
+                    ));
+                    cancel = cancel_button.clicked();
+                    confirm = confirm_button.clicked();
+                    #[cfg(test)]
+                    context.data_mut(|data| {
+                        data.insert_temp(
+                            egui::Id::new("temporary_approval_off_buttons"),
+                            (confirm_button.rect, cancel_button.rect),
+                        )
+                    });
+                });
+            });
+        if confirm {
+            self.apply_approval_default(false);
+        }
+        if confirm || cancel || modal.should_close() {
+            self.approval_off_prompt = false;
+        }
+    }
+
     pub(super) fn field_rows(&mut self, ui: &mut egui::Ui) {
         if self.vault.fields.is_empty() {
             ui.label(egui::RichText::new(self.catalog.text("temp_no_fields")).weak());
@@ -383,7 +450,10 @@ impl SecretsApp {
                     }
                     if let Some(c) = columns {
                         ui.horizontal_top(|ui| {
-                            cell(ui, c.name, |ui| name_cell(ui, field));
+                            cell(ui, c.name, |ui| {
+                                name_cell(ui, field);
+                                state_label(ui, field, &self.catalog);
+                            });
                             cell(ui, c.secret, |ui| {
                                 secret_cell(ui, field, &self.catalog, &mut self.notice, &mut change)
                             });
@@ -393,6 +463,7 @@ impl SecretsApp {
                         });
                     } else {
                         name_cell(ui, field);
+                        state_label(ui, field, &self.catalog);
                         secret_cell(ui, field, &self.catalog, &mut self.notice, &mut change);
                         approval_cell(ui, field, &self.catalog, &mut change, true);
                     }

@@ -163,7 +163,7 @@ pub(super) fn input_margin(ui: &egui::Ui) -> egui::Margin {
     egui::Margin::symmetric(4, pad)
 }
 
-pub(super) fn success_color(visuals: &egui::Visuals) -> Color32 {
+pub(crate) fn success_color(visuals: &egui::Visuals) -> Color32 {
     if visuals.dark_mode {
         Color32::from_rgb(96, 200, 132)
     } else {

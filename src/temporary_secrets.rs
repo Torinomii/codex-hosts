@@ -156,9 +156,20 @@ impl Field {
     }
 }
 
-#[derive(Default)]
 struct Vault {
     fields: Vec<Field>,
+    /// The window-wide Call approval switch: new fields start with it, and
+    /// changing it applies to every field. Memory only, like the values.
+    default_requires_approval: bool,
+}
+
+impl Default for Vault {
+    fn default() -> Self {
+        Self {
+            fields: Vec::new(),
+            default_requires_approval: true,
+        }
+    }
 }
 
 fn validate_names(names: &[String], allow_empty: bool) -> Result<(), &'static str> {
@@ -195,11 +206,24 @@ impl Vault {
                     name: name.clone(),
                     draft: Zeroizing::new(String::new()),
                     value: None,
-                    requires_approval: true,
+                    requires_approval: self.default_requires_approval,
                 });
             }
         }
         Ok(())
+    }
+    /// Sets the window-wide default and every field's switch to `on`.
+    fn set_all_approval(&mut self, on: bool) {
+        self.default_requires_approval = on;
+        for field in &mut self.fields {
+            field.requires_approval = on;
+        }
+    }
+    /// Whether some field's switch differs from the window-wide default.
+    fn approval_mixed(&self) -> bool {
+        self.fields
+            .iter()
+            .any(|field| field.requires_approval != self.default_requires_approval)
     }
     fn clear(&mut self, names: &[String]) -> Result<(), &'static str> {
         validate_names(names, true)?;
@@ -297,6 +321,48 @@ struct Operation {
     result: OperationStatus,
     execution: Execution,
     expires: Instant,
+}
+
+/// The program's file name, which the overview shows instead of its path.
+fn program_name(operation: &Operation) -> String {
+    operation
+        .execution
+        .program
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// "program: status · Exit code: n", the one line a run is reported with.
+fn operation_summary(catalog: &Catalog, operation: &Operation) -> String {
+    let mut message = catalog.format(
+        "temp_result",
+        &[
+            ("program", &program_name(operation)),
+            (
+                "status",
+                catalog.text(&format!("temp_op_{}", operation.result.status)),
+            ),
+        ],
+    );
+    if let Some(code) = operation.result.exit_code {
+        message.push_str(&format!(
+            " · {}",
+            catalog.format("temp_exit", &[("code", &code.to_string())])
+        ));
+    }
+    message
+}
+
+fn status_tone(status: &str) -> crate::approval_ui::Tone {
+    use crate::approval_ui::Tone;
+    match status {
+        "completed" => Tone::Success,
+        "pending" | "queued" | "running" => Tone::Info,
+        "cancelled" | "expired" => Tone::Warning,
+        _ => Tone::Error,
+    }
 }
 
 pub(super) struct Envelope {
@@ -415,6 +481,12 @@ pub(crate) struct SecretsApp {
     displayed_approval: Option<Uuid>,
     approval_ready_at: f64,
     feedback: crate::approval_ui::Feedback,
+    /// The activity bar's run list is unfolded.
+    history_open: bool,
+    /// Asking whether to switch Call approval off for every field.
+    approval_off_prompt: bool,
+    /// A changed window-wide switch the main window has yet to save.
+    approval_default_change: Option<bool>,
 }
 
 impl SecretsApp {
@@ -540,6 +612,24 @@ impl SecretsApp {
         response.operation_id = operation_id;
         response
     }
+    /// The saved window-wide Call approval switch, before any field exists.
+    pub(crate) fn set_approval_default(&mut self, on: bool) {
+        self.vault.set_all_approval(on);
+    }
+
+    /// The switch value the user chose since the last call, for the main
+    /// window to save.
+    pub(crate) fn take_approval_default_change(&mut self) -> Option<bool> {
+        self.approval_default_change.take()
+    }
+
+    /// Applies the window-wide switch to every field and later fields.
+    fn apply_approval_default(&mut self, on: bool) {
+        self.vault.set_all_approval(on);
+        self.approval_default_change = Some(on);
+        self.record_input_status("ok");
+    }
+
     /// The Bitwarden unlock prompt a tool call is waiting on, if any.
     pub(crate) fn bitwarden_unlock_pending(&self) -> Option<Uuid> {
         self.bitwarden_unlocks.pending()
@@ -598,9 +688,10 @@ impl SecretsApp {
             }
         }
         if count > 0 {
-            self.feedback.set(
+            self.feedback.set_tone(
                 self.catalog
                     .format("temp_input_revoked", &[("count", &count.to_string())]),
+                crate::approval_ui::Tone::Warning,
             );
         }
     }
@@ -613,39 +704,18 @@ impl SecretsApp {
             }
         }
         if count > 0 {
-            self.feedback.set(
+            self.feedback.set_tone(
                 self.catalog
                     .format("temp_expired_feedback", &[("count", &count.to_string())]),
+                crate::approval_ui::Tone::Warning,
             );
         }
     }
     fn result_feedback(&mut self, id: Uuid) {
         if let Some(operation) = self.operations.iter().find(|o| o.result.id == id) {
-            let program = operation
-                .execution
-                .program
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy();
-            let mut message = self.catalog.format(
-                "temp_result",
-                &[
-                    ("program", &program),
-                    (
-                        "status",
-                        self.catalog
-                            .text(&format!("temp_op_{}", operation.result.status)),
-                    ),
-                ],
-            );
-            if let Some(code) = operation.result.exit_code {
-                message.push_str(&format!(
-                    " · {}",
-                    self.catalog
-                        .format("temp_exit", &[("code", &code.to_string())])
-                ));
-            }
-            self.feedback.set(message);
+            let message = operation_summary(&self.catalog, operation);
+            let tone = status_tone(&operation.result.status);
+            self.feedback.set_tone(message, tone);
         }
     }
     fn poll(&mut self) {
@@ -726,10 +796,13 @@ impl SecretsApp {
                 .find(|o| o.result.id == id)
                 .expect("validated pending operation");
             operation.result.status = "cancelled".into();
-            self.feedback.set(self.catalog.format(
-                "temp_decided",
-                &[("decision", self.catalog.text("approval_rejected"))],
-            ));
+            self.feedback.set_tone(
+                self.catalog.format(
+                    "temp_decided",
+                    &[("decision", self.catalog.text("approval_rejected"))],
+                ),
+                crate::approval_ui::Tone::Warning,
+            );
         }
     }
     fn start_queued(&mut self) {
@@ -805,6 +878,9 @@ impl SecretsApp {
             displayed_approval: None,
             approval_ready_at: 0.0,
             feedback: crate::approval_ui::Feedback::default(),
+            history_open: false,
+            approval_off_prompt: false,
+            approval_default_change: None,
         })
     }
     pub(crate) fn logic(&mut self, context: &egui::Context) -> bool {
@@ -845,7 +921,10 @@ impl SecretsApp {
         let approval_pending = self.operations.iter().any(|o| o.result.status == "pending");
         let ssh_pending = self.ssh_approvals.pending();
         let mut open = true;
-        let blocked = approval_pending || ssh_pending || self.delete_all_prompt.is_some();
+        let blocked = approval_pending
+            || ssh_pending
+            || self.delete_all_prompt.is_some()
+            || self.approval_off_prompt;
         let frame =
             egui::Frame::window(&context.global_style()).inner_margin(egui::Margin::same(18));
         let window = egui::Window::new(catalog.text("temp_title"))
@@ -855,7 +934,9 @@ impl SecretsApp {
             .collapsible(false)
             .resizable(true)
             .default_width((context.content_rect().width() - 56.0).min(760.0))
+            .default_height((context.content_rect().height() - 80.0).clamp(320.0, 720.0))
             .max_width((context.content_rect().width() - 56.0).max(280.0))
+            .max_height((context.content_rect().height() - 40.0).max(320.0))
             .min_width(280.0)
             .min_height(320.0)
             .frame(frame);
@@ -869,6 +950,7 @@ impl SecretsApp {
         if let Some(window) = window
             && !ssh_pending
             && self.delete_all_prompt.is_none()
+            && !self.approval_off_prompt
         {
             self.show_approval(context, window.response.rect);
         } else if ssh_pending {
@@ -878,10 +960,9 @@ impl SecretsApp {
         self.ssh_approvals.show(context, catalog);
         if !ssh_pending {
             self.show_delete_all(context);
+            self.show_approval_off(context);
         }
-        if !approval_pending && !ssh_pending {
-            self.feedback.show(context, "temporary_feedback");
-        }
+        // While the editor is open its activity bar carries the results.
     }
     fn show_approval(&mut self, context: &egui::Context, parent_rect: egui::Rect) {
         let Some(operation) = self
@@ -1263,61 +1344,28 @@ impl SecretsApp {
             egui::RichText::new(self.catalog.text("temp_memory_notice"))
                 .color(ui.visuals().weak_text_color()),
         );
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         self.field_toolbar(ui);
         if let Some(notice) = self.notice {
             ui.colored_label(ui.visuals().warn_fg_color, self.catalog.text(notice));
         }
-        ui.add_space(16.0);
-        egui::ScrollArea::vertical()
-            .id_salt("temporary_secret_scroll")
-            .auto_shrink([false, true])
-            .max_height((context.content_rect().height() - 240.0).clamp(120.0, 460.0))
-            .show(ui, |ui| {
-                self.field_rows(ui);
-                if !self.operations.is_empty() {
-                    ui.separator();
-                    ui.strong(self.catalog.text("temp_operations"));
-                }
-                let mut history = 0;
-                for operation in self.operations.iter().rev().filter(|operation| {
-                    if matches!(
-                        operation.result.status.as_str(),
-                        "pending" | "queued" | "running"
-                    ) {
-                        true
-                    } else {
-                        history += 1;
-                        history <= 4
-                    }
-                }) {
-                    ui.group(|ui| {
-                        ui.label(format!(
-                            "{} · {}",
-                            operation
-                                .execution
-                                .program
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            self.catalog
-                                .text(&format!("temp_op_{}", operation.result.status))
-                        ));
-                        if let Some(code) = operation.result.exit_code {
-                            ui.label(
-                                self.catalog
-                                    .format("temp_exit", &[("code", &code.to_string())]),
-                            );
-                        }
-                        if operation.result.status == "running"
-                            && ui.button(self.catalog.text("temp_stop")).clicked()
-                            && let Some(running) = &self.running
-                        {
-                            running.cancel.store(true, Ordering::Relaxed);
-                        }
-                    });
-                }
+        ui.add_space(10.0);
+        // The activity bar is laid out first, from the bottom, so it stays in
+        // view however many fields scroll above it.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            self.activity_bar(ui);
+            if self.history_open && !self.operations.is_empty() {
+                self.history(ui);
+            }
+            ui.separator();
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("temporary_secret_scroll")
+                    .auto_shrink([false, false])
+                    .min_scrolled_height(96.0)
+                    .show(ui, |ui| self.field_rows(ui));
             });
+        });
         if self.running.is_some()
             || self
                 .operations
@@ -1325,6 +1373,189 @@ impl SecretsApp {
                 .any(|o| matches!(o.result.status.as_str(), "pending" | "queued"))
         {
             context.request_repaint_after(Duration::from_millis(100));
+        }
+        if self.feedback.text().is_some() {
+            // Let a fresh result fade back to the plain summary on time.
+            context.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    /// One line at the window's foot: what runs now, else the latest result
+    /// (emphasized while fresh), with waiting runs, the field summary and the
+    /// run history.
+    fn activity_bar(&mut self, ui: &mut egui::Ui) {
+        use crate::approval_ui::Tone;
+        let running = self
+            .operations
+            .iter()
+            .find(|o| o.result.status == "running");
+        let waiting = self
+            .operations
+            .iter()
+            .filter(|o| matches!(o.result.status.as_str(), "pending" | "queued"))
+            .count();
+        let (text, tone, fresh) = if let Some(operation) = running {
+            (
+                operation_summary(&self.catalog, operation),
+                Tone::Info,
+                true,
+            )
+        } else if let (Some(text), Some(tone)) = (self.feedback.text(), self.feedback.tone()) {
+            (text.to_owned(), tone, true)
+        } else if let Some(operation) = self.operations.back() {
+            (
+                operation_summary(&self.catalog, operation),
+                status_tone(&operation.result.status),
+                false,
+            )
+        } else {
+            (
+                self.catalog.text("temp_activity_idle").to_owned(),
+                Tone::Info,
+                false,
+            )
+        };
+        let idle = running.is_none() && !fresh && self.operations.is_empty();
+        let ready = self
+            .vault
+            .fields
+            .iter()
+            .filter(|field| field.value.is_some())
+            .count();
+        let mut stop = false;
+        let mut toggle = false;
+        let height = ui.spacing().interact_size.y + 4.0;
+        let response = ui
+            .allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_width(ui.available_width());
+                    let color = if idle {
+                        ui.visuals().weak_text_color()
+                    } else {
+                        tone.color(ui.visuals())
+                    };
+                    ui.label(egui::RichText::new("●").color(color));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.operations.is_empty() {
+                            let label = format!(
+                                "{} {}",
+                                self.catalog.format(
+                                    "temp_history",
+                                    &[("count", &self.operations.len().to_string())]
+                                ),
+                                if self.history_open { "▾" } else { "▴" }
+                            );
+                            let response = ui
+                                .selectable_label(self.history_open, label)
+                                .on_hover_text(self.catalog.text("temp_operations"));
+                            toggle = response.clicked();
+                            #[cfg(test)]
+                            ui.ctx().data_mut(|data| {
+                                data.insert_temp(
+                                    egui::Id::new("temporary_history_toggle"),
+                                    response.rect,
+                                )
+                            });
+                        }
+                        ui.label(
+                            egui::RichText::new(self.catalog.format(
+                                "temp_fields_ready",
+                                &[
+                                    ("ready", &ready.to_string()),
+                                    ("total", &self.vault.fields.len().to_string()),
+                                ],
+                            ))
+                            .weak(),
+                        );
+                        if waiting > 0 {
+                            ui.label(
+                                egui::RichText::new(
+                                    self.catalog
+                                        .format("temp_waiting", &[("count", &waiting.to_string())]),
+                                )
+                                .color(ui.visuals().warn_fg_color),
+                            );
+                        }
+                        if running.is_some() {
+                            stop = ui.small_button(self.catalog.text("temp_stop")).clicked();
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let label = egui::RichText::new(&text);
+                            let label = if idle {
+                                label.weak()
+                            } else if fresh {
+                                label.strong()
+                            } else {
+                                label
+                            };
+                            ui.add(egui::Label::new(label).truncate())
+                                .on_hover_text(&text);
+                        });
+                    });
+                },
+            )
+            .response;
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new("temporary_activity_bar"), response.rect)
+        });
+        let _ = response;
+        if stop && let Some(running) = &self.running {
+            running.cancel.store(true, Ordering::Relaxed);
+        }
+        if toggle {
+            self.history_open = !self.history_open;
+        }
+    }
+
+    /// The kept runs, newest first, unfolded above the activity bar.
+    fn history(&mut self, ui: &mut egui::Ui) {
+        let mut stop = false;
+        ui.add_space(4.0);
+        egui::Frame::new()
+            .fill(crate::ui::theme::section_fill(ui.visuals()))
+            .stroke(crate::ui::theme::section_stroke(ui.visuals()))
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::symmetric(12, 8))
+            .show(ui, |ui| {
+                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.strong(self.catalog.text("temp_operations"));
+                    egui::ScrollArea::vertical()
+                        .id_salt("temporary_history_scroll")
+                        .auto_shrink([false, true])
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for operation in self.operations.iter().rev() {
+                                ui.horizontal(|ui| {
+                                    let tone = status_tone(&operation.result.status);
+                                    ui.label(
+                                        egui::RichText::new("●").color(tone.color(ui.visuals())),
+                                    );
+                                    if operation.result.status == "running"
+                                        && ui.small_button(self.catalog.text("temp_stop")).clicked()
+                                    {
+                                        stop = true;
+                                    }
+                                    ui.add(
+                                        egui::Label::new(operation_summary(
+                                            &self.catalog,
+                                            operation,
+                                        ))
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(
+                                        operation.execution.program.display().to_string(),
+                                    );
+                                });
+                            }
+                        });
+                });
+            });
+        if stop && let Some(running) = &self.running {
+            running.cancel.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -1659,6 +1890,9 @@ mod tests {
             displayed_approval: None,
             approval_ready_at: 0.0,
             feedback: crate::approval_ui::Feedback::default(),
+            history_open: false,
+            approval_off_prompt: false,
+            approval_default_change: None,
         }
     }
     #[test]
@@ -2944,6 +3178,196 @@ mod tests {
         assert_eq!(app.running.as_ref().unwrap().id, second);
         assert_eq!(app.operations[0].result.status, "cancelled");
         assert_eq!(app.operations[1].result.status, "running");
+    }
+
+    #[test]
+    fn global_approval_switch_confirms_off_sets_every_field_and_later_fields() {
+        let mut app = app();
+        app.vault.request(&["other-field".into()]).unwrap();
+        app.visible = true;
+        let context = egui::Context::default();
+        crate::ui::configure_fonts(&context, "en");
+        let catalog = Catalog::for_locale(Some("en"));
+        warm_approval(&mut app, &context, &catalog);
+        let switch = || {
+            context
+                .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("temporary_global_approval")))
+                .unwrap()
+        };
+        app.operations.push_back(Operation {
+            execution: execution(),
+            expires: Instant::now() + APPROVAL_LIFETIME,
+            result: OperationStatus {
+                id: Uuid::new_v4(),
+                status: "queued".into(),
+                exit_code: None,
+            },
+        });
+        let buttons = |app: &mut SecretsApp| {
+            warm_approval(app, &context, &catalog);
+            context
+                .data(|d| {
+                    d.get_temp::<(egui::Rect, egui::Rect)>(egui::Id::new(
+                        "temporary_approval_off_buttons",
+                    ))
+                })
+                .unwrap()
+        };
+        // Switching off asks first; Cancel changes nothing.
+        approval_click(&mut app, &context, &catalog, switch().center());
+        assert!(app.approval_off_prompt);
+        assert!(app.vault.fields.iter().all(|f| f.requires_approval));
+        let (_, cancel) = buttons(&mut app);
+        approval_click(&mut app, &context, &catalog, cancel.center());
+        assert!(!app.approval_off_prompt);
+        assert!(app.vault.fields.iter().all(|f| f.requires_approval));
+        assert_eq!(app.operations[0].result.status, "queued");
+        assert_eq!(app.take_approval_default_change(), None);
+        warm_approval(&mut app, &context, &catalog);
+        approval_click(&mut app, &context, &catalog, switch().center());
+        let (confirm, _) = buttons(&mut app);
+        approval_click(&mut app, &context, &catalog, confirm.center());
+        assert!(app.vault.fields.iter().all(|f| !f.requires_approval));
+        assert!(!app.vault.default_requires_approval);
+        assert_eq!(app.operations[0].result.status, "cancelled");
+        // The main window saves the choice once.
+        assert_eq!(app.take_approval_default_change(), Some(false));
+        assert_eq!(app.take_approval_default_change(), None);
+        // Fields declared later, by Codex or in the window, follow the switch.
+        app.handle(Request::Declare {
+            fields: vec!["declared-later".into()],
+        });
+        assert!(!app.vault.fields[2].requires_approval);
+        // One field switched back on makes the set mixed; a click on the
+        // mixed switch turns approval on everywhere.
+        app.vault.fields[1].requires_approval = true;
+        assert!(app.vault.approval_mixed());
+        warm_approval(&mut app, &context, &catalog);
+        approval_click(&mut app, &context, &catalog, switch().center());
+        assert!(
+            !app.approval_off_prompt,
+            "switching on needs no confirmation"
+        );
+        assert!(app.vault.fields.iter().all(|f| f.requires_approval));
+        assert!(app.vault.default_requires_approval && !app.vault.approval_mixed());
+        assert_eq!(app.take_approval_default_change(), Some(true));
+        // A saved off switch applies to the first fields of the next start.
+        let mut restarted = self::app();
+        restarted.vault = Vault::default();
+        restarted.set_approval_default(false);
+        restarted.handle(Request::Declare {
+            fields: vec!["after-restart".into()],
+        });
+        assert!(!restarted.vault.fields[0].requires_approval);
+        assert_eq!(restarted.take_approval_default_change(), None);
+        // Deleting every field keeps the window-wide choice for new ones.
+        app.vault.set_all_approval(false);
+        app.delete_all_fields();
+        app.vault.request(&["after-delete".into()]).unwrap();
+        assert!(!app.vault.fields[0].requires_approval);
+    }
+
+    #[test]
+    fn activity_bar_stays_in_view_below_many_fields_and_carries_results() {
+        fn texts(shape: &egui::Shape, found: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => found.push((
+                    text.galley.job.text.clone(),
+                    text.galley.rect.translate(text.pos.to_vec2()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, found)),
+                _ => {}
+            }
+        }
+        fn blue(shape: &egui::Shape) -> bool {
+            match shape {
+                egui::Shape::Rect(rect) => rect.fill == crate::approval_ui::BLUE,
+                egui::Shape::Vec(shapes) => shapes.iter().any(blue),
+                _ => false,
+            }
+        }
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            for size in [egui::vec2(774.0, 584.0), egui::vec2(1040.0, 760.0)] {
+                let mut app = app();
+                app.vault
+                    .request(
+                        &(1..MAX_FIELDS)
+                            .map(|i| format!("project-local-token-{i}"))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
+                app.visible = true;
+                let id = Uuid::new_v4();
+                app.operations.push_back(Operation {
+                    execution: execution(),
+                    expires: Instant::now() + APPROVAL_LIFETIME,
+                    result: OperationStatus {
+                        id,
+                        status: "completed".into(),
+                        exit_code: Some(0),
+                    },
+                });
+                let context = egui::Context::default();
+                crate::ui::configure_fonts(&context, locale);
+                let catalog = Catalog::for_locale(Some(locale));
+                app.catalog = catalog.clone();
+                app.result_feedback(id);
+                let expected = operation_summary(&catalog, &app.operations[0]);
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                for history in [false, true] {
+                    app.history_open = history;
+                    let mut output = None;
+                    for _ in 0..4 {
+                        output = Some(approval_frame(&mut app, &context, &catalog, size, vec![]).0);
+                    }
+                    let output = output.unwrap();
+                    let bar = context
+                        .data(|d| d.get_temp::<egui::Rect>(egui::Id::new("temporary_activity_bar")))
+                        .unwrap();
+                    let window = context
+                        .memory(|m| m.area_rect(egui::Id::new("temporary_secrets_window")))
+                        .unwrap();
+                    assert!(
+                        screen.contains_rect(window),
+                        "{locale} {size:?}: {window:?}"
+                    );
+                    assert!(
+                        window.contains_rect(bar),
+                        "{locale} {size:?}: {bar:?} in {window:?}"
+                    );
+                    // The bar sits at the window's foot, not after 64 field rows.
+                    assert!(
+                        window.bottom() - bar.bottom() < 40.0,
+                        "{locale}: {bar:?} {window:?}"
+                    );
+                    let mut found = Vec::new();
+                    for shape in &output.shapes {
+                        texts(&shape.shape, &mut found);
+                    }
+                    assert!(
+                        found
+                            .iter()
+                            .any(|(text, rect)| text == &expected && bar.intersects(*rect)),
+                        "{locale}: {expected} not in the bar"
+                    );
+                    if history {
+                        let heading = catalog.text("temp_operations");
+                        assert!(
+                            found
+                                .iter()
+                                .any(|(text, rect)| text == heading && window.contains_rect(*rect))
+                        );
+                    }
+                    // Results no longer arrive as a blue box over the editor.
+                    assert!(!output.shapes.iter().any(|s| blue(&s.shape)));
+                    assert!(
+                        found
+                            .iter()
+                            .all(|(text, _)| !text.contains("temporary-sentinel"))
+                    );
+                }
+            }
+        }
     }
 }
 

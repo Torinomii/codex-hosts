@@ -784,6 +784,7 @@ impl HostsApp {
         };
         if let Some(temporary) = &mut temporary {
             temporary.visible = launch.show_temporary;
+            temporary.set_approval_default(store.temporary_call_approval);
         }
         let tray = if launch.codex_edit {
             None
@@ -2487,6 +2488,12 @@ impl HostsApp {
         self.toasts(&context);
         if let Some(temporary) = &mut self.temporary {
             temporary.show(&context, &self.catalog);
+            if let Some(on) = temporary.take_approval_default_change() {
+                self.store.temporary_call_approval = on;
+                if let Err(error) = self.store.save() {
+                    self.set_status_format("storage_error", &[("error", &error.to_string())]);
+                }
+            }
         }
     }
 }

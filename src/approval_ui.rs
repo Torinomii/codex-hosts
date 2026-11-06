@@ -283,36 +283,77 @@ pub(crate) fn full_text(ui: &mut egui::Ui, catalog: &Catalog, id: egui::Id, text
     );
 }
 
+/// How a result reads: plain, done, needs attention, or went wrong.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Tone {
+    #[default]
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl Tone {
+    /// The tone's color in the application theme (not the approval palette).
+    pub(crate) fn color(self, visuals: &egui::Visuals) -> Color32 {
+        match self {
+            Tone::Info => visuals.selection.bg_fill,
+            Tone::Success => crate::ui::theme::success_color(visuals),
+            Tone::Warning => visuals.warn_fg_color,
+            Tone::Error => visuals.error_fg_color,
+        }
+    }
+}
+
+/// Seconds a result stays in view.
+const FEEDBACK_SECONDS: u64 = 7;
+
 #[derive(Default)]
 pub(crate) struct Feedback {
-    message: Option<(String, Instant)>,
+    message: Option<(String, Tone, Instant)>,
 }
 impl Feedback {
     pub(crate) fn set(&mut self, text: String) {
-        self.message = Some((text, Instant::now()));
+        self.set_tone(text, Tone::Info);
     }
-    pub(crate) fn text(&self) -> Option<&str> {
+    pub(crate) fn set_tone(&mut self, text: String, tone: Tone) {
+        self.message = Some((text, tone, Instant::now()));
+    }
+    fn current(&self) -> Option<&(String, Tone, Instant)> {
         self.message
             .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(7))
-            .map(|(text, _)| text.as_str())
+            .filter(|(_, _, at)| at.elapsed() < Duration::from_secs(FEEDBACK_SECONDS))
     }
+    pub(crate) fn text(&self) -> Option<&str> {
+        self.current().map(|(text, _, _)| text.as_str())
+    }
+    pub(crate) fn tone(&self) -> Option<Tone> {
+        self.current().map(|(_, tone, _)| *tone)
+    }
+    /// A toast in the application's own style, for when no window of ours
+    /// can carry the message (the editor is hidden).
     pub(crate) fn show(&self, context: &egui::Context, id: &str) {
-        let Some(text) = self.text() else {
+        let Some((text, tone, _)) = self.current() else {
             return;
         };
         context.request_repaint_after(Duration::from_millis(250));
         egui::Area::new(egui::Id::new(id))
-            .anchor(egui::Align2::RIGHT_BOTTOM, [-20.0, -20.0])
+            .anchor(egui::Align2::RIGHT_BOTTOM, [-20.0, -48.0])
             .order(egui::Order::Foreground)
             .interactable(false)
             .fade_in(false)
             .show(context, |ui| {
-                frame(context).show(ui, |ui| {
-                    style(ui);
-                    ui.set_width((context.content_rect().width() - 80.0).min(420.0));
-                    ui.add(egui::Label::new(text).wrap());
-                });
+                let color = tone.color(ui.visuals());
+                egui::Frame::popup(ui.style())
+                    .stroke(egui::Stroke::new(1.5, color))
+                    .inner_margin(egui::Margin::symmetric(14, 10))
+                    .show(ui, |ui| {
+                        ui.set_max_width((context.content_rect().width() - 80.0).min(380.0));
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("●").color(color));
+                            ui.add(egui::Label::new(text.as_str()).wrap());
+                        });
+                    });
             });
     }
 }

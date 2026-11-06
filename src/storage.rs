@@ -22,6 +22,10 @@ pub struct HostStore {
     pub bitwarden: BitwardenSettings,
     /// The 1Password account and vault; non-secret.
     pub onepassword: OnePasswordSettings,
+    /// The temporary secrets window's Call approval switch for all fields,
+    /// which new fields start with. Written only when switched off.
+    #[serde(skip_serializing_if = "is_true")]
+    pub temporary_call_approval: bool,
     #[serde(skip)]
     write_blocked: Option<String>,
     // Exact loaded bytes (None means no primary). Never written into hosts.json.
@@ -48,10 +52,15 @@ impl Default for HostStore {
             hosts: Vec::new(),
             bitwarden: BitwardenSettings::default(),
             onepassword: OnePasswordSettings::default(),
+            temporary_call_approval: true,
             write_blocked: None,
             revision: RefCell::new(None),
         }
     }
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 impl HostStore {
@@ -721,6 +730,28 @@ mod tests {
         assert!(primary.exists());
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn temporary_call_approval_defaults_on_and_is_written_only_when_off() {
+        let old: HostStore = serde_json::from_str(r#"{"version":2,"hosts":[]}"#).unwrap();
+        assert!(old.temporary_call_approval);
+        assert!(
+            !serde_json::to_string(&HostStore::default())
+                .unwrap()
+                .contains("temporary_call_approval")
+        );
+        let off = HostStore {
+            temporary_call_approval: false,
+            ..HostStore::default()
+        };
+        let text = serde_json::to_string(&off).unwrap();
+        assert!(text.contains(r#""temporary_call_approval":false"#));
+        assert!(
+            !serde_json::from_str::<HostStore>(&text)
+                .unwrap()
+                .temporary_call_approval
+        );
     }
 
     #[test]
