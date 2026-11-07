@@ -188,6 +188,23 @@ async fn save_with<R: OpRunner>(
     Ok((op.item_key(&item.summary().id), facts))
 }
 
+/// The host items of the configured vault, as their list entries describe
+/// them (no description or tags, nothing secret).
+pub(crate) async fn list_hosts() -> Result<Vec<(ItemKey, HostFacts)>, RemoteFailure> {
+    let _turn = CLI_GATE.lock().await;
+    let op = Op::from_settings(&settings()?)?;
+    let items = op.list_items().await.map_err(|error| failure(error, ""))?;
+    Ok(items
+        .iter()
+        .filter(|item| item.vault.id == op.account.vault_id)
+        .filter_map(|item| {
+            listed_facts(item, None)
+                .ok()
+                .map(|facts| (op.item_key(&item.id), facts))
+        })
+        .collect())
+}
+
 /// Archives the item behind a 1Password host.
 pub(crate) async fn archive_item(host: &HostProfile) -> Result<(), RemoteFailure> {
     let _turn = CLI_GATE.lock().await;
@@ -427,6 +444,19 @@ pub(crate) async fn admit(host: &HostProfile) -> Result<AdmittedLogin, RemoteFai
 pub(crate) async fn resolve_login_password(
     host: &HostProfile,
 ) -> Result<Zeroizing<String>, RemoteFailure> {
+    login_password(host).await?.ok_or_else(|| {
+        RemoteFailure::new(
+            "ONEPASSWORD_ITEM_MISSING",
+            format!("The 1Password item behind {} has no password.", host.alias),
+        )
+    })
+}
+
+/// The password a 1Password host's item holds, `None` when it has none;
+/// the item's username must still be the host's.
+pub(crate) async fn login_password(
+    host: &HostProfile,
+) -> Result<Option<Zeroizing<String>>, RemoteFailure> {
     let _turn = CLI_GATE.lock().await;
     let op = Op::from_settings(&settings()?)?;
     let item = read_item(&op, host).await?;
@@ -440,15 +470,10 @@ pub(crate) async fn resolve_login_password(
             ),
         ));
     }
-    item.password()
+    Ok(item
+        .password()
         .map_err(|error| failure(error, &host.alias))?
-        .filter(|password| !password.is_empty())
-        .ok_or_else(|| {
-            RemoteFailure::new(
-                "ONEPASSWORD_ITEM_MISSING",
-                format!("The 1Password item behind {} has no password.", host.alias),
-            )
-        })
+        .filter(|password| !password.is_empty()))
 }
 
 /// Lists the vault and mirrors it into the store (saved when something

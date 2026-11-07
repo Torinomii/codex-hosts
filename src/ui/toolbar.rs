@@ -183,6 +183,8 @@ impl HostsApp {
         let mut toggle_selection = false;
         let mut delete_batch = false;
         let mut export_batch = false;
+        let mut transfer_batch = false;
+        let can_transfer = self.transfer_stores().len() > 1;
         let mut cancel_batch = ui.input(|input| input.key_pressed(egui::Key::Escape));
         egui::Frame::new()
             .fill(theme::accent_bar_fill(ui.visuals()))
@@ -218,6 +220,20 @@ impl HostsApp {
                         export_batch = true;
                     }
                     if ui
+                        .add_enabled(
+                            count > 0 && can_transfer,
+                            egui::Button::new(self.catalog.text("transfer_button")),
+                        )
+                        .on_disabled_hover_text(self.catalog.text(if can_transfer {
+                            "batch_nothing_selected"
+                        } else {
+                            "transfer_no_target"
+                        }))
+                        .clicked()
+                    {
+                        transfer_batch = true;
+                    }
+                    if ui
                         .add_enabled(count > 0, egui::Button::new(self.catalog.text("delete")))
                         .clicked()
                     {
@@ -238,6 +254,10 @@ impl HostsApp {
         }
         if export_batch {
             self.request_batch_export();
+        }
+        if transfer_batch {
+            let ids = self.batch_selected.iter().copied().collect();
+            self.open_transfer(ids, super::transfer::TransferMode::Copy, None);
         }
         if delete_batch {
             self.request_batch_delete();

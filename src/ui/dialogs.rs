@@ -159,6 +159,7 @@ impl HostsApp {
         self.unsaved_switch_dialog(context);
         self.persistence_dialog(context);
         self.batch_delete_dialog(context);
+        self.transfer_dialog(context);
         self.bitwarden_dialogs(context);
     }
 
@@ -172,6 +173,7 @@ impl HostsApp {
             || self.pending_switch.is_some()
             || self.persistence_prompt.is_some()
             || self.batch_delete_prompt
+            || self.transfer_prompt.is_some()
             || self.bitwarden_dialog_open()
     }
 
@@ -594,11 +596,20 @@ impl HostsApp {
         }
         let count = self.batch_selected.len().to_string();
         let catalog = &self.catalog;
+        let mut message = catalog.format("batch_delete_message", &[("count", count.as_str())]);
+        if self
+            .store
+            .hosts
+            .iter()
+            .any(|host| self.batch_selected.contains(&host.id) && host.is_vault_host())
+        {
+            message = format!("{message} {}", catalog.text("batch_delete_vault_note"));
+        }
         let choice = confirm_dialog(
             context,
             "batch_delete_confirmation",
             catalog.text("batch_delete_title"),
-            &catalog.format("batch_delete_message", &[("count", count.as_str())]),
+            &message,
             catalog.text("confirm_delete_selected"),
             catalog.text("cancel"),
             true,

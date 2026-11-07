@@ -23,6 +23,7 @@ mod services;
 mod status;
 pub(crate) mod theme;
 mod toolbar;
+mod transfer;
 
 pub(crate) use theme::{configure_fonts, forget_password_history};
 
@@ -99,25 +100,31 @@ enum PendingAction {
     TestAll,
 }
 
-/// The item write that changes only the tags of a vault host, built from
-/// the stored mirror so nothing else in the form leaks into it.
-fn tags_write(stored: &HostProfile, tags: &[String]) -> HostWrite {
-    let scheme = match stored.protocol {
+/// The `ssh://` or `telnet://` URL a vault item holds for `profile`; the
+/// username stays in the item's own field.
+fn item_uri(profile: &HostProfile) -> String {
+    let scheme = match profile.protocol {
         Protocol::Ssh => codex_hosts_bw::UriScheme::Ssh,
         Protocol::Telnet => codex_hosts_bw::UriScheme::Telnet,
     };
-    let uri = codex_hosts_bw::HostUri {
+    codex_hosts_bw::HostUri {
         scheme,
         username: None,
-        host: stored.address.trim().to_owned(),
-        port: Some(stored.port),
-    };
+        host: profile.address.trim().to_owned(),
+        port: Some(profile.port),
+    }
+    .to_string()
+}
+
+/// The item write that changes only the tags of a vault host, built from
+/// the stored mirror so nothing else in the form leaks into it.
+fn tags_write(stored: &HostProfile, tags: &[String]) -> HostWrite {
     HostWrite {
         provider: stored.vault_provider().unwrap_or_default(),
         item_id: Some(stored.id),
         external_id: stored.vault().and_then(|vault| vault.external_id.clone()),
         name: stored.alias.clone(),
-        host_uri: uri.to_string(),
+        host_uri: item_uri(stored),
         username: stored.username.clone(),
         password: FieldEdit::Keep,
         description: stored.description.clone(),
@@ -328,16 +335,6 @@ impl HostEditor {
     /// What the vault item should hold after this save.
     fn vault_write(&self) -> HostWrite {
         let profile = &self.profile;
-        let scheme = match profile.protocol {
-            Protocol::Ssh => codex_hosts_bw::UriScheme::Ssh,
-            Protocol::Telnet => codex_hosts_bw::UriScheme::Telnet,
-        };
-        let uri = codex_hosts_bw::HostUri {
-            scheme,
-            username: None,
-            host: profile.address.trim().to_owned(),
-            port: Some(profile.port),
-        };
         // Key and Agent logins leave the item password alone.
         let password = if !self.needs_password() {
             FieldEdit::Keep
@@ -357,7 +354,7 @@ impl HostEditor {
                 .then(|| profile.vault().and_then(|vault| vault.external_id.clone()))
                 .flatten(),
             name: profile.alias.trim().to_owned(),
-            host_uri: uri.to_string(),
+            host_uri: item_uri(profile),
             username: profile.username.trim().to_owned(),
             password,
             description: profile.description.trim().to_owned(),
@@ -622,6 +619,8 @@ pub struct HostsApp {
     host_filter: HostFilter,
     batch_delete_prompt: bool,
     batch_export_window_open: bool,
+    /// The copy-or-move dialog, while open.
+    transfer_prompt: Option<transfer::TransferPrompt>,
     sidebar_width: Option<f32>,
     /// Scroll the host list so the selected row is visible on the next frame.
     scroll_to_selected: bool,
@@ -822,6 +821,7 @@ impl HostsApp {
             host_filter: HostFilter::default(),
             batch_delete_prompt: false,
             batch_export_window_open: false,
+            transfer_prompt: None,
             sidebar_width: None,
             scroll_to_selected: true,
             launch,
@@ -1983,15 +1983,22 @@ impl HostsApp {
         self.batch_delete_prompt = true;
     }
 
+    /// Deletes the selected hosts. Local ones go at once with their
+    /// Credential Manager records; the items of vault hosts go to their
+    /// trash or archive on a worker, and their mirrors when that lands.
     fn remove_batch(&mut self) {
-        let ids = self.batch_selected.iter().copied().collect::<Vec<_>>();
-        let profiles = self
+        let (vault_hosts, profiles): (Vec<HostProfile>, Vec<HostProfile>) = self
             .store
             .hosts
             .iter()
-            .filter(|host| ids.contains(&host.id))
+            .filter(|host| self.batch_selected.contains(&host.id))
             .cloned()
-            .collect::<Vec<_>>();
+            .partition(HostProfile::is_vault_host);
+        if !vault_hosts.is_empty() && self.vault_job_running() {
+            self.set_status_key("busy");
+            return;
+        }
+        let ids = profiles.iter().map(|host| host.id).collect::<Vec<_>>();
         let credential_snapshots = match profiles
             .iter()
             .map(|host| credentials::snapshot_host(host).map(|snapshot| (host.id, snapshot)))
@@ -2014,9 +2021,7 @@ impl HostsApp {
             }
         }
         let original_hosts = self.store.hosts.clone();
-        self.store
-            .hosts
-            .retain(|host| !self.batch_selected.contains(&host.id));
+        self.store.hosts.retain(|host| !ids.contains(&host.id));
         if let Err(error) = self.store.save() {
             self.store.hosts = original_hosts;
             let mut rollback_errors = Vec::new();
@@ -2051,7 +2056,67 @@ impl HostsApp {
             self.testing_all = false;
             self.test_hosts_snapshot = None;
         }
-        self.set_status_key("batch_deleted");
+        if vault_hosts.is_empty() {
+            self.set_status_key("batch_deleted");
+        } else {
+            let count = vault_hosts.len().to_string();
+            self.start_vault_task(VaultTask::DeleteMany(vault_hosts));
+            self.set_status_format("batch_deleting_items", &[("count", &count)]);
+        }
+    }
+
+    /// The items of a batch delete are in their trash or archive: their
+    /// mirrors and local records go too.
+    fn finish_batch_vault_delete(&mut self, report: transfer::RemovalReport) {
+        if !report.removed.is_empty() {
+            if let Err(error) = self.refresh_hosts() {
+                self.set_status_format("storage_error", &[("error", &error)]);
+                return;
+            }
+            let removed: Vec<HostProfile> = self
+                .store
+                .hosts
+                .iter()
+                .filter(|host| report.removed.contains(&host.id))
+                .cloned()
+                .collect();
+            self.store
+                .hosts
+                .retain(|host| !report.removed.contains(&host.id));
+            if let Err(error) = self.store.save() {
+                self.set_status_format("storage_error", &[("error", &error.to_string())]);
+                return;
+            }
+            for host in &removed {
+                let _ = credentials::delete_host(host);
+                crate::ssh::invalidate_profile(host.id);
+                self.test_operations.remove(&host.id);
+                self.pending_tests.retain(|pending| *pending != host.id);
+                self.test_states.remove(&host.id);
+            }
+            if self
+                .selected
+                .is_some_and(|selected| report.removed.contains(&selected))
+            {
+                self.selected = self.store.hosts.first().map(|host| host.id);
+                self.editor = self
+                    .selected
+                    .and_then(|selected| self.store.hosts.iter().find(|host| host.id == selected))
+                    .cloned()
+                    .map(HostEditor::load);
+            }
+        }
+        match report.failed.first() {
+            Some((alias, error)) => self.set_status_format(
+                "batch_delete_item_failed",
+                &[
+                    ("count", &report.failed.len().to_string()),
+                    ("alias", alias.as_str()),
+                    ("error", error.as_str()),
+                ],
+            ),
+            None => self.set_status_key("batch_deleted"),
+        }
     }
 
     fn download_import_template(&mut self) {
@@ -2818,6 +2883,7 @@ mod tests {
             host_filter: HostFilter::default(),
             batch_delete_prompt: false,
             batch_export_window_open: false,
+            transfer_prompt: None,
             sidebar_width: None,
             scroll_to_selected: false,
             launch: LaunchOptions::default(),
@@ -3074,7 +3140,14 @@ mod tests {
                 let output = run_full_window(&mut app, &context, size);
                 let label = format!("batch {locale} {size:?}");
                 let texts = painted_texts(&output.shapes);
-                for key in ["deselect_all", "select_all", "export", "delete", "cancel"] {
+                for key in [
+                    "deselect_all",
+                    "select_all",
+                    "export",
+                    "transfer_button",
+                    "delete",
+                    "cancel",
+                ] {
                     let wanted = app.catalog.text(key);
                     if key == "deselect_all" || key == "select_all" {
                         continue;
@@ -3507,6 +3580,59 @@ mod tests {
             ),
             "delete failed; rollback failed: restore failed"
         );
+    }
+
+    #[test]
+    fn batch_delete_trashes_vault_items_before_their_mirrors_go() {
+        if !in_isolated_store("ui::tests::batch_delete_trashes_vault_items_before_their_mirrors_go")
+        {
+            return;
+        }
+        let _guard = credentials::test_lock();
+        let context = egui::Context::default();
+        let local = HostProfile::new("local".to_owned());
+        let mut vault = HostProfile::new("vault".to_owned());
+        vault.vault = Some(VaultHostRef {
+            provider: VaultProvider::OnePassword,
+            item_id: vault.id,
+            external_id: Some("op-item".to_owned()),
+            item_name: "vault".to_owned(),
+            revision_date: "1".to_owned(),
+        });
+        let mut app = metadata_test_app(&context, "en", local.clone());
+        app.store.hosts.push(vault.clone());
+        app.store.save().unwrap();
+        app.batch_mode = true;
+        app.batch_selected.extend([local.id, vault.id]);
+
+        app.remove_batch();
+        let ids: Vec<Uuid> = app.store.hosts.iter().map(|host| host.id).collect();
+        assert_eq!(ids, [vault.id], "the local host goes at once");
+        assert!(app.vault_job_running(), "the item goes on a worker");
+        assert_eq!(
+            app.status.text,
+            app.catalog
+                .format("batch_deleting_items", &[("count", "1")])
+        );
+        app.vault_job = None;
+
+        app.finish_batch_vault_delete(transfer::RemovalReport {
+            removed: Vec::new(),
+            failed: vec![("vault".to_owned(), "refused".to_owned())],
+        });
+        assert_eq!(app.store.hosts.len(), 1, "a host whose item stayed stays");
+        assert_eq!(app.status.kind, StatusKind::Error);
+
+        app.finish_batch_vault_delete(transfer::RemovalReport {
+            removed: vec![vault.id],
+            failed: Vec::new(),
+        });
+        assert!(app.store.hosts.is_empty());
+        assert!(
+            HostStore::load().unwrap().hosts.is_empty(),
+            "and the store is saved"
+        );
+        assert_eq!(app.status.text, app.catalog.text("batch_deleted"));
     }
 
     #[test]

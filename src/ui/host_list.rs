@@ -2,6 +2,7 @@ use eframe::egui::{self, Color32, RichText};
 
 use super::bitwarden::VaultState;
 use super::services::Section;
+use super::transfer::TransferMode;
 use super::{EditorSwitch, HostTestState, HostsApp, retain_visible_selection};
 use crate::i18n::Catalog;
 use crate::model::{HostFilter, HostProfile, Protocol, normalize_tags};
@@ -626,12 +627,17 @@ impl HostsApp {
         let batch_selected = &self.batch_selected;
         let test_states = &self.test_states;
         let delete_label = self.catalog.text("delete").to_owned();
+        let copy_label = self.catalog.text("transfer_menu_copy").to_owned();
+        let move_label = self.catalog.text("transfer_menu_move").to_owned();
+        let no_target_hint = self.catalog.text("transfer_no_target").to_owned();
+        let stores = self.transfer_stores();
         let test_label = self.catalog.text("test_connection").to_owned();
         let retained_hint = self.catalog.text("persistence_retained_hint").to_owned();
         let mut selection_request = None;
         let mut deletion_request = None;
         let mut test_request = None;
         let mut batch_toggle_request = None;
+        let mut transfer_request = None;
         let mut fold_request = None;
         let mut vault_request = None;
         let three_lines = hosts
@@ -724,6 +730,32 @@ impl HostsApp {
                             test_request = Some(id);
                             ui.close();
                         }
+                        let targets: Vec<HostGroup> = stores
+                            .iter()
+                            .copied()
+                            .filter(|group| *group != HostGroup::of(host))
+                            .collect();
+                        for (label, mode) in [
+                            (&copy_label, TransferMode::Copy),
+                            (&move_label, TransferMode::Move),
+                        ] {
+                            ui.add_enabled_ui(!targets.is_empty(), |ui| {
+                                ui.menu_button(label, |ui| {
+                                    for target in &targets {
+                                        if ui
+                                            .button(self.catalog.text(target.label_key()))
+                                            .clicked()
+                                        {
+                                            transfer_request = Some((id, mode, *target));
+                                            ui.close();
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_disabled_hover_text(&no_target_hint);
+                            });
+                        }
+                        ui.separator();
                         if ui.button(&delete_label).clicked() {
                             deletion_request = Some(id);
                             ui.close();
@@ -762,6 +794,8 @@ impl HostsApp {
             self.switch_editor(EditorSwitch::Delete(id));
         } else if let Some(id) = test_request {
             self.switch_editor(EditorSwitch::Test(id));
+        } else if let Some((id, mode, target)) = transfer_request {
+            self.open_transfer(vec![id], mode, Some(target));
         } else if let Some(id) = selection_request {
             self.switch_editor(EditorSwitch::Select(id));
         }
@@ -1245,11 +1279,15 @@ mod tests {
             "unsaved draft"
         );
         let test = find_text_rect(&output.shapes, app.catalog.text("test_connection")).unwrap();
+        let copy = find_text_rect(&output.shapes, app.catalog.text("transfer_menu_copy")).unwrap();
+        let moving =
+            find_text_rect(&output.shapes, app.catalog.text("transfer_menu_move")).unwrap();
         let delete = find_text_rect(&output.shapes, app.catalog.text("delete")).unwrap();
         assert!(
-            test.bottom() <= delete.top(),
-            "test comes first in the menu"
+            test.bottom() <= copy.top() && copy.bottom() <= moving.top(),
+            "test comes first, then copy and move"
         );
+        assert!(moving.bottom() <= delete.top(), "delete comes last");
     }
 
     #[test]
