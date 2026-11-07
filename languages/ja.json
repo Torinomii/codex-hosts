@@ -641,6 +641,7 @@
     "transfer_all_skipped": "{target} にこれらのホストがすでにあるため、何も転送しませんでした。",
     "batch_deleting_items": "パスワードマネージャーの {count} 件のアイテムをゴミ箱またはアーカイブに移動しています…",
     "batch_delete_vault_note": "Bitwarden のアイテムはボールトのゴミ箱へ、1Password のアイテムはアーカイブへ移動し、そこから復元できます。",
-    "batch_delete_item_failed": "{count} 件のアイテムを削除できなかったため、そのホストは残ります。{alias}：{error}"
+    "batch_delete_item_failed": "{count} 件のアイテムを削除できなかったため、そのホストは残ります。{alias}：{error}",
+    "batch_select_group": "{group} に表示されているホストをすべて選択"
   }
 }

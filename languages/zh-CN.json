@@ -641,6 +641,7 @@
     "transfer_all_skipped": "未传送任何主机：{target} 中已有这些主机。",
     "batch_deleting_items": "正在将 {count} 个密码管理器项目移至回收站或归档…",
     "batch_delete_vault_note": "Bitwarden 项目会移至密码库回收站，1Password 项目会移至归档，均可在那里恢复。",
-    "batch_delete_item_failed": "{count} 个项目无法删除，其主机将保留。{alias}：{error}"
+    "batch_delete_item_failed": "{count} 个项目无法删除，其主机将保留。{alias}：{error}",
+    "batch_select_group": "选择 {group} 中列出的全部主机"
   }
 }

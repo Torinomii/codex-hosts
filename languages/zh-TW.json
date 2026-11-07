@@ -641,6 +641,7 @@
     "transfer_all_skipped": "未傳送任何主機：{target} 中已有這些主機。",
     "batch_deleting_items": "正在將 {count} 個密碼管理員項目移至垃圾桶或封存…",
     "batch_delete_vault_note": "Bitwarden 項目會移至保管庫垃圾桶，1Password 項目會移至封存，均可在那裡還原。",
-    "batch_delete_item_failed": "{count} 個項目無法刪除，其主機將保留。{alias}：{error}"
+    "batch_delete_item_failed": "{count} 個項目無法刪除，其主機將保留。{alias}：{error}",
+    "batch_select_group": "選取 {group} 中列出的全部主機"
   }
 }

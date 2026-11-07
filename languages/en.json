@@ -641,6 +641,7 @@
     "transfer_all_skipped": "Nothing was transferred: {target} already has these hosts.",
     "batch_deleting_items": "Moving {count} password-manager items to their trash or archive…",
     "batch_delete_vault_note": "Bitwarden items go to the vault trash and 1Password items to the archive, where they can be restored.",
-    "batch_delete_item_failed": "{count} items could not be deleted, so their hosts stay. {alias}: {error}"
+    "batch_delete_item_failed": "{count} items could not be deleted, so their hosts stay. {alias}: {error}",
+    "batch_select_group": "Select every listed host in {group}"
   }
 }

@@ -1,4 +1,7 @@
+use std::collections::HashSet;
+
 use eframe::egui::{self, Color32, RichText};
+use uuid::Uuid;
 
 use super::bitwarden::VaultState;
 use super::services::Section;
@@ -95,6 +98,35 @@ enum HeaderClick {
     Fold,
     /// The password-manager header's action button.
     Vault,
+    /// The batch checkbox: select (`true`) or clear every listed host of
+    /// the group.
+    Select(bool),
+}
+
+/// How much of a group the batch selection holds, for its header checkbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupSelection {
+    None,
+    Some,
+    All,
+}
+
+impl GroupSelection {
+    fn of<'a>(
+        members: impl IntoIterator<Item = &'a HostProfile>,
+        selected: &HashSet<Uuid>,
+    ) -> Self {
+        let (mut total, mut chosen) = (0, 0);
+        for host in members {
+            total += 1;
+            chosen += usize::from(selected.contains(&host.id));
+        }
+        match chosen {
+            0 => Self::None,
+            _ if chosen == total => Self::All,
+            _ => Self::Some,
+        }
+    }
 }
 
 /// The one action on the Bitwarden header, worded for the vault's state so
@@ -137,22 +169,63 @@ impl VaultAction {
     }
 }
 
-/// A header row: the fold arrow, label and count at the left; a
-/// password-manager group also carries one labelled button at the right
-/// ([`VaultAction`]). Adding hosts goes through "＋ New host" above the list.
-fn group_row(
-    ui: &mut egui::Ui,
-    catalog: &Catalog,
+/// What a header row shows.
+struct GroupHeader {
     group: HostGroup,
     count: usize,
     collapsed: bool,
-    row_height: f32,
     vault_action: Option<VaultAction>,
+    /// The group's checkbox, in batch mode.
+    selection: Option<GroupSelection>,
+}
+
+/// A header row: in batch mode a checkbox for the whole group, then the
+/// fold arrow, label and count at the left; a password-manager group also
+/// carries one labelled button at the right ([`VaultAction`]). Adding hosts
+/// goes through "＋ New host" above the list.
+fn group_row(
+    ui: &mut egui::Ui,
+    catalog: &Catalog,
+    header: GroupHeader,
+    row_height: f32,
 ) -> Option<HeaderClick> {
+    let GroupHeader {
+        group,
+        count,
+        collapsed,
+        vault_action,
+        selection,
+    } = header;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_height),
         egui::Sense::click(),
     );
+    let mut text_left = rect.left() + LIST_INSET;
+    let mut click = None;
+    if let Some(selection) = selection {
+        // Where the host rows put theirs, so the column of boxes lines up.
+        let mut child = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(rect.shrink2(egui::vec2(LIST_INSET, 0.0)))
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        let mut checked = selection == GroupSelection::All;
+        let checkbox = child
+            .add_enabled(
+                count > 0,
+                egui::Checkbox::without_text(&mut checked)
+                    .indeterminate(selection == GroupSelection::Some),
+            )
+            .on_hover_text(catalog.format(
+                "batch_select_group",
+                &[("group", catalog.text(group.label_key()))],
+            ));
+        if checkbox.changed() {
+            // A partly selected group fills up first.
+            click = Some(HeaderClick::Select(selection != GroupSelection::All));
+        }
+        text_left = checkbox.rect.right() + 8.0;
+    }
     if ui.is_rect_visible(rect) {
         let fill = ui.visuals().faint_bg_color;
         ui.painter().rect_filled(rect, 0.0, fill);
@@ -162,7 +235,7 @@ fn group_row(
             catalog.text(group.label_key())
         );
         ui.painter().text(
-            egui::pos2(rect.left() + LIST_INSET, rect.center().y),
+            egui::pos2(text_left, rect.center().y),
             egui::Align2::LEFT_CENTER,
             text,
             egui::FontId::proportional(13.0),
@@ -193,10 +266,11 @@ fn group_row(
             child.spinner();
         }
     }
-    response
+    let folded = response
         .on_hover_cursor(egui::CursorIcon::PointingHand)
         .clicked()
-        .then_some(HeaderClick::Fold)
+        .then_some(HeaderClick::Fold);
+    click.or(folded)
 }
 
 /// The note under an empty Bitwarden section, wrapped to the panel so a
@@ -638,6 +712,7 @@ impl HostsApp {
         let mut test_request = None;
         let mut batch_toggle_request = None;
         let mut transfer_request = None;
+        let mut group_select_request = None;
         let mut fold_request = None;
         let mut vault_request = None;
         let three_lines = hosts
@@ -673,17 +748,28 @@ impl HostsApp {
                         count,
                         collapsed,
                     } => {
-                        match group_row(
-                            ui,
-                            &self.catalog,
-                            *group,
-                            *count,
-                            *collapsed,
-                            row_height,
-                            action_of(*group),
-                        ) {
+                        let selection = batch_mode.then(|| {
+                            GroupSelection::of(
+                                hosts
+                                    .iter()
+                                    .copied()
+                                    .filter(|host| HostGroup::of(host) == *group),
+                                batch_selected,
+                            )
+                        });
+                        let header = GroupHeader {
+                            group: *group,
+                            count: *count,
+                            collapsed: *collapsed,
+                            vault_action: action_of(*group),
+                            selection,
+                        };
+                        match group_row(ui, &self.catalog, header, row_height) {
                             Some(HeaderClick::Fold) => fold_request = Some(*group),
                             Some(HeaderClick::Vault) => vault_request = Some(*group),
+                            Some(HeaderClick::Select(all)) => {
+                                group_select_request = Some((*group, all));
+                            }
                             None => {}
                         }
                         continue;
@@ -778,6 +864,18 @@ impl HostsApp {
 
         if let Some(group) = fold_request {
             self.collapsed_groups.toggle(group);
+        }
+        if let Some((group, all)) = group_select_request {
+            let members = hosts
+                .iter()
+                .filter(|host| HostGroup::of(host) == group)
+                .map(|host| host.id)
+                .collect::<Vec<_>>();
+            if all {
+                self.batch_selected.extend(members);
+            } else {
+                self.batch_selected.retain(|id| !members.contains(id));
+            }
         }
         if let Some(group) = vault_request
             && let Some(action) = action_of(group)
@@ -883,8 +981,9 @@ impl HostsApp {
 mod tests {
     use super::super::tests::{find_text_rect, in_isolated_store, metadata_test_app};
     use super::*;
-    use crate::model::{HostProfile, SshAuth, SuSettings, SudoSettings, VaultProvider};
-    use uuid::Uuid;
+    use crate::model::{
+        HostProfile, SshAuth, SuSettings, SudoSettings, VaultHostRef, VaultProvider,
+    };
 
     fn list_frame(
         app: &mut HostsApp,
@@ -1264,6 +1363,60 @@ mod tests {
         assert!(alias.width() > 30.0, "alias stays readable: {alias:?}");
         assert!(find_text_rect(&output.shapes, "sudo").is_some());
         assert!(find_text_rect(&output.shapes, app.catalog.text("badge_codex_hidden")).is_none());
+    }
+
+    #[test]
+    fn a_group_checkbox_fills_then_clears_only_its_own_group() {
+        let context = egui::Context::default();
+        super::super::theme::configure_fonts(&context, "en");
+        let local = HostProfile::new("local-one".into());
+        let mut app = metadata_test_app(&context, "en", local.clone());
+        let vault = |alias: &str| {
+            let mut host = HostProfile::new(alias.into());
+            host.vault = Some(VaultHostRef {
+                provider: VaultProvider::Bitwarden,
+                item_id: host.id,
+                external_id: None,
+                item_name: alias.into(),
+                revision_date: "1".into(),
+            });
+            host
+        };
+        let (a, b) = (vault("bw-a"), vault("bw-b"));
+        app.store.hosts.extend([a.clone(), b.clone()]);
+        app.store.bitwarden.cli_path = Some(std::path::PathBuf::from("C:/bw/bw.exe"));
+        app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+        app.batch_mode = true;
+        app.batch_selected.extend([local.id, a.id]);
+
+        let header = format!("▾  {} (2)", app.catalog.text("group_bitwarden"));
+        let toggle = |app: &mut HostsApp| {
+            let shown = list_frame(app, &context, 340.0, vec![]);
+            let text = find_text_rect(&shown.shapes, &header).expect("the Bitwarden header");
+            let box_center = egui::pos2(text.left() - 8.0 - 7.0, text.center().y);
+            list_frame(
+                app,
+                &context,
+                340.0,
+                click(box_center, egui::PointerButton::Primary),
+            );
+        };
+        toggle(&mut app);
+        assert_eq!(
+            app.batch_selected,
+            HashSet::from([local.id, a.id, b.id]),
+            "a partly selected group fills up"
+        );
+        assert!(
+            app.collapsed_groups == GroupFolds::default(),
+            "the box does not fold"
+        );
+        toggle(&mut app);
+        assert_eq!(
+            app.batch_selected,
+            HashSet::from([local.id]),
+            "a full group clears, other groups stay"
+        );
     }
 
     #[test]
