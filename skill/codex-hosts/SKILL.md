@@ -34,7 +34,7 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
-Every call's `*_timeout_ms` must stay below `tool_timeout_sec`: a command that outlives Codex's wait keeps running on the host until its own timeout. Users who want to approve each probe set `approval_mode = "prompt"` for `probe` and `batch_probe` there. An executable older than 0.3.1 has no `--mcp`; `bin\codex-hosts.exe --version | more` prints the version (the program is windowed, so output appears only when captured).
+Every call's `*_timeout_ms` must stay below `tool_timeout_sec`: a command that outlives Codex's wait keeps running on the host until its own timeout. Users who want to approve each probe set `approval_mode = "prompt"` for `probe` and `batch_probe` there. `bin\codex-hosts.exe --version | more` prints the version (the program is windowed, so output appears only when captured).
 
 The running server's tool list, schemas, and `initialize` instructions define available features. Updating these Skill files does not replace an executable or restart an existing MCP/GUI process. If a documented tool or field is absent, report the version mismatch and arrange an authorized application update/restart; do not invent parameters or fall back to raw password input. A client may need a new session to reload changed Skill text.
 
@@ -50,7 +50,7 @@ The running server's tool list, schemas, and `initialize` instructions define av
 - `exec` checks the pinned host key and authenticates by itself; a trusted host needs no preliminary `probe`. Use `probe` (it runs `hostname`) only to test a requested host, surface a host key, diagnose a route, or authenticate a host that keeps its session at the start of the work. `probe` and `batch_probe` have no Codex approval card by default, but they still connect and authenticate and can require the app's separate SSH approval. Call them only for hosts the task needs, never to keep a hardware key "warm".
 - `status` is `ok`, `remote_error` (non-zero `exit_code`), or `error` with a `code`. Check `output_truncated`: one command captures at most 1 MiB, and a whole `exec_many` or batch result at most 8 MiB.
 - Set `connect_timeout_ms`, `command_timeout_ms`, and `batch_timeout_ms` from the task's real bounds. When omitted, the host profile's defaults apply, else 120 s to connect and 10 minutes per command. The connect timeout includes authentication, so leave time for a touch or PIN.
-- Unless a host keeps its session, every call authenticates again, repeating hardware prompts. Calls to the same per-call host run one after another; calls to different hosts run in parallel. Batches keep input order and share one authenticated jump-host session. Set `continue_on_error:false` only when later hosts must not start after a failure.
+- Unless a host keeps its session, every call authenticates again, repeating hardware prompts. Calls to the same per-call host run one after another; calls to different hosts run in parallel. Batches keep input order and share one authenticated jump-host session. Set `continue_on_error:false` only when later hosts must not start after a failure; a non-zero exit counts as one.
 - `disconnect` closes the sessions kept for hosts that opted in; use it when the user asks. Ending the Codex session closes everything.
 
 Parameters, result fields, limits, and every error code: [references/tool-protocol.md](references/tool-protocol.md).
@@ -110,6 +110,7 @@ There is no file-transfer tool. `exec_stdin` can carry a local file to an SSH ho
 - `HOSTKEY_UNKNOWN` or `HOSTKEY_MISMATCH`: pass the failure's `observed_fingerprint` and `observed_algorithm` to `open_host_editor` for the alias in `host_alias` (the failing hop of a jump chain), then retry once after `trusted`.
 - `AUTH_FAILED`, `PRIVATE_KEY_LOAD_FAILED`, `FIDO_*`, `SSH_AGENT_*`: read [references/hardware-keys.md](references/hardware-keys.md) before advising.
 - `APPROVAL_CANCELLED`, `APPROVAL_EXPIRED`, `APPROVAL_UNAVAILABLE`: no SSH execution was authorized for this call. Report the result and follow [approvals.md](references/approvals.md); do not re-prompt or bypass the decision automatically.
+- `APPROVAL_TARGET_CHANGED`: the host's vault item moved after approval and nothing was sent to it. Call again once so the user reviews the new target.
 - `SUDO_AUTO_AUTH_DISABLED`, `SU_AUTO_AUTH_DISABLED`, `SUDO_CREDENTIAL_MISSING`, `SU_CREDENTIAL_MISSING`: open the exact host editor for user-controlled permission/password correction. Supply is mechanism-specific; an editor save is not permission to replay the failed operation. Wrong-password, repeated-prompt, read and start failures stop without trying another password or mechanism.
 - `CONNECT_TIMEOUT` or `AUTH_TIMEOUT`: report the failed host/hop and phase; do not change its profile to work around it. `BATCH_TIMEOUT` can occur after other commands have started or finished, so it does not prove the batch had no side effects; never restart it automatically.
 - `SSH_BATCH_RECONNECT_BLOCKED`: report the affected hosts; do not restart the batch.

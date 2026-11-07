@@ -196,7 +196,7 @@ pub fn parse_status(stdout: &[u8]) -> Result<StatusReport, VaultParseError> {
 /// is dropped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VaultFolder {
-    /// Folder id; bindings store this, never the name.
+    /// Folder id; settings store this, never the name.
     pub id: Uuid,
     /// Decrypted name. Names may repeat and nest only by `/` convention.
     pub name: String,

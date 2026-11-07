@@ -319,7 +319,7 @@ impl HostsApp {
     /// Opens the credential services on 1Password: its page once set up,
     /// else the wizard.
     pub(super) fn open_onepassword_page(&mut self) {
-        self.open_credential_manager();
+        self.open_credential_services();
         if self.service_configured(HostGroup::OnePassword) {
             self.onepassword.view = View::Page;
         } else {
@@ -517,7 +517,7 @@ impl HostsApp {
             account: Some(account),
         };
         self.save_onepassword_settings();
-        self.close_credential_manager();
+        self.close_credential_services();
         self.set_status_key("op_setup_done");
         self.setup_done = Some(done);
         // The vault's items become hosts right away.
@@ -625,7 +625,7 @@ impl HostsApp {
                 panel.wizard = None;
                 panel.view = if configured { View::Page } else { View::Closed };
             }
-            PageAction::Close => self.close_credential_manager(),
+            PageAction::Close => self.close_credential_services(),
         }
     }
 

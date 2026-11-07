@@ -22,7 +22,7 @@ For `SU_AUTO_AUTH_DISABLED` or `SU_CREDENTIAL_MISSING`, open the host editor for
 
 Su errors: `SU_AUTO_AUTH_DISABLED`, `SU_INVALID_INPUT`, `SU_INVALID_PASSWORD`, `SU_CREDENTIAL_MISSING`, `SU_CREDENTIAL_READ_FAILED`, `SU_AUTH_REPEATED`, `SU_INPUT_FAILED`, `SU_START_FAILED`, `SU_CHANNEL_CLOSED`. Existing SSH, timeout and cancellation codes still apply.
 
-Advanced stores no default execution target. Old JSON `default_user` values are ignored and removed on save while credential IDs and secret slots remain; older calls omitting `user` fail validation without execution. `sudo -u` and `su` have different authentication and policy rules: select the mechanism for the authorized operation, without automatic fallback between them.
+Advanced stores no default execution target; a call omitting `user` fails validation without execution. `sudo -u` and `su` have different authentication and policy rules: select the mechanism for the authorized operation, without automatic fallback between them.
 
 An SSH target or jump host with `require_call_approval:true` requires the user's whole-call approval before connection, including a passwordless root-to-user call. This is separate from `su_enabled`, password availability and remote PAM policy. Follow [approvals.md](approvals.md); no automatic resubmission or switch to sudo after rejection.
 

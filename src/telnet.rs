@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::credentials;
-use crate::model::HostProfile;
+use crate::model::{HostProfile, Protocol};
 use crate::ssh::{OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE};
 
 const IAC: u8 = 255;
@@ -103,9 +103,31 @@ async fn execute_async(
     command: &str,
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
-    let password = if profile.is_vault_host() {
-        crate::vault_hosts::resolve_login_password(profile, None).await?
+    // A vault-backed host is admitted first, like SSH: the item is read afresh,
+    // so the password goes only to the endpoint the item holds now.
+    let refreshed;
+    let (profile, password) = if profile.is_vault_host() {
+        let crate::vault_hosts::AdmittedLogin {
+            host, mut login, ..
+        } = crate::vault_hosts::admit(profile).await?;
+        crate::vault_hosts::keep_approved_target(profile, &host, limits.approved)?;
+        if host.protocol != Protocol::Telnet {
+            return Err(RemoteFailure::new(
+                "PROFILE_INVALID",
+                format!(
+                    "The password manager item for {} no longer describes a Telnet host; run the call again.",
+                    profile.alias
+                ),
+            ));
+        }
+        refreshed = host;
+        let password = match login.take_password() {
+            Some(password) => password,
+            None => crate::vault_hosts::resolve_login_password(&refreshed, Some(login)).await?,
+        };
+        (&refreshed, password)
     } else {
+        let password =
         credentials::load(profile.id, credentials::login_password_kind(profile))
             .map_err(|error| RemoteFailure::new("CREDENTIAL_READ_FAILED", error.to_string()))?
             .ok_or_else(|| {
@@ -116,7 +138,8 @@ async fn execute_async(
                         profile.alias
                     ),
                 )
-            })?
+            })?;
+        (profile, password)
     };
     let mut stream = bounded(
         limits.connect_timeout,

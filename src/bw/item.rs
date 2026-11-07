@@ -66,7 +66,7 @@ impl ItemKind {
 /// the text fields codex-hosts owns ([`CODEX_FIELD_PREFIX`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemSummary {
-    /// Item id; bindings reference this.
+    /// Item id; a vault host stores this as its item reference.
     pub id: Uuid,
     /// Cipher type.
     pub kind: ItemKind,

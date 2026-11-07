@@ -18,7 +18,7 @@ pub struct HostStore {
     pub version: u32,
     pub preferred_locale: Option<String>,
     pub hosts: Vec<HostProfile>,
-    /// Credential-manager choice and the Bitwarden account; non-secret.
+    /// The Bitwarden account and folder; non-secret.
     pub bitwarden: BitwardenSettings,
     /// The 1Password account and vault; non-secret.
     pub onepassword: OnePasswordSettings,
@@ -84,7 +84,7 @@ impl HostStore {
         if let Some(store) = load_primary_strict(&primary)? {
             return Ok(store);
         }
-        load_legacy_or_default()
+        Ok(Self::default())
     }
 
     pub fn load_recovering() -> Result<Self, StorageError> {
@@ -93,7 +93,7 @@ impl HostStore {
             return Ok(store);
         }
 
-        load_legacy_or_default()
+        Ok(Self::default())
     }
 
     pub fn blocked(reason: impl Into<String>) -> Self {
@@ -150,20 +150,6 @@ pub fn write_lock() -> std::sync::MutexGuard<'static, ()> {
     WRITERS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn load_legacy_or_default() -> Result<HostStore, StorageError> {
-    if env::var_os("CODEX_HOSTS_DATA_DIR").is_none()
-        && let Some(legacy) = legacy_hosts_path()
-        && legacy.exists()
-    {
-        let mut migrated = read_store(&legacy)?;
-        migrated.version = STORE_VERSION;
-        *migrated.revision.get_mut() = None; // Migration creates a new primary, not the legacy file.
-        migrated.save()?;
-        return Ok(migrated);
-    }
-    Ok(HostStore::default())
 }
 
 fn disk_revision(path: &Path) -> Result<Option<Vec<u8>>, StorageError> {
@@ -256,6 +242,8 @@ fn load_primary_or_backup(path: &Path) -> Result<Option<HostStore>, StorageError
     if path.exists() {
         match read_store(path) {
             Ok(store) => return Ok(Some(store)),
+            // Never replace a newer store with the backup.
+            Err(primary_error @ StorageError::NewerVersion(_)) => return Err(primary_error),
             Err(primary_error) => {
                 if !backup.exists() {
                     return Err(primary_error);
@@ -339,6 +327,17 @@ fn unique_temporary_path(directory: &Path, stem: &str) -> PathBuf {
 
 fn read_store(path: &Path) -> Result<HostStore, StorageError> {
     let bytes = fs::read(path)?;
+    // Checked before the full parse: a newer layout may not parse at all, and
+    // one that does would lose its unknown fields on the next save.
+    #[derive(Deserialize)]
+    struct StoreVersion {
+        #[serde(default)]
+        version: u32,
+    }
+    let StoreVersion { version } = serde_json::from_slice(&bytes)?;
+    if version > STORE_VERSION {
+        return Err(StorageError::NewerVersion(version));
+    }
     let mut store: HostStore = serde_json::from_slice(&bytes)?;
     store.version = STORE_VERSION;
     *store.revision.get_mut() = Some(bytes);
@@ -465,12 +464,6 @@ fn file_owner_sid(_path: &Path) -> std::io::Result<String> {
     Err(std::io::Error::other("owner check is Windows-only"))
 }
 
-fn legacy_hosts_path() -> Option<PathBuf> {
-    env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .map(|path| path.join("CodexRemoteGui").join("hosts.json"))
-}
-
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error(
@@ -483,6 +476,10 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("stored host data is invalid: {0}")]
     Json(#[from] serde_json::Error),
+    #[error(
+        "host data was saved by a newer codex-hosts (store version {0}); update codex-hosts to use it"
+    )]
+    NewerVersion(u32),
     #[error("host storage primary is missing; recovery is available from {0}")]
     BackupRecoveryRequired(PathBuf),
     #[error("host storage writes are blocked because loading failed: {0}")]
@@ -672,6 +669,38 @@ mod tests {
 
         assert_eq!(read_store(&primary).unwrap().hosts[0].alias, "original");
         assert_eq!(read_store(&backup).unwrap().hosts[0].alias, "original");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_store_from_a_newer_version_is_refused_and_left_untouched() {
+        let directory = std::env::temp_dir().join(format!("codex-hosts-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let primary = directory.join("hosts.json");
+        let backup = directory.join("hosts.json.bak");
+        // A future layout that this version could not even parse.
+        let newer = format!(
+            r#"{{"version":{},"hosts":{{"by_id":{{}}}},"future":true}}"#,
+            STORE_VERSION + 1
+        );
+        fs::write(&primary, &newer).unwrap();
+        fs::write(
+            &backup,
+            serde_json::to_vec_pretty(&HostStore::default()).unwrap(),
+        )
+        .unwrap();
+
+        let strict = load_primary_strict(&primary).unwrap_err();
+        assert!(matches!(strict, StorageError::NewerVersion(v) if v == STORE_VERSION + 1));
+        let recovering = load_primary_or_backup(&primary).unwrap_err();
+        assert!(matches!(recovering, StorageError::NewerVersion(_)));
+        assert_eq!(fs::read_to_string(&primary).unwrap(), newer);
+        assert_eq!(
+            fs::read_dir(&directory).unwrap().count(),
+            2,
+            "no corrupt copy"
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }

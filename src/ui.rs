@@ -628,8 +628,8 @@ pub struct HostsApp {
     launch: LaunchOptions,
     callback_written: bool,
     pending_callback: Option<PendingCallback>,
-    /// The credential-manager dialog, while open.
-    credential_manager: Option<bitwarden::CredentialManager>,
+    /// The credential-services dialog, while open.
+    credential_services: Option<bitwarden::CredentialServices>,
     /// The master-password prompt a tool call or a window task is waiting on.
     unlock_prompt: Option<bitwarden::UnlockPrompt>,
     /// The unlock an SSH call approval asked for along with the call.
@@ -827,7 +827,7 @@ impl HostsApp {
             launch,
             callback_written: false,
             pending_callback: None,
-            credential_manager: None,
+            credential_services: None,
             unlock_prompt: None,
             approval_unlock: None,
             vault_job: None,
@@ -2569,6 +2569,7 @@ fn gui_test_limits(timeout: Duration) -> OperationLimits {
         output_bytes: None,
         batch_scope: None,
         retain_sessions: false,
+        approved: false,
     }
 }
 
@@ -2822,7 +2823,7 @@ mod tests {
             launch: LaunchOptions::default(),
             callback_written: false,
             pending_callback: None,
-            credential_manager: None,
+            credential_services: None,
             unlock_prompt: None,
             approval_unlock: None,
             vault_job: None,
@@ -2957,7 +2958,7 @@ mod tests {
                 .map(|(_, rect, _)| *rect)
                 .unwrap_or_else(|| panic!("{label}: missing control {key}"))
         };
-        let toolbar_y = find("credential_manager").center().y;
+        let toolbar_y = find("credential_services").center().y;
         for key in ["tray_exit", "language"] {
             let rect = find(key);
             assert!(

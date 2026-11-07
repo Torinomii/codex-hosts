@@ -435,7 +435,10 @@ impl HostsApp {
         let Some(delete_file) = choice else {
             return;
         };
-        let prompt = self.import_cleanup_prompt.take().unwrap();
+        let prompt = self
+            .import_cleanup_prompt
+            .take()
+            .expect("checked at the top of this function");
         let path_text = prompt.path.display().to_string();
         let count = prompt.imported_count.to_string();
         if delete_file {

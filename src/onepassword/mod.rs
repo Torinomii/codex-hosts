@@ -62,7 +62,7 @@ impl Op {
         if !settings.enabled {
             return Err(RemoteFailure::new(
                 "ONEPASSWORD_DISABLED",
-                "1Password is switched off in codex-hosts; enable it in the credential manager.",
+                "1Password is switched off in codex-hosts; enable it under Credential services in the window.",
             ));
         }
         let (Some(account), Some(cli_path)) = (&settings.account, &settings.cli_path) else {
@@ -343,7 +343,7 @@ pub(crate) fn reconcile<R: OpRunner>(
 /// A user-facing failure: only what the user can do about it.
 pub(crate) fn failure(error: OpError, alias: &str) -> RemoteFailure {
     let message = match &error {
-        OpError::NotOp => "The chosen file is not the 1Password CLI (op.exe 2.x); choose it again in the codex-hosts credential manager.".to_owned(),
+        OpError::NotOp => "The chosen file is not the 1Password CLI (op.exe 2.x); choose it again under Credential services in the codex-hosts window.".to_owned(),
         OpError::IntegrationOff => "Turn on Settings > Developer > Integrate with 1Password CLI in the 1Password app, then try again.".to_owned(),
         OpError::AppUnavailable => "Open the 1Password app, then try again.".to_owned(),
         OpError::NotAuthorized => "1Password did not allow the request: unlock the 1Password app and approve its prompt, then try again.".to_owned(),

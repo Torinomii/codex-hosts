@@ -166,7 +166,7 @@ async fn password_for_method_async(
             Candidate::Login if profile.is_vault_host() => match vault_password {
                 Some(password) => Some(password.clone()),
                 // Vault refusals keep their own codes: the user acts in the
-                // credential manager, not in this host's Advanced settings.
+                // Credential services dialog, not in this host's Advanced settings.
                 None => Some(crate::vault_hosts::resolve_login_password(profile, None).await?),
             },
             candidate => credentials::load(profile.id, candidate.kind(profile))

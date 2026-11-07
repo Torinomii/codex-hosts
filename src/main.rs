@@ -39,10 +39,6 @@ fn main() {
                 });
             }
         }
-        Ok(LaunchMode::Tool {
-            request_path,
-            result_path,
-        }) => std::process::exit(tool::run(&request_path, &result_path)),
         Ok(LaunchMode::Mcp) => std::process::exit(mcp::run()),
         Ok(LaunchMode::Version) => {
             println!("codex-hosts {}", env!("CARGO_PKG_VERSION"));
@@ -87,10 +83,6 @@ fn launch_gui(options: ui::LaunchOptions) {
 enum LaunchMode {
     TemporarySecrets(uuid::Uuid),
     Gui(Box<ui::LaunchOptions>),
-    Tool {
-        request_path: PathBuf,
-        result_path: PathBuf,
-    },
     Mcp,
     Version,
 }
@@ -117,8 +109,6 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
         return Ok(LaunchMode::Version);
     }
     let mut options = ui::LaunchOptions::default();
-    let mut request_path = None;
-    let mut result_path = None;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index].as_str();
@@ -137,9 +127,7 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
             }
             "--user" => options.prefill.username = Some(next_value(&args, &mut index, flag)?),
             "--sudo-enabled" => options.prefill.sudo_enabled = Some(next_value(&args, &mut index, flag)?.parse().map_err(|_| "--sudo-enabled needs true or false".to_owned())?),
-            "--sudo-user" => return Err("Execution targets belong in exec_sudo.user for each call, not host settings.".into()),
             "--su-enabled" => options.prefill.su_enabled = Some(next_value(&args, &mut index, flag)?.parse().map_err(|_| "--su-enabled needs true or false".to_owned())?),
-            "--su-user" => return Err("Execution targets belong in exec_su.user for each call, not host settings.".into()),
             "--sudo-auth-user" => options.prefill.sudo_users.get_or_insert_with(Vec::new).push(next_value(&args, &mut index, flag)?),
             "--sudo-auth-users" => options.prefill.sudo_users = Some(serde_json::from_str(&next_value(&args, &mut index, flag)?).map_err(|_| "--sudo-auth-users needs a JSON username array".to_owned())?),
             "--protocol" => {
@@ -181,23 +169,11 @@ fn parse_args(args: Vec<String>) -> Result<LaunchMode, String> {
             "--result-file" => {
                 options.result_path = Some(PathBuf::from(next_value(&args, &mut index, flag)?))
             }
-            "--tool-request" => {
-                request_path = Some(PathBuf::from(next_value(&args, &mut index, flag)?))
-            }
-            "--tool-result" => {
-                result_path = Some(PathBuf::from(next_value(&args, &mut index, flag)?))
-            }
             _ => return Err(format!("unknown argument: {flag}")),
         }
         index += 1;
     }
 
-    if request_path.is_some() || result_path.is_some() {
-        return Ok(LaunchMode::Tool {
-            request_path: request_path.ok_or_else(|| "missing --tool-request".to_owned())?,
-            result_path: result_path.ok_or_else(|| "missing --tool-result".to_owned())?,
-        });
-    }
     Ok(LaunchMode::Gui(Box::new(options)))
 }
 

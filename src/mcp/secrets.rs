@@ -12,18 +12,21 @@ use crate::ssh::RemoteFailure;
 use crate::temporary_secrets::{self, Request, Response};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct OpenParams {
     /// Non-secret field names such as `myproject-local-qwen-apikey` (1-64 names, up to 256 bytes each).
     pub fields: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct StatusParams {
     /// Session UUID returned by temporary_secrets_open.
     pub session: uuid::Uuid,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ClearParams {
     /// Session UUID returned by temporary_secrets_open.
     pub session: uuid::Uuid,
@@ -33,6 +36,7 @@ pub(super) struct ClearParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub(super) struct RunParams {
     /// Session UUID returned by temporary_secrets_open.
     pub session: uuid::Uuid,
@@ -77,8 +81,8 @@ pub(super) async fn clear(params: ClearParams) -> Result<Response, RemoteFailure
 }
 
 pub(super) async fn run(params: RunParams) -> Result<Response, RemoteFailure> {
-    // Execution's fields are private on purpose; build it through serde so the
-    // same validation applies as for the file protocol.
+    // Execution's fields are private on purpose; build it through serde so its
+    // own validation runs.
     let mut execution = serde_json::json!({
         "action": "execute",
         "program": params.program,
@@ -96,7 +100,7 @@ pub(super) async fn run(params: RunParams) -> Result<Response, RemoteFailure> {
 
 /// The vault answers its own failures (`SECRET_MISSING`, `OPERATION_LIMIT`, ...)
 /// as a response with `status: "error"`; MCP clients read `isError`, so those
-/// become tool errors here, as the file protocol's `is_failure` already does.
+/// become tool errors here.
 pub(super) fn flag_errors(
     outcome: Result<Response, RemoteFailure>,
 ) -> Result<Response, serde_json::Value> {

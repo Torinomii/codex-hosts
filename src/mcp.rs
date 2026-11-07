@@ -197,6 +197,7 @@ impl CallGates {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ListHostsParams {
     /// Return only hosts carrying every one of these tags (case-insensitive).
     #[serde(default)]
@@ -204,6 +205,7 @@ struct ListHostsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ProbeParams {
     /// Saved host alias; matching ignores ASCII case and surrounding whitespace.
     alias: String,
@@ -216,6 +218,7 @@ struct ProbeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct DisconnectParams {
     /// Alias whose retained connections to drop, including chains that pass through it; omit to drop every retained connection.
     #[serde(default)]
@@ -230,6 +233,7 @@ struct DisconnectResult {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExecParams {
     /// Saved host alias.
     alias: String,
@@ -244,6 +248,7 @@ struct ExecParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExecStdinParams {
     /// Saved SSH host alias (Telnet has no separate input channel).
     alias: String,
@@ -260,6 +265,7 @@ struct ExecStdinParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ExecManyParams {
     /// Saved SSH host alias.
     alias: String,
@@ -277,6 +283,7 @@ struct ExecManyParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct BatchProbeParams {
     /// Explicit list of 1 to 256 saved host aliases; an empty list is rejected, never "all hosts".
     aliases: Vec<String>,
@@ -292,12 +299,13 @@ struct BatchProbeParams {
     /// Deadline for the whole batch; hosts that have not started by then are reported as BATCH_TIMEOUT.
     #[serde(default)]
     batch_timeout_ms: Option<u64>,
-    /// Keep going after a host fails (default true); false stops starting new hosts after the first failure.
+    /// Keep going after a host fails (default true); false stops starting new hosts after the first error or non-zero exit.
     #[serde(default = "default_true")]
     continue_on_error: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct BatchExecParams {
     /// Explicit list of 1 to 256 saved host aliases; an empty list is rejected, never "all hosts".
     aliases: Vec<String>,
@@ -315,7 +323,7 @@ struct BatchExecParams {
     /// Deadline for the whole batch; hosts that have not started by then are reported as BATCH_TIMEOUT.
     #[serde(default)]
     batch_timeout_ms: Option<u64>,
-    /// Keep going after a host fails (default true); false stops starting new hosts after the first failure.
+    /// Keep going after a host fails (default true); false stops starting new hosts after the first error or non-zero exit.
     #[serde(default = "default_true")]
     continue_on_error: bool,
 }
@@ -612,7 +620,6 @@ impl Server {
                     )),
                     params.batch_timeout_ms,
                     params.continue_on_error,
-                    true,
                 )
                 .await
             })
@@ -649,7 +656,6 @@ impl Server {
                     )),
                     params.batch_timeout_ms,
                     params.continue_on_error,
-                    true,
                 )
                 .await
             })
@@ -676,7 +682,7 @@ async fn probe_host(
 ) -> Result<ssh::RemoteResult, RemoteFailure> {
     let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
-    crate::approval::authorize(crate::approval::Review::new(
+    let approved = crate::approval::authorize(crate::approval::Review::new(
         std::slice::from_ref(&host),
         &store.hosts,
         vec!["hostname".into()],
@@ -688,10 +694,15 @@ async fn probe_host(
     let result = connection::probe_async(
         &host,
         &store.hosts,
-        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
+        host_limits(
+            &host,
+            params.connect_timeout_ms,
+            params.command_timeout_ms,
+            approved,
+        ),
     )
     .await?;
-    tool::merge_verified_host_keys(&store.hosts, &result.verified_host_keys)?;
+    tool::merge_verified_host_keys(&store.hosts, &result.verified_host_keys).await?;
     Ok(result)
 }
 
@@ -703,7 +714,7 @@ async fn exec_host(
     let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     ssh::validate_stdin(stdin.as_deref())?;
-    crate::approval::authorize(crate::approval::Review::new(
+    let approved = crate::approval::authorize(crate::approval::Review::new(
         std::slice::from_ref(&host),
         &store.hosts,
         vec![params.command.clone()],
@@ -717,7 +728,12 @@ async fn exec_host(
         &store.hosts,
         &params.command,
         stdin.as_deref(),
-        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
+        host_limits(
+            &host,
+            params.connect_timeout_ms,
+            params.command_timeout_ms,
+            approved,
+        ),
     )
     .await
 }
@@ -729,7 +745,7 @@ async fn exec_many_host(
     tool::validate_commands(&params.commands)?;
     let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
-    crate::approval::authorize(crate::approval::Review::new(
+    let approved = crate::approval::authorize(crate::approval::Review::new(
         std::slice::from_ref(&host),
         &store.hosts,
         params.commands.clone(),
@@ -745,7 +761,12 @@ async fn exec_many_host(
     let _guard = gates
         .single_host(&host, &store.hosts, concurrency as u32)
         .await;
-    let mut limits = host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms);
+    let mut limits = host_limits(
+        &host,
+        params.connect_timeout_ms,
+        params.command_timeout_ms,
+        approved,
+    );
     limits.output_bytes = Some(MAX_BATCH_OUTPUT_BYTES);
     let mut result =
         connection::execute_many_async(&host, &store.hosts, &params.commands, concurrency, limits)
@@ -761,7 +782,7 @@ async fn exec_sudo_host(
     let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     let target = crate::sudo::validate(&host, &params.program, &params.args, Some(&params.user))?;
-    crate::approval::authorize(crate::approval::Review::new(
+    let approved = crate::approval::authorize(crate::approval::Review::new(
         std::slice::from_ref(&host),
         &store.hosts,
         vec![format!(
@@ -780,7 +801,12 @@ async fn exec_sudo_host(
         &params.program,
         &params.args,
         Some(&target),
-        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
+        host_limits(
+            &host,
+            params.connect_timeout_ms,
+            params.command_timeout_ms,
+            approved,
+        ),
     )
     .await
 }
@@ -792,7 +818,7 @@ async fn exec_su_host(
     let (store, host) = tool::load_host(&params.alias).await?;
     tool::validate_profile(&host)?;
     let target = crate::su::validate(&host, &params.program, &params.args, Some(&params.user))?;
-    crate::approval::authorize(crate::approval::Review::new(
+    let approved = crate::approval::authorize(crate::approval::Review::new(
         std::slice::from_ref(&host),
         &store.hosts,
         vec![format!(
@@ -811,7 +837,12 @@ async fn exec_su_host(
         &params.program,
         &params.args,
         Some(&target),
-        host_limits(&host, params.connect_timeout_ms, params.command_timeout_ms),
+        host_limits(
+            &host,
+            params.connect_timeout_ms,
+            params.command_timeout_ms,
+            approved,
+        ),
     )
     .await
 }
@@ -887,10 +918,12 @@ fn host_limits(
     host: &HostProfile,
     connect_timeout_ms: Option<u64>,
     command_timeout_ms: Option<u64>,
+    approved: bool,
 ) -> OperationLimits {
     let (connect, command) = host_timeouts(host, connect_timeout_ms, command_timeout_ms);
     let mut limits = tool::limits(Some(connect), Some(command), None);
     limits.retain_sessions = true;
+    limits.approved = approved;
     limits
 }
 
@@ -1081,6 +1114,55 @@ mod tests {
     }
 
     #[test]
+    fn tool_parameters_reject_unknown_fields_instead_of_dropping_them() {
+        // Tools without parameters have nothing an extra field could replace.
+        for tool in Server::tool_router().list_all() {
+            let has_fields = tool
+                .input_schema
+                .get("properties")
+                .and_then(|properties| properties.as_object())
+                .is_some_and(|properties| !properties.is_empty());
+            if has_fields {
+                assert_eq!(
+                    tool.input_schema.get("additionalProperties"),
+                    Some(&serde_json::json!(false)),
+                    "{}",
+                    tool.name
+                );
+            }
+        }
+        fn accepts<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> bool {
+            serde_json::from_value::<T>(value).is_ok()
+        }
+        /// Valid as given; rejected, naming the field, once `stdin` is added.
+        fn refuses_stdin<T: serde::de::DeserializeOwned>(mut value: serde_json::Value) {
+            assert!(accepts::<T>(value.clone()), "{value}");
+            value["stdin"] = serde_json::json!("print(1)");
+            let error = serde_json::from_value::<T>(value)
+                .err()
+                .expect("stdin refused");
+            assert!(error.to_string().contains("stdin"), "{error}");
+        }
+        refuses_stdin::<ExecParams>(serde_json::json!({"alias":"a","command":"python3 -"}));
+        refuses_stdin::<ExecManyParams>(serde_json::json!({"alias":"a","commands":["uptime"]}));
+        refuses_stdin::<BatchExecParams>(serde_json::json!({"aliases":["a"],"command":"uptime"}));
+        assert!(!accepts::<ExecParams>(
+            serde_json::json!({"alias":"a","command":"id","command_timeout":5000})
+        ));
+        assert!(!accepts::<ProbeParams>(
+            serde_json::json!({"alias":"a","connect_timeout":5000})
+        ));
+        assert!(!accepts::<ListHostsParams>(
+            serde_json::json!({"tag":["prod"]})
+        ));
+        assert!(accepts::<ListHostsParams>(serde_json::json!({})));
+        assert!(!accepts::<secrets::RunParams>(serde_json::json!({
+            "session": uuid::Uuid::nil(), "program": "C:\\p.exe", "cwd": "C:\\",
+            "env": {}, "value": "secret"
+        })));
+    }
+
+    #[test]
     fn results_carry_the_same_json_as_text_and_structured_content() {
         let failure = RemoteFailure::new("ALIAS_NOT_FOUND", "missing");
         let result = tool_result(&failure, true);
@@ -1097,19 +1179,19 @@ mod tests {
     #[test]
     fn omitted_timeouts_fall_back_to_host_then_global_defaults() {
         let plain = HostProfile::default();
-        let defaults = host_limits(&plain, None, None);
+        let defaults = host_limits(&plain, None, None, false);
         assert_eq!(defaults.connect_timeout, Some(DEFAULT_CONNECT_TIMEOUT));
         assert_eq!(defaults.command_timeout, Some(DEFAULT_COMMAND_TIMEOUT));
-        let explicit = host_limits(&plain, Some(5000), Some(1000));
+        let explicit = host_limits(&plain, Some(5000), Some(1000), false);
         assert_eq!(explicit.connect_timeout, Some(Duration::from_secs(5)));
         assert_eq!(explicit.command_timeout, Some(Duration::from_secs(1)));
         let mut tuned = HostProfile::default();
         tuned.advanced.connect_timeout_s = Some(30);
         tuned.advanced.command_timeout_s = Some(1800);
-        let from_host = host_limits(&tuned, None, None);
+        let from_host = host_limits(&tuned, None, None, false);
         assert_eq!(from_host.connect_timeout, Some(Duration::from_secs(30)));
         assert_eq!(from_host.command_timeout, Some(Duration::from_secs(1800)));
-        let overridden = host_limits(&tuned, Some(2000), None);
+        let overridden = host_limits(&tuned, Some(2000), None, false);
         assert_eq!(overridden.connect_timeout, Some(Duration::from_secs(2)));
         assert_eq!(overridden.command_timeout, Some(Duration::from_secs(1800)));
     }

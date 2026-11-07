@@ -148,13 +148,13 @@ impl VaultError {
     pub(crate) fn into_remote(self, alias: &str) -> RemoteFailure {
         let hint = match &self {
             Self::Locked => {
-                "Unlock Bitwarden in the codex-hosts window (credential manager), then retry."
+                "Unlock Bitwarden in the codex-hosts window (Credential services), then retry."
             }
             Self::SignedOut => {
-                "Log in to Bitwarden again through the codex-hosts credential manager."
+                "Log in to Bitwarden again under Credential services in the codex-hosts window."
             }
             Self::SyncRequired => {
-                "Sync the vault from the codex-hosts credential manager, then retry."
+                "Sync the vault under Credential services in the codex-hosts window, then retry."
             }
             Self::ItemMissing
             | Self::ItemDeleted

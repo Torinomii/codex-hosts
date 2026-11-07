@@ -13,53 +13,6 @@ pub fn probe(
     }
 }
 
-pub fn execute_with_input(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    command: &str,
-    stdin: Option<&str>,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    ssh::validate_stdin(stdin)?;
-    match profile.protocol {
-        Protocol::Ssh => ssh::execute_with_input(profile, hosts, command, stdin, limits),
-        Protocol::Telnet if stdin.is_some() => Err(RemoteFailure::new(
-            "STDIN_UNSUPPORTED",
-            "Optional stdin requires an SSH host; Telnet has no separate command input channel.",
-        )),
-        Protocol::Telnet => telnet::execute(profile, command, limits),
-    }
-}
-
-pub fn execute_many(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    commands: &[String],
-    max_concurrency: usize,
-    limits: OperationLimits,
-) -> Result<RemoteManyResult, RemoteFailure> {
-    match profile.protocol {
-        Protocol::Ssh => ssh::execute_many(profile, hosts, commands, max_concurrency, limits),
-        Protocol::Telnet => Err(RemoteFailure::new(
-            "SSH_REQUIRED",
-            "exec_many is available only for SSH hosts.",
-        )),
-    }
-}
-
-pub fn execute_sudo(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    program: &str,
-    args: &[String],
-    user: Option<&str>,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    ssh::runtime().block_on(ssh::execute_sudo_async(
-        profile, hosts, program, args, user, limits,
-    ))
-}
-
 pub async fn execute_sudo_async(
     profile: &HostProfile,
     hosts: &[HostProfile],
@@ -69,19 +22,6 @@ pub async fn execute_sudo_async(
     limits: OperationLimits,
 ) -> Result<RemoteResult, RemoteFailure> {
     ssh::execute_sudo_async(profile, hosts, program, args, user, limits).await
-}
-
-pub fn execute_su(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    program: &str,
-    args: &[String],
-    user: Option<&str>,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    ssh::runtime().block_on(ssh::execute_su_async(
-        profile, hosts, program, args, user, limits,
-    ))
 }
 
 pub async fn execute_su_async(
@@ -152,9 +92,15 @@ mod tests {
             ..Default::default()
         };
         for input in ["", "data"] {
-            let error =
-                execute_with_input(&host, &[], "cat", Some(input), OperationLimits::default())
-                    .unwrap_err();
+            let error = ssh::runtime()
+                .block_on(execute_with_input_async(
+                    &host,
+                    &[],
+                    "cat",
+                    Some(input),
+                    OperationLimits::default(),
+                ))
+                .unwrap_err();
             assert_eq!(error.code, "STDIN_UNSUPPORTED");
         }
     }

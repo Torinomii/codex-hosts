@@ -22,10 +22,6 @@ impl Fixture {
         self.slots.push(kind);
         kind
     }
-
-    fn legacy(&self) -> Entry {
-        Entry::new(LEGACY_SERVICE, &self.host.id.to_string()).unwrap()
-    }
 }
 
 impl Drop for Fixture {
@@ -40,62 +36,14 @@ impl Drop for Fixture {
                 self.host.id
             );
         }
-        assert!(matches!(
-            self.legacy().get_password(),
-            Err(KeyringError::NoEntry)
-        ));
     }
 }
 
 #[test]
-fn legacy_migration_removes_source_and_deleted_password_stays_deleted() {
-    let _guard = crate::credentials::test_lock();
-    let fixture = Fixture::new();
-    fixture.legacy().set_password("legacy-fixture").unwrap();
-    let migrated = load(fixture.host.id, CredentialKind::Password)
-        .unwrap()
-        .unwrap();
-    assert_eq!(migrated.as_str(), "legacy-fixture");
-    assert!(matches!(
-        fixture.legacy().get_password(),
-        Err(KeyringError::NoEntry)
-    ));
-    delete(fixture.host.id, CredentialKind::Password).unwrap();
-    assert!(
-        load(fixture.host.id, CredentialKind::Password)
-            .unwrap()
-            .is_none()
-    );
-}
-
-#[test]
-fn explicit_delete_removes_unmigrated_and_shadowed_legacy_passwords() {
-    let _guard = crate::credentials::test_lock();
-    for current in [false, true] {
-        let fixture = Fixture::new();
-        fixture.legacy().set_password("obsolete-fixture").unwrap();
-        if current {
-            store(fixture.host.id, CredentialKind::Password, "current-fixture").unwrap();
-        }
-        delete(fixture.host.id, CredentialKind::Password).unwrap();
-        assert!(
-            load(fixture.host.id, CredentialKind::Password)
-                .unwrap()
-                .is_none()
-        );
-        assert!(matches!(
-            fixture.legacy().get_password(),
-            Err(KeyringError::NoEntry)
-        ));
-    }
-}
-
-#[test]
-fn versioned_login_never_falls_back_to_host_or_legacy_slots() {
+fn versioned_login_never_falls_back_to_the_host_slot() {
     let _guard = crate::credentials::test_lock();
     let mut fixture = Fixture::new();
     let slot = fixture.login_slot();
-    fixture.legacy().set_password("legacy-fixture").unwrap();
     store(fixture.host.id, CredentialKind::Password, "host-fixture").unwrap();
     assert!(load(fixture.host.id, slot).unwrap().is_none());
     store(fixture.host.id, slot, "identity-fixture").unwrap();
@@ -108,7 +56,7 @@ fn versioned_login_never_falls_back_to_host_or_legacy_slots() {
 }
 
 #[test]
-fn failed_identity_rotation_restores_legacy_or_versioned_secret_without_new_slot() {
+fn failed_identity_rotation_restores_host_or_versioned_secret_without_new_slot() {
     let _guard = crate::credentials::test_lock();
     for versioned in [false, true] {
         let mut fixture = Fixture::new();
@@ -118,11 +66,7 @@ fn failed_identity_rotation_restores_legacy_or_versioned_secret_without_new_slot
             CredentialKind::Password
         };
         let new = fixture.login_slot();
-        if versioned {
-            store(fixture.host.id, old, "old-fixture").unwrap();
-        } else {
-            fixture.legacy().set_password("old-fixture").unwrap();
-        }
+        store(fixture.host.id, old, "old-fixture").unwrap();
         let result = save_transaction(
             fixture.host.id,
             &[
@@ -137,10 +81,6 @@ fn failed_identity_rotation_restores_legacy_or_versioned_secret_without_new_slot
             "old-fixture"
         );
         assert!(load(fixture.host.id, new).unwrap().is_none());
-        assert!(matches!(
-            fixture.legacy().get_password(),
-            Err(KeyringError::NoEntry)
-        ));
     }
 }
 

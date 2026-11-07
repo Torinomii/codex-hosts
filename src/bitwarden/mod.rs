@@ -50,7 +50,7 @@ impl Account {
         if !settings.enabled {
             return Err(RemoteFailure::new(
                 "BITWARDEN_DISABLED",
-                "Bitwarden is switched off in codex-hosts; enable it in the credential manager.",
+                "Bitwarden is switched off in codex-hosts; enable it under Credential services in the window.",
             ));
         }
         let (Some(profile), Some(cli_path)) = (&settings.profile, &settings.cli_path) else {

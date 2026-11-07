@@ -10,7 +10,7 @@ use super::policy::SessionKey;
 
 /// CLI versions whose login, unlock, stdin `create`/`edit`, and item shapes
 /// were verified end to end. Writes are refused on any other version until it
-/// is verified and added here (design: 未驗證前不允許寫入).
+/// is verified and added here.
 pub const VERIFIED_VERSIONS: &[&str] = &["2026.10.1"];
 
 /// A `bw --version` value, `YEAR.MONTH.PATCH`.

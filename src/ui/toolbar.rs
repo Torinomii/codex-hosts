@@ -17,10 +17,10 @@ impl HostsApp {
             if !self.launch.codex_edit
                 && ui
                     .add_enabled(
-                        self.credential_manager.is_none(),
-                        egui::Button::new(self.catalog.text("credential_manager")),
+                        self.credential_services.is_none(),
+                        egui::Button::new(self.catalog.text("credential_services")),
                     )
-                    .on_hover_text(self.catalog.text("credential_manager_hint"))
+                    .on_hover_text(self.catalog.text("credential_services_hint"))
                     .clicked()
             {
                 open_credentials = true;
@@ -48,7 +48,7 @@ impl HostsApp {
             });
         });
         if open_credentials {
-            self.open_credential_manager();
+            self.open_credential_services();
         } else if let Some(group) = open_service {
             self.open_service_page(group);
         }
@@ -67,7 +67,7 @@ impl HostsApp {
             let hint = group.texts().map_or("", |texts| texts.chip_hint);
             if ui
                 .add_enabled(
-                    self.credential_manager.is_none(),
+                    self.credential_services.is_none(),
                     egui::Button::new(RichText::new(format!("●  {text}")).color(color))
                         .frame(false),
                 )

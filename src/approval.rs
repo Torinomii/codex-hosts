@@ -39,8 +39,10 @@ pub struct Review {
     /// is in the call and reading it would otherwise prompt right after.
     #[serde(default)]
     unlock_vault: bool,
+    /// A Bitwarden host is in the call; only Bitwarden is unlocked through
+    /// this window, so 1Password hosts never set it.
     #[serde(skip)]
-    uses_vault: bool,
+    uses_bitwarden: bool,
 }
 
 impl Review {
@@ -54,7 +56,7 @@ impl Review {
         let target_ids: HashSet<_> = targets.iter().map(|host| host.id).collect();
         let mut seen: HashMap<Uuid, usize> = HashMap::new();
         let mut hosts: Vec<ReviewHost> = Vec::new();
-        let mut uses_vault = false;
+        let mut uses_bitwarden = false;
         for target in targets {
             let chain = if target.protocol == Protocol::Ssh {
                 resolve_ssh_chain(target, all).map_err(|_| {
@@ -64,7 +66,7 @@ impl Review {
                 vec![target]
             };
             for host in chain {
-                uses_vault |= host.is_bitwarden_host();
+                uses_bitwarden |= host.is_bitwarden_host();
                 let is_jump = host.id != target.id;
                 if let Some(&index) = seen.get(&host.id) {
                     hosts[index].is_jump |= is_jump;
@@ -90,7 +92,7 @@ impl Review {
             stdin: stdin.map(str::to_owned),
             sudo_user,
             unlock_vault: false,
-            uses_vault,
+            uses_bitwarden,
         })
     }
 
@@ -287,11 +289,14 @@ fn call_card(
 /// Nothing is cached across calls, including calls that reuse an SSH session.
 /// When the call's vault hosts would ask for the master password next, the
 /// approval asks for it too, so the user answers one dialog.
-pub(crate) async fn authorize(mut review: Review) -> Result<(), RemoteFailure> {
+///
+/// `Ok(true)` means the user approved the hosts as the dialog showed them; the
+/// caller sets `OperationLimits::approved` so a vault refresh cannot move them.
+pub(crate) async fn authorize(mut review: Review) -> Result<bool, RemoteFailure> {
     if !review.required() {
-        return Ok(());
+        return Ok(false);
     }
-    review.unlock_vault = review.uses_vault && crate::bitwarden::unlock_due();
+    review.unlock_vault = review.uses_bitwarden && crate::bitwarden::unlock_due();
     let response = tokio::task::spawn_blocking(|| {
         temporary_secrets::request_gui(Request::Show { temporary: false })
     })
@@ -299,7 +304,8 @@ pub(crate) async fn authorize(mut review: Review) -> Result<(), RemoteFailure> {
     .map_err(|_| failure("APPROVAL_UNAVAILABLE"))?
     .map_err(|_| failure("APPROVAL_UNAVAILABLE"))?;
     let session = response.session;
-    authorize_session(session, review).await
+    authorize_session(session, review).await?;
+    Ok(true)
 }
 
 pub(crate) async fn authorize_session(session: Uuid, review: Review) -> Result<(), RemoteFailure> {
@@ -334,10 +340,6 @@ pub(crate) async fn authorize_session(session: Uuid, review: Review) -> Result<(
             _ => return Err(failure("APPROVAL_UNAVAILABLE")),
         }
     }
-}
-
-pub(crate) fn authorize_sync(review: Review) -> Result<(), RemoteFailure> {
-    crate::ssh::runtime().block_on(authorize(review))
 }
 
 async fn call(
@@ -1126,7 +1128,7 @@ mod tests {
             stdin: None,
             sudo_user: None,
             unlock_vault: false,
-            uses_vault: false,
+            uses_bitwarden: false,
         }
     }
     #[test]
@@ -1185,7 +1187,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!plain.uses_vault);
+        assert!(!plain.uses_bitwarden);
         jump.vault = Some(crate::model::VaultHostRef {
             item_id: Uuid::new_v4(),
             item_name: "jump".into(),
@@ -1195,11 +1197,11 @@ mod tests {
         let hosts = [jump, target.clone()];
         let mut review =
             Review::new(std::slice::from_ref(&target), &hosts, vec![], None, None).unwrap();
-        assert!(review.uses_vault && !review.unlock_vault);
+        assert!(review.uses_bitwarden && !review.unlock_vault);
         review.unlock_vault = true;
         let sent: Review = serde_json::from_str(&serde_json::to_string(&review).unwrap()).unwrap();
         assert!(sent.unlock_vault);
-        assert!(!sent.uses_vault, "the window never needs the host scan");
+        assert!(!sent.uses_bitwarden, "the window never needs the host scan");
     }
 
     #[test]

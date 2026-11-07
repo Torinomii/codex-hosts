@@ -51,9 +51,13 @@ pub struct OperationLimits {
     pub command_timeout: Option<Duration>,
     pub output_bytes: Option<usize>,
     pub batch_scope: Option<uuid::Uuid>,
-    /// Only the MCP server keeps sessions between calls; the GUI and the
-    /// file protocol never retain, whatever the profile says.
+    /// Only the MCP server keeps sessions between calls; the GUI never
+    /// retains, whatever the profile says.
     pub retain_sessions: bool,
+    /// The user approved this call's hosts as the dialog showed them. A vault
+    /// host whose item then moves its endpoint or login fails with
+    /// `APPROVAL_TARGET_CHANGED` instead of connecting somewhere unapproved.
+    pub approved: bool,
 }
 
 pub const TOTAL_TIMEOUT_CODE: &str = "OPERATION_TIMEOUT";
@@ -212,13 +216,22 @@ impl client::Handler for ServerKeyObserver {
         &mut self,
         server_public_key: &PublicKey,
     ) -> Result<bool, Self::Error> {
-        if let Ok(mut observed) = self.observed.lock() {
-            *observed = Some(ObservedHostKey {
-                fingerprint: server_public_key.fingerprint(HashAlg::Sha256).to_string(),
-                algorithm: server_public_key.algorithm().to_string(),
-            });
+        let presented = ObservedHostKey {
+            fingerprint: server_public_key.fingerprint(HashAlg::Sha256).to_string(),
+            algorithm: server_public_key.algorithm().to_string(),
+        };
+        let Ok(mut observed) = self.observed.lock() else {
+            return Ok(false);
+        };
+        // The first key is compared with the pin once the handshake is done.
+        // A re-key must present that same key, or the session ends.
+        match observed.as_ref() {
+            Some(first) => Ok(first.fingerprint == presented.fingerprint),
+            None => {
+                *observed = Some(presented);
+                Ok(true)
+            }
         }
-        Ok(true)
     }
 }
 
@@ -654,6 +667,10 @@ fn ssh_runtime() -> &'static Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("codex-hosts-ssh")
+            // A vault-host call nests the MCP handler, the provider CLI and
+            // the connection on one worker; unoptimized builds need about
+            // 3 MiB of stack for it, more than the 2 MiB default.
+            .thread_stack_size(8 * 1024 * 1024)
             .enable_all()
             .build()
             .expect("creating the shared SSH runtime should succeed")
@@ -849,22 +866,6 @@ pub(crate) async fn execute_with_input_async(
     .await
 }
 
-pub fn execute_many(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    commands: &[String],
-    max_concurrency: usize,
-    limits: OperationLimits,
-) -> Result<RemoteManyResult, RemoteFailure> {
-    ssh_runtime().block_on(execute_many_bounded(
-        profile,
-        hosts,
-        commands,
-        max_concurrency,
-        limits,
-    ))
-}
-
 pub(crate) async fn execute_many_bounded(
     profile: &HostProfile,
     hosts: &[HostProfile],
@@ -914,10 +915,6 @@ fn disconnect_sessions(sessions: Vec<Arc<PooledSession>>) -> usize {
         });
     }
     count
-}
-
-pub fn agent_identities() -> Result<Vec<AgentKeyInfo>, RemoteFailure> {
-    ssh_runtime().block_on(agent_identities_async())
 }
 
 pub(crate) async fn agent_identities_async() -> Result<Vec<AgentKeyInfo>, RemoteFailure> {
@@ -1301,6 +1298,7 @@ async fn pooled_connection(
     let refreshed;
     let host: &HostProfile = if host.is_vault_host() {
         let admitted = vault_hosts::admit(host).await?;
+        vault_hosts::keep_approved_target(host, &admitted.host, limits.approved)?;
         admission = Some(admitted.admission);
         refreshed = admitted.host;
         let login = admitted.login;
@@ -2201,6 +2199,36 @@ fn append_limited(output: &mut Vec<u8>, data: &[u8], budget: &CaptureBudget) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rekey_must_present_the_host_key_checked_at_connect() {
+        use client::Handler as _;
+        let first = PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINfwVIII2nJSe0Aa99Vovth3oJBqdje5CXG38MyCA0+L",
+        )
+        .unwrap();
+        let other = PublicKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIErjaSqT/i32tua1ssClc448uE9QkYZIwSyqPlCtrb/Z",
+        )
+        .unwrap();
+        let observed = Arc::new(Mutex::new(None));
+        let mut observer = ServerKeyObserver {
+            observed: Arc::clone(&observed),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert!(observer.check_server_key(&first).await.unwrap());
+            assert!(observer.check_server_key(&first).await.unwrap());
+            assert!(!observer.check_server_key(&other).await.unwrap());
+        });
+        let kept = observed.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            kept.fingerprint,
+            first.fingerprint(HashAlg::Sha256).to_string()
+        );
+    }
 
     #[test]
     fn total_timeout_cancels_the_wrapped_operation() {

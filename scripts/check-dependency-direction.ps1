@@ -1,9 +1,9 @@
 # Fails when the core depends on something its boundary forbids.
 #
-# Boundary (see specs/003-mcp-server/design.md §0.5): codex-hosts talks to
-# Bitwarden only by running the official native bw.exe as a child process, so
-# the core tree must never pull in an HTTP/TLS stack or a vault SDK. It only
-# opens SSH/Telnet connections and local pipes itself.
+# Boundary: codex-hosts reaches Bitwarden and 1Password only by running their
+# official CLIs (bw.exe, op.exe) as child processes, so the core tree must never
+# pull in an HTTP/TLS stack or a vault SDK. It only opens SSH/Telnet connections
+# and local pipes itself.
 #
 # Run from the repository root: .\scripts\check-dependency-direction.ps1
 

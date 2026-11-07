@@ -288,7 +288,7 @@ impl HostsApp {
     /// Opens the credential services on the page of `group`.
     pub(super) fn open_service_page(&mut self, group: HostGroup) {
         match group {
-            HostGroup::Local => self.open_credential_manager(),
+            HostGroup::Local => self.open_credential_services(),
             HostGroup::Bitwarden => self.open_bitwarden_page(),
             HostGroup::OnePassword => self.open_onepassword_page(),
         }

@@ -1,19 +1,17 @@
 use std::collections::{HashSet, VecDeque};
-use std::fs;
-use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::io::{self, Write};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::task::JoinSet;
 
 use crate::connection;
 use crate::credentials::{self, CredentialKind};
-use crate::fido::{self, FidoKeyInfo};
+use crate::fido::FidoKeyInfo;
 use crate::model::{
     AuthPersistence, CredentialSource, HostFilter, HostProfile, Protocol, RemoteEnv, SshAuth,
     VaultProvider, normalize_tags,
@@ -31,89 +29,6 @@ pub(crate) const MAX_EXEC_MANY_COMMANDS: usize = 64;
 const MAX_ALIAS_BYTES: usize = 256;
 pub(crate) const MAX_TOOL_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
-enum ToolRequest {
-    Capabilities,
-    TemporarySecretsOpen {
-        fields: Vec<String>,
-    },
-    TemporarySecrets {
-        session: uuid::Uuid,
-        request: crate::temporary_secrets::Request,
-    },
-    AgentIdentities,
-    FidoIdentities,
-    ListHosts {
-        #[serde(default)]
-        tags: Vec<String>,
-    },
-    Probe {
-        alias: String,
-        #[serde(default)]
-        connect_timeout_ms: Option<u64>,
-        #[serde(default)]
-        command_timeout_ms: Option<u64>,
-    },
-    Exec {
-        alias: String,
-        command: String,
-        #[serde(default)]
-        stdin: Option<String>,
-        #[serde(default)]
-        connect_timeout_ms: Option<u64>,
-        #[serde(default)]
-        command_timeout_ms: Option<u64>,
-    },
-    ExecMany {
-        alias: String,
-        commands: Vec<String>,
-        #[serde(default)]
-        stdin: Option<String>,
-        #[serde(default)]
-        max_concurrency: Option<usize>,
-        #[serde(default)]
-        connect_timeout_ms: Option<u64>,
-        #[serde(default)]
-        command_timeout_ms: Option<u64>,
-    },
-    ExecSudo(crate::sudo::Request),
-    ExecSu(crate::su::Request),
-    BatchProbe {
-        aliases: Vec<String>,
-        #[serde(default)]
-        max_concurrency: Option<usize>,
-        #[serde(default)]
-        connect_timeout_ms: Option<u64>,
-        #[serde(default)]
-        command_timeout_ms: Option<u64>,
-        #[serde(default)]
-        batch_timeout_ms: Option<u64>,
-        #[serde(default = "default_continue_on_error")]
-        continue_on_error: bool,
-    },
-    BatchExec {
-        aliases: Vec<String>,
-        command: String,
-        #[serde(default)]
-        stdin: Option<String>,
-        #[serde(default)]
-        max_concurrency: Option<usize>,
-        #[serde(default)]
-        connect_timeout_ms: Option<u64>,
-        #[serde(default)]
-        command_timeout_ms: Option<u64>,
-        #[serde(default)]
-        batch_timeout_ms: Option<u64>,
-        #[serde(default = "default_continue_on_error")]
-        continue_on_error: bool,
-    },
-}
-
-fn default_continue_on_error() -> bool {
-    true
-}
-
 #[derive(Debug, Serialize)]
 pub(crate) struct HostSummary {
     pub(crate) alias: String,
@@ -125,7 +40,8 @@ pub(crate) struct HostSummary {
     pub(crate) protocol: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ssh_auth: Option<&'static str>,
-    /// Where the login password lives (`credential_manager` or `bitwarden`);
+    /// Where the login password lives (`credential_manager`, `bitwarden` or
+    /// `onepassword`);
     /// absent for key and agent logins.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) credential_source: Option<&'static str>,
@@ -179,33 +95,6 @@ pub(crate) struct FidoIdentitiesResult {
 }
 
 #[derive(Debug, Serialize)]
-struct CapabilitiesResult {
-    host_metadata_fields: [&'static str; 2],
-    list_hosts_tag_filter: bool,
-    exec_stdin: bool,
-    exec_stdin_protocols: [&'static str; 1],
-    exec_sudo: bool,
-    exec_su: bool,
-    max_stdin_bytes: usize,
-    schema_version: u32,
-    status: &'static str,
-    app_version: &'static str,
-    actions: [&'static str; 12],
-    ssh_auth: [&'static str; 3],
-    max_batch_concurrency: usize,
-    max_batch_hosts: usize,
-    max_batch_output_bytes: usize,
-    max_timeout_ms: u64,
-    default_batch_concurrency: usize,
-    default_retained_connections: usize,
-    max_retained_connections: usize,
-    connection_idle_timeout_ms: u64,
-    max_exec_many_commands: usize,
-    host_key_hash: &'static str,
-    agent_forwarding: bool,
-}
-
-#[derive(Debug, Serialize)]
 struct BatchSummary {
     requested: usize,
     succeeded: usize,
@@ -246,390 +135,15 @@ impl BatchItem {
     }
 }
 
+/// With `continue_on_error:false`, any host that is not `ok` stops new hosts
+/// from starting: a failure, or a command that ran and exited non-zero.
+fn stops_batch(item: &BatchItem, continue_on_error: bool) -> bool {
+    !continue_on_error && item.status() != "ok"
+}
+
 struct BatchWorkResult {
     item: BatchItem,
     verified_host_keys: Vec<VerifiedHostKey>,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum ToolResponse {
-    TemporarySecrets(crate::temporary_secrets::Response),
-    Capabilities(CapabilitiesResult),
-    AgentIdentities(AgentIdentitiesResult),
-    FidoIdentities(FidoIdentitiesResult),
-    List(ListResult),
-    Remote(crate::ssh::RemoteResult),
-    Sudo(SudoResponse),
-    RemoteMany(crate::ssh::RemoteManyResult),
-    Batch(BatchResult),
-    Failure(RemoteFailure),
-}
-
-#[derive(Serialize)]
-struct SudoResponse {
-    schema_version: u32,
-    #[serde(flatten)]
-    result: SudoOutcome,
-}
-
-#[derive(Serialize)]
-#[serde(untagged)]
-enum SudoOutcome {
-    Remote(crate::ssh::RemoteResult),
-    Failure(RemoteFailure),
-}
-
-impl ToolResponse {
-    fn is_failure(&self) -> bool {
-        matches!(self, Self::Failure(_))
-            || matches!(
-                self,
-                Self::Sudo(SudoResponse {
-                    result: SudoOutcome::Failure(_),
-                    ..
-                })
-            )
-            || matches!(self, Self::TemporarySecrets(response) if response.status == "error")
-    }
-}
-
-pub fn run(request_path: &Path, result_path: &Path) -> i32 {
-    let response = match execute_request(request_path) {
-        Ok(value) => value,
-        Err(error) => ToolResponse::Failure(error),
-    };
-    let failed = response.is_failure();
-    let write_result = fs::File::create(result_path)
-        .map(BufWriter::new)
-        .map_err(|error| error.to_string())
-        .and_then(|mut writer| {
-            serde_json::to_writer_pretty(&mut writer, &response)
-                .map_err(|error| error.to_string())?;
-            writer.flush().map_err(|error| error.to_string())
-        });
-    match write_result {
-        Ok(()) => {
-            if failed {
-                1
-            } else {
-                0
-            }
-        }
-        Err(_) => 2,
-    }
-}
-
-fn execute_request(path: &Path) -> Result<ToolResponse, RemoteFailure> {
-    let bytes = fs::read(path)
-        .map_err(|error| RemoteFailure::new("REQUEST_READ_FAILED", error.to_string()))?;
-    let request: ToolRequest = serde_json::from_slice(&bytes)
-        .map_err(|error| RemoteFailure::new("REQUEST_INVALID", error.to_string()))?;
-    validate_request_input(&request)?;
-
-    if matches!(&request, ToolRequest::Capabilities) {
-        return Ok(ToolResponse::Capabilities(CapabilitiesResult {
-            host_metadata_fields: ["description", "tags"],
-            list_hosts_tag_filter: true,
-            exec_stdin: true,
-            exec_stdin_protocols: ["ssh"],
-            exec_sudo: true,
-            exec_su: true,
-            max_stdin_bytes: ssh::MAX_STDIN_BYTES,
-            schema_version: SCHEMA_VERSION,
-            status: "ok",
-            app_version: env!("CARGO_PKG_VERSION"),
-            actions: [
-                "temporary_secrets_open",
-                "temporary_secrets",
-                "agent_identities",
-                "fido_identities",
-                "list_hosts",
-                "probe",
-                "exec",
-                "exec_many",
-                "exec_sudo",
-                "exec_su",
-                "batch_probe",
-                "batch_exec",
-            ],
-            ssh_auth: ["password", "private_key", "ssh_agent"],
-            max_batch_concurrency: MAX_BATCH_CONCURRENCY,
-            max_batch_hosts: MAX_BATCH_HOSTS,
-            max_batch_output_bytes: MAX_BATCH_OUTPUT_BYTES,
-            max_timeout_ms: MAX_TOOL_TIMEOUT_MS,
-            default_batch_concurrency: DEFAULT_BATCH_CONCURRENCY,
-            default_retained_connections: ssh::DEFAULT_RETAINED_CONNECTIONS,
-            max_retained_connections: ssh::MAX_RETAINED_CONNECTIONS,
-            connection_idle_timeout_ms: ssh::CONNECTION_IDLE_TIMEOUT.as_millis() as u64,
-            max_exec_many_commands: MAX_EXEC_MANY_COMMANDS,
-            host_key_hash: "sha256",
-            agent_forwarding: false,
-        }));
-    }
-    if matches!(&request, ToolRequest::AgentIdentities) {
-        return Ok(ToolResponse::AgentIdentities(AgentIdentitiesResult {
-            schema_version: SCHEMA_VERSION,
-            status: "ok",
-            identities: ssh::agent_identities()?,
-        }));
-    }
-    if matches!(&request, ToolRequest::FidoIdentities) {
-        return Ok(ToolResponse::FidoIdentities(FidoIdentitiesResult {
-            schema_version: SCHEMA_VERSION,
-            status: "ok",
-            helper_available: fido::helper_available(),
-            identities: fido::discover_handles(),
-        }));
-    }
-
-    match &request {
-        ToolRequest::TemporarySecretsOpen { fields } => {
-            return crate::temporary_secrets::open(fields.clone())
-                .map(ToolResponse::TemporarySecrets)
-                .map_err(|code| {
-                    RemoteFailure::new(
-                        code,
-                        "Temporary secret window unavailable or invalid field names.",
-                    )
-                });
-        }
-        ToolRequest::TemporarySecrets { session, request } => {
-            return crate::temporary_secrets::call(*session, request.clone())
-                .map(ToolResponse::TemporarySecrets)
-                .map_err(|code| {
-                    RemoteFailure::new(
-                        code,
-                        "Temporary session unavailable; open a new window if it was closed.",
-                    )
-                });
-        }
-        _ => {}
-    }
-    let privileged_outcome = match &request {
-        ToolRequest::ExecSudo(params) => Some(execute_sudo_request(params)),
-        ToolRequest::ExecSu(params) => Some(execute_su_request(params)),
-        _ => None,
-    };
-    if let Some(outcome) = privileged_outcome {
-        return Ok(ToolResponse::Sudo(SudoResponse {
-            schema_version: SCHEMA_VERSION,
-            result: match outcome {
-                Ok(result) => SudoOutcome::Remote(result),
-                Err(error) => SudoOutcome::Failure(error),
-            },
-        }));
-    }
-    match request {
-        ToolRequest::Capabilities
-        | ToolRequest::TemporarySecretsOpen { .. }
-        | ToolRequest::TemporarySecrets { .. } => unreachable!(),
-        ToolRequest::AgentIdentities => unreachable!(),
-        ToolRequest::FidoIdentities => unreachable!(),
-        ToolRequest::ListHosts { tags } => {
-            let store = ssh::runtime().block_on(load_store_for_listing())?;
-            list_hosts(&store, tags).map(ToolResponse::List)
-        }
-        ToolRequest::Probe {
-            alias,
-            connect_timeout_ms,
-            command_timeout_ms,
-        } => {
-            let (store, host) = ssh::runtime().block_on(load_host(&alias))?;
-            validate_profile(&host)?;
-            crate::approval::authorize_sync(crate::approval::Review::new(
-                std::slice::from_ref(&host),
-                &store.hosts,
-                vec!["hostname".into()],
-                None,
-                None,
-            )?)?;
-            let result = connection::probe(
-                &host,
-                &store.hosts,
-                limits(connect_timeout_ms, command_timeout_ms, None),
-            )?;
-            merge_verified_host_keys(&store.hosts, &result.verified_host_keys)?;
-            Ok(ToolResponse::Remote(result))
-        }
-        ToolRequest::Exec {
-            alias,
-            command,
-            stdin,
-            connect_timeout_ms,
-            command_timeout_ms,
-        } => {
-            let (store, host) = ssh::runtime().block_on(load_host(&alias))?;
-            validate_profile(&host)?;
-            ssh::validate_stdin(stdin.as_deref())?;
-            crate::approval::authorize_sync(crate::approval::Review::new(
-                std::slice::from_ref(&host),
-                &store.hosts,
-                vec![command.clone()],
-                stdin.as_deref(),
-                None,
-            )?)?;
-            Ok(ToolResponse::Remote(connection::execute_with_input(
-                &host,
-                &store.hosts,
-                &command,
-                stdin.as_deref(),
-                limits(connect_timeout_ms, command_timeout_ms, None),
-            )?))
-        }
-        ToolRequest::ExecSudo(_) | ToolRequest::ExecSu(_) => {
-            unreachable!("privileged exec handled before the shared legacy store load")
-        }
-        ToolRequest::ExecMany {
-            alias,
-            commands,
-            stdin: _,
-            max_concurrency,
-            connect_timeout_ms,
-            command_timeout_ms,
-        } => {
-            validate_commands(&commands)?;
-            let (store, host) = ssh::runtime().block_on(load_host(&alias))?;
-            validate_profile(&host)?;
-            crate::approval::authorize_sync(crate::approval::Review::new(
-                std::slice::from_ref(&host),
-                &store.hosts,
-                commands.clone(),
-                None,
-                None,
-            )?)?;
-            let concurrency = max_concurrency
-                .unwrap_or(DEFAULT_BATCH_CONCURRENCY)
-                .clamp(1, MAX_BATCH_CONCURRENCY);
-            let mut operation_limits = limits(connect_timeout_ms, command_timeout_ms, None);
-            operation_limits.output_bytes = Some(MAX_BATCH_OUTPUT_BYTES);
-            let mut result = connection::execute_many(
-                &host,
-                &store.hosts,
-                &commands,
-                concurrency,
-                operation_limits,
-            )?;
-            fit_many_result_budget(&mut result, MAX_BATCH_OUTPUT_BYTES)?;
-            Ok(ToolResponse::RemoteMany(result))
-        }
-        ToolRequest::BatchProbe {
-            aliases,
-            max_concurrency,
-            connect_timeout_ms,
-            command_timeout_ms,
-            batch_timeout_ms,
-            continue_on_error,
-        } => ssh::runtime()
-            .block_on(async {
-                let store = load_store_for_aliases(&aliases).await?;
-                execute_batch(
-                    &store.hosts,
-                    aliases,
-                    BatchAction::Probe,
-                    max_concurrency,
-                    Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
-                    batch_timeout_ms,
-                    continue_on_error,
-                    false,
-                )
-                .await
-            })
-            .map(ToolResponse::Batch),
-        ToolRequest::BatchExec {
-            aliases,
-            command,
-            stdin: _,
-            max_concurrency,
-            connect_timeout_ms,
-            command_timeout_ms,
-            batch_timeout_ms,
-            continue_on_error,
-        } => ssh::runtime()
-            .block_on(async {
-                let store = load_store_for_aliases(&aliases).await?;
-                execute_batch(
-                    &store.hosts,
-                    aliases,
-                    BatchAction::Exec(command),
-                    max_concurrency,
-                    Arc::new(move |_: &HostProfile| (connect_timeout_ms, command_timeout_ms)),
-                    batch_timeout_ms,
-                    continue_on_error,
-                    false,
-                )
-                .await
-            })
-            .map(ToolResponse::Batch),
-    }
-}
-
-fn execute_sudo_request(
-    params: &crate::sudo::Request,
-) -> Result<crate::ssh::RemoteResult, RemoteFailure> {
-    let (store, host) = ssh::runtime().block_on(load_host(&params.alias))?;
-    let host = &host;
-    validate_profile(host)?;
-    let target = crate::sudo::validate(host, &params.program, &params.args, Some(&params.user))?;
-    crate::approval::authorize_sync(crate::approval::Review::new(
-        std::slice::from_ref(host),
-        &store.hosts,
-        vec![format!(
-            "{} {}",
-            params.program,
-            serde_json::to_string(&params.args).unwrap_or_default()
-        )],
-        None,
-        Some(target.clone()),
-    )?)?;
-    connection::execute_sudo(
-        host,
-        &store.hosts,
-        &params.program,
-        &params.args,
-        Some(&target),
-        limits(params.connect_timeout_ms, params.command_timeout_ms, None),
-    )
-}
-
-fn execute_su_request(
-    params: &crate::su::Request,
-) -> Result<crate::ssh::RemoteResult, RemoteFailure> {
-    let (store, host) = ssh::runtime().block_on(load_host(&params.alias))?;
-    let host = &host;
-    validate_profile(host)?;
-    let target = crate::su::validate(host, &params.program, &params.args, Some(&params.user))?;
-    crate::approval::authorize_sync(crate::approval::Review::new(
-        std::slice::from_ref(host),
-        &store.hosts,
-        vec![format!(
-            "su → {target}: {} {}",
-            params.program,
-            serde_json::to_string(&params.args).unwrap_or_default()
-        )],
-        None,
-        None,
-    )?)?;
-    connection::execute_su(
-        host,
-        &store.hosts,
-        &params.program,
-        &params.args,
-        Some(&target),
-        limits(params.connect_timeout_ms, params.command_timeout_ms, None),
-    )
-}
-
-fn validate_request_input(request: &ToolRequest) -> Result<(), RemoteFailure> {
-    match request {
-        ToolRequest::Exec { stdin, .. } => ssh::validate_stdin(stdin.as_deref()),
-        ToolRequest::ExecMany { stdin: Some(_), .. }
-        | ToolRequest::BatchExec { stdin: Some(_), .. } => Err(RemoteFailure::new(
-            "STDIN_UNSUPPORTED",
-            "stdin is supported only by single-host SSH exec.",
-        )),
-        _ => Ok(()),
-    }
 }
 
 pub(crate) fn list_hosts(
@@ -713,15 +227,15 @@ pub(crate) fn list_hosts(
     })
 }
 
-/// Per-host connect and command timeouts in milliseconds; the MCP server
-/// resolves them from the call, then the host's Advanced defaults, then the
-/// global defaults, while the file protocol passes the request values through.
+/// Per-host connect and command timeouts in milliseconds, resolved by the MCP
+/// server from the call, then the host's Advanced defaults, then the global
+/// defaults.
 pub(crate) type BatchTimeouts =
     Arc<dyn Fn(&HostProfile) -> (Option<u64>, Option<u64>) + Send + Sync>;
 
 /// Runs every host as a task on the caller's runtime. Dropping the returned
 /// future (MCP cancellation) aborts the tasks, which closes their channels.
-#[allow(clippy::too_many_arguments)]
+/// Hosts that opt into retention keep their sessions, as for single-host calls.
 pub(crate) async fn execute_batch(
     hosts: &[HostProfile],
     aliases: Vec<String>,
@@ -730,7 +244,6 @@ pub(crate) async fn execute_batch(
     timeouts: BatchTimeouts,
     batch_timeout_ms: Option<u64>,
     continue_on_error: bool,
-    retain_sessions: bool,
 ) -> Result<BatchResult, RemoteFailure> {
     let snapshot = Arc::new(hosts.to_vec());
     let hosts = resolve_batch_hosts(&snapshot, &aliases)?;
@@ -738,7 +251,7 @@ pub(crate) async fn execute_batch(
         BatchAction::Probe => "hostname",
         BatchAction::Exec(command) => command,
     };
-    crate::approval::authorize(crate::approval::Review::new(
+    let approved = crate::approval::authorize(crate::approval::Review::new(
         &hosts,
         &snapshot,
         vec![command.into()],
@@ -808,7 +321,8 @@ pub(crate) async fn execute_batch(
                         limits(connect_timeout_ms, command_timeout_ms, total_timeout);
                     operation_limits.output_bytes = Some(per_host_output_bytes);
                     operation_limits.batch_scope = Some(batch_scope);
-                    operation_limits.retain_sessions = retain_sessions;
+                    operation_limits.retain_sessions = true;
+                    operation_limits.approved = approved;
                     match action.as_ref() {
                         BatchAction::Probe => {
                             connection::probe_async(&host, snapshot.as_slice(), operation_limits)
@@ -838,15 +352,15 @@ pub(crate) async fn execute_batch(
                         if error.host_alias.is_none() {
                             error.host_alias = Some(host.alias.clone().into_boxed_str());
                         }
-                        if !continue_on_error {
-                            stop.store(true, Ordering::Release);
-                        }
                         BatchWorkResult {
                             item: BatchItem::Failure(error),
                             verified_host_keys: Vec::new(),
                         }
                     }
                 };
+                if stops_batch(&work_result.item, continue_on_error) {
+                    stop.store(true, Ordering::Release);
+                }
                 if let Ok(mut slots) = results.lock() {
                     slots[index] = Some(work_result);
                 }
@@ -896,7 +410,7 @@ pub(crate) async fn execute_batch(
         values.push(work_result.item);
     }
     if matches!(action.as_ref(), BatchAction::Probe) && !verified_host_keys.is_empty() {
-        merge_verified_host_keys(snapshot.as_slice(), &verified_host_keys)?;
+        merge_verified_host_keys(snapshot.as_slice(), &verified_host_keys).await?;
     }
     let status = if summary.failed == 0 && summary.cancelled == 0 {
         if summary.remote_errors == 0 {
@@ -1090,19 +604,65 @@ fn resolve_batch_hosts(
     Ok(resolved)
 }
 
-pub(crate) fn merge_verified_host_keys(
+/// Records the host keys a call verified. The remote work has already
+/// succeeded, so a store that another writer (the GUI, another call) holds
+/// for a moment is retried briefly instead of failing the call.
+pub(crate) async fn merge_verified_host_keys(
     snapshot: &[HostProfile],
     verified_host_keys: &[VerifiedHostKey],
 ) -> Result<(), RemoteFailure> {
     if verified_host_keys.is_empty() {
         return Ok(());
     }
+    let mut attempt = 0;
+    loop {
+        match merge_verified_host_keys_once(snapshot, verified_host_keys) {
+            Err(failure) if failure.is_busy() && attempt < STORE_BUSY_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
+            }
+            Err(MergeFailure::Read(error)) => {
+                return Err(RemoteFailure::new("STORE_READ_FAILED", error.to_string()));
+            }
+            Err(MergeFailure::Write(error)) => {
+                return Err(RemoteFailure::new("STORE_WRITE_FAILED", error.to_string()));
+            }
+            Ok(()) => return Ok(()),
+        }
+    }
+}
+
+/// Five retries wait 750 ms in all.
+const STORE_BUSY_RETRIES: u32 = 5;
+
+enum MergeFailure {
+    Read(crate::storage::StorageError),
+    Write(crate::storage::StorageError),
+}
+
+impl MergeFailure {
+    /// Another writer holds the store or saved it between our load and save;
+    /// loading again and merging again is safe.
+    fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Self::Write(
+                crate::storage::StorageError::Changed
+                    | crate::storage::StorageError::WriteBlocked(_)
+            )
+        )
+    }
+}
+
+fn merge_verified_host_keys_once(
+    snapshot: &[HostProfile],
+    verified_host_keys: &[VerifiedHostKey],
+) -> Result<(), MergeFailure> {
     // Concurrent calls in the MCP server each load, modify and save the store;
     // without this the store's revision check fails one of them after its
     // remote authentication already succeeded.
     let _merge = crate::storage::write_lock();
-    let mut fresh = HostStore::load()
-        .map_err(|error| RemoteFailure::new("STORE_READ_FAILED", error.to_string()))?;
+    let mut fresh = HostStore::load().map_err(MergeFailure::Read)?;
     let mut changed = false;
     for verified in verified_host_keys {
         let Some(old) = snapshot.iter().find(|host| host.id == verified.host_id) else {
@@ -1134,9 +694,7 @@ pub(crate) fn merge_verified_host_keys(
         changed = true;
     }
     if changed {
-        fresh
-            .save()
-            .map_err(|error| RemoteFailure::new("STORE_WRITE_FAILED", error.to_string()))?;
+        fresh.save().map_err(MergeFailure::Write)?;
     }
     Ok(())
 }
@@ -1153,6 +711,7 @@ pub(crate) fn limits(
         output_bytes: None,
         batch_scope: None,
         retain_sessions: false,
+        approved: false,
     }
 }
 
@@ -1305,6 +864,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_key_merges_retry_only_while_another_writer_holds_the_store() {
+        use crate::storage::StorageError;
+        assert!(MergeFailure::Write(StorageError::Changed).is_busy());
+        assert!(MergeFailure::Write(StorageError::WriteBlocked("busy".into())).is_busy());
+        assert!(!MergeFailure::Write(StorageError::NoDataDirectory).is_busy());
+        assert!(!MergeFailure::Read(StorageError::Changed).is_busy());
+        assert!(!MergeFailure::Read(StorageError::NewerVersion(3)).is_busy());
+    }
+
+    #[test]
     fn hidden_hosts_are_invisible_and_unusable_for_codex() {
         let mut store = HostStore::default();
         let mut hidden = HostProfile {
@@ -1352,41 +921,17 @@ mod tests {
         assert_eq!(result.hosts.len(), 1);
         assert_eq!(result.hosts[0].description, "notes");
         assert_eq!(result.hosts[0].tags, ["Prod", "web"]);
-        let request: ToolRequest = serde_json::from_str(r#"{"action":"list_hosts"}"#).unwrap();
-        assert!(matches!(request, ToolRequest::ListHosts { tags } if tags.is_empty()));
     }
 
     #[test]
-    fn optional_stdin_contract_rejects_wrong_types_and_oversized_utf8() {
-        for suffix in ["", ",\"stdin\":null", ",\"stdin\":\"\""] {
-            let request: ToolRequest = serde_json::from_str(&format!(
-                "{{\"action\":\"exec\",\"alias\":\"a\",\"command\":\"cat\"{suffix}}}"
-            ))
-            .unwrap();
-            assert!(validate_request_input(&request).is_ok());
-        }
-        assert!(
-            serde_json::from_str::<ToolRequest>(
-                r#"{"action":"exec","alias":"a","command":"cat","stdin":123}"#
-            )
-            .is_err()
-        );
+    fn stdin_contract_accepts_empty_input_and_rejects_oversized_utf8() {
+        assert!(ssh::validate_stdin(None).is_ok());
+        assert!(ssh::validate_stdin(Some("")).is_ok());
         let input = "中".repeat(ssh::MAX_STDIN_BYTES / 3 + 1);
-        let request: ToolRequest = serde_json::from_value(
-            serde_json::json!({"action":"exec","alias":"a","command":"cat","stdin":input}),
-        )
-        .unwrap();
         assert_eq!(
-            validate_request_input(&request).unwrap_err().code,
+            ssh::validate_stdin(Some(&input)).unwrap_err().code,
             "STDIN_TOO_LARGE"
         );
-        for action in ["exec_many", "batch_exec"] {
-            let request: ToolRequest = serde_json::from_value(serde_json::json!({"action":action,"alias":"a","aliases":["a"],"command":"cat","commands":["cat"],"stdin":"data"})).unwrap();
-            assert_eq!(
-                validate_request_input(&request).unwrap_err().code,
-                "STDIN_UNSUPPORTED"
-            );
-        }
     }
 
     #[test]
@@ -1432,29 +977,37 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sudo_uses_the_same_strict_parameters_as_mcp() {
-        let request = serde_json::json!({"action":"exec_sudo", "alias":"test", "program":"/usr/bin/id", "user":"root", "args":["-u"]});
-        assert!(matches!(
-            serde_json::from_value::<ToolRequest>(request.clone()).unwrap(),
-            ToolRequest::ExecSudo(_)
+    fn stopping_batches_stop_after_a_non_zero_exit_as_well_as_a_failure() {
+        let result = |status, exit_code| {
+            BatchItem::Success(crate::ssh::RemoteResult {
+                status,
+                alias: "host-1".to_owned(),
+                exit_code,
+                stdout: String::new(),
+                sudo_user: None,
+                su_user: None,
+                stderr: String::new(),
+                output_truncated: false,
+                host_fingerprint: None,
+                host_key_algorithm: None,
+                auth_key_fingerprint: None,
+                verified_host_keys: Vec::new(),
+            })
+        };
+        let failure = BatchItem::Failure(failure_for_alias(
+            "host-1",
+            "CONNECT_FAILED",
+            "The host refused the connection.",
         ));
-        for field in ["stdin", "command", "password"] {
-            let mut invalid = request.clone();
-            invalid[field] = serde_json::json!("rejected");
+        assert!(!stops_batch(&result("ok", 0), false));
+        assert!(stops_batch(&result("remote_error", 1), false));
+        assert!(stops_batch(&failure, false));
+        for item in [result("ok", 0), result("remote_error", 1), failure] {
             assert!(
-                serde_json::from_value::<ToolRequest>(invalid).is_err(),
-                "{field}"
+                !stops_batch(&item, true),
+                "continue_on_error:true never stops"
             );
         }
-        let mut missing = request.clone();
-        missing.as_object_mut().unwrap().remove("user");
-        assert!(serde_json::from_value::<ToolRequest>(missing).is_err());
-        let mut su = request;
-        su["action"] = serde_json::json!("exec_su");
-        assert!(matches!(
-            serde_json::from_value::<ToolRequest>(su).unwrap(),
-            ToolRequest::ExecSu(_)
-        ));
     }
 
     #[test]

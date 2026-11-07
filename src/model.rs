@@ -7,7 +7,6 @@ use uuid::Uuid;
 #[serde(rename_all = "snake_case")]
 pub enum Protocol {
     #[default]
-    #[serde(alias = "ssh_password")]
     Ssh,
     Telnet,
 }
@@ -48,8 +47,8 @@ impl SshAuth {
 }
 
 /// How long an authenticated session may outlive the tool call that opened it.
-/// The default keeps today's behaviour: every call authenticates again, so a
-/// hardware key is touched once per action.
+/// The default: every call authenticates again, so a hardware key is touched
+/// once per action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum AuthPersistence {
@@ -347,7 +346,7 @@ pub const DEFAULT_SYNC_MAX_AGE_SECONDS: u64 = 0;
 /// Calls that follow each other closely (a batch, a probe then an exec) share
 /// one sync even under "sync before every use".
 pub const MIN_SYNC_SPACING_SECONDS: u64 = 5;
-/// The choices the credential manager offers for the sync window, in seconds.
+/// The sync-window choices the Bitwarden settings offer, in seconds.
 pub const SYNC_MAX_AGE_CHOICES: [u64; 4] = [0, 60, 5 * 60, 30 * 60];
 /// Folder the wizard proposes for host credentials.
 pub const DEFAULT_BITWARDEN_FOLDER: &str = "codex-hosts";
@@ -435,7 +434,7 @@ impl Default for BitwardenProfile {
     }
 }
 
-/// Credential-manager settings kept with the host store.
+/// Bitwarden settings kept with the host store.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BitwardenSettings {
@@ -922,58 +921,6 @@ mod tests {
         let encoded = serde_json::to_value(&host).unwrap();
         assert_eq!(encoded["advanced"]["su"]["enabled"], true);
         assert!(encoded["advanced"]["su"].get("password").is_none());
-        assert!(encoded["advanced"]["su"].get("default_user").is_none());
-    }
-
-    #[test]
-    fn retired_target_defaults_preserve_credentials_but_never_select_an_identity() {
-        for old_target in ["root", "bob", "alice", ""] {
-            let id = Uuid::new_v4();
-            let mut host: HostProfile = serde_json::from_value(serde_json::json!({
-                "alias":"legacy", "address":"host", "username":"alice",
-                "advanced": {
-                    "sudo": {"enabled":true,"default_user":old_target,
-                        "credentials":[{"id":id,"username":"bob"}]},
-                    "su": {"enabled":true,"default_user":old_target}
-                }
-            }))
-            .unwrap();
-            host.apply_prefill(&Prefill {
-                sudo_enabled: Some(true),
-                su_enabled: Some(true),
-                ..Default::default()
-            });
-            assert_eq!(host.advanced.sudo.as_ref().unwrap().credentials[0].id, id);
-            assert_eq!(
-                crate::sudo::validate(&host, "/usr/bin/id", &[], None)
-                    .unwrap_err()
-                    .code,
-                "SUDO_USER_REQUIRED"
-            );
-            assert_eq!(
-                crate::su::validate(&host, "/usr/bin/id", &[], None)
-                    .unwrap_err()
-                    .code,
-                "SU_USER_REQUIRED"
-            );
-            assert_eq!(
-                crate::sudo::validate(&host, "/usr/bin/id", &[], Some(" carol ")).unwrap(),
-                "carol"
-            );
-            assert_eq!(
-                crate::su::validate(&host, "/usr/bin/id", &[], Some(" carol ")).unwrap(),
-                "carol"
-            );
-            let encoded = serde_json::to_value(&host).unwrap();
-            for mechanism in ["sudo", "su"] {
-                assert!(encoded["advanced"][mechanism].get("default_user").is_none());
-                assert_eq!(encoded["advanced"][mechanism]["enabled"], true);
-            }
-            let roundtrip: HostProfile = serde_json::from_value(encoded).unwrap();
-            assert_eq!(roundtrip.advanced, host.advanced);
-            assert!(crate::sudo::validate(&roundtrip, "/usr/bin/id", &[], None).is_err());
-            assert!(crate::su::validate(&roundtrip, "/usr/bin/id", &[], None).is_err());
-        }
     }
 
     #[test]

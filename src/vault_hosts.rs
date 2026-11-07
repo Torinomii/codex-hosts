@@ -409,6 +409,30 @@ pub(crate) async fn admit(host: &HostProfile) -> Result<AdmittedLogin, RemoteFai
     }
 }
 
+/// An approved call connects only to the endpoint and login the approval
+/// showed. When admission finds that the item moved meanwhile, the refreshed
+/// mirror is already saved, so the next call's approval shows the new target.
+pub(crate) fn keep_approved_target(
+    shown: &HostProfile,
+    admitted: &HostProfile,
+    approved: bool,
+) -> Result<(), RemoteFailure> {
+    let same = shown.protocol == admitted.protocol
+        && shown.address == admitted.address
+        && shown.port == admitted.port
+        && shown.username == admitted.username;
+    if !approved || same {
+        return Ok(());
+    }
+    Err(RemoteFailure::new(
+        "APPROVAL_TARGET_CHANGED",
+        format!(
+            "The password manager item for {} changed its endpoint or login after the call was approved; nothing was sent. Call again to review the new target.",
+            shown.alias
+        ),
+    ))
+}
+
 /// Reads the login password of a vault-backed host, reusing what an
 /// admission handed over when it can.
 pub(crate) async fn resolve_login_password(
@@ -460,6 +484,42 @@ pub(crate) fn refresh_quietly(store: &HostStore) -> impl Future<Output = bool> +
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_approved_call_refuses_a_target_the_vault_moved_after_approval() {
+        let shown = HostProfile {
+            alias: "web".into(),
+            address: "10.0.0.5".into(),
+            port: 22,
+            username: "alice".into(),
+            ..HostProfile::default()
+        };
+        assert!(keep_approved_target(&shown, &shown.clone(), true).is_ok());
+        let moves = [
+            HostProfile {
+                username: "root".into(),
+                ..shown.clone()
+            },
+            HostProfile {
+                address: "10.0.0.6".into(),
+                ..shown.clone()
+            },
+            HostProfile {
+                port: 2222,
+                ..shown.clone()
+            },
+            HostProfile {
+                protocol: Protocol::Telnet,
+                ..shown.clone()
+            },
+        ];
+        for moved in &moves {
+            let error = keep_approved_target(&shown, moved, true).unwrap_err();
+            assert_eq!(error.code, "APPROVAL_TARGET_CHANGED");
+            // Without an approval the vault item applies at once, as documented.
+            assert!(keep_approved_target(&shown, moved, false).is_ok());
+        }
+    }
 
     fn facts(alias: &str, address: &str) -> HostFacts {
         HostFacts {

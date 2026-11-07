@@ -1,4 +1,4 @@
-//! Bitwarden in the window: the credential-manager dialog (account setup
+//! Bitwarden in the window: the credential-services dialog (account setup
 //! wizard, vault status, the folder's items, settings), the jobs that keep
 //! vault-backed hosts in step with the folder (refresh, save, delete), and
 //! the master-password prompt. Every `bw` call runs on a worker thread with
@@ -401,7 +401,7 @@ impl HostsApp {
             self.vault_session = None;
             self.vault_state = Some(VaultState::Locked);
             self.vault_note = Some(self.catalog.text("vault_section_locked").to_owned());
-            if let Some(manager) = self.credential_manager.as_mut() {
+            if let Some(manager) = self.credential_services.as_mut() {
                 manager.session = None;
             }
         }
@@ -712,7 +712,7 @@ pub(super) struct UnlockPrompt {
 pub(super) struct ApprovalUnlock(Job<Result<Option<SessionKey>, JobError>>);
 
 // ---------------------------------------------------------------------------
-// Credential manager dialog
+// Credential services dialog
 
 /// The dialog's two levels: every credential service, or one service.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -773,7 +773,7 @@ pub(super) struct SetupDone {
     pub(super) store_error: Option<String>,
 }
 
-pub(super) struct CredentialManager {
+pub(super) struct CredentialServices {
     view: ManagerView,
     tab: ManagerTab,
     status: Option<ManagerStatus>,
@@ -1015,8 +1015,8 @@ enum ManagerAction {
 }
 
 impl HostsApp {
-    /// Opens the credential-manager dialog from the toolbar.
-    pub(super) fn open_credential_manager(&mut self) {
+    /// Opens the credential-services dialog from the toolbar.
+    pub(super) fn open_credential_services(&mut self) {
         let idle_minutes = match self
             .store
             .bitwarden
@@ -1028,7 +1028,7 @@ impl HostsApp {
             _ => DEFAULT_REAUTH_IDLE_MINUTES,
         };
         self.onepassword.close();
-        self.credential_manager = Some(CredentialManager {
+        self.credential_services = Some(CredentialServices {
             view: ManagerView::Services,
             tab: ManagerTab::Account,
             status: None,
@@ -1052,7 +1052,7 @@ impl HostsApp {
 
     /// Opens the credential services straight on the Bitwarden page.
     pub(super) fn open_bitwarden_page(&mut self) {
-        self.open_credential_manager();
+        self.open_credential_services();
         if self.store.bitwarden.profile.is_some() {
             self.manager_act(ManagerAction::OpenBitwarden);
         }
@@ -1069,12 +1069,12 @@ impl HostsApp {
         let settings = self.store.bitwarden.clone();
         let reporter = self.reporter();
         let max_age = settings.sync_max_age_seconds;
-        let Some(manager) = self.credential_manager.as_mut() else {
+        let Some(manager) = self.credential_services.as_mut() else {
             return;
         };
         match action {
             ManagerAction::Close => {
-                self.credential_manager = None;
+                self.credential_services = None;
                 self.onepassword.close();
             }
             ManagerAction::OpenBitwarden => {
@@ -1087,7 +1087,7 @@ impl HostsApp {
                 manager.message = None;
             }
             ManagerAction::NewHost => {
-                self.credential_manager = None;
+                self.credential_services = None;
                 self.switch_editor(EditorSwitch::New(HostGroup::Bitwarden));
             }
             ManagerAction::SaveSettings => {
@@ -1114,7 +1114,7 @@ impl HostsApp {
                         lock_in_background(&self.store.bitwarden, key);
                         self.vault_session = None;
                         self.vault_state = Some(VaultState::Locked);
-                        if let Some(manager) = self.credential_manager.as_mut() {
+                        if let Some(manager) = self.credential_services.as_mut() {
                             manager.session = None;
                             manager.message =
                                 Some((false, self.catalog.text("bw_policy_locked_now").to_owned()));
@@ -1122,7 +1122,7 @@ impl HostsApp {
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        if let Some(manager) = self.credential_manager.as_mut() {
+                        if let Some(manager) = self.credential_services.as_mut() {
                             manager.message = Some((true, error));
                         }
                     }
@@ -1476,7 +1476,7 @@ impl HostsApp {
                 self.set_status_key("bw_setup_done");
                 // The wizard's job is done: the window says so and offers
                 // the next step instead of leaving the user on a settings page.
-                self.credential_manager = None;
+                self.credential_services = None;
                 self.setup_done = done;
                 // The folder's items become hosts right away.
                 self.refresh_vault_hosts();
@@ -1484,9 +1484,9 @@ impl HostsApp {
         }
     }
 
-    fn poll_credential_manager(&mut self) {
+    fn poll_credential_services(&mut self) {
         let catalog = self.catalog.clone();
-        let Some(manager) = self.credential_manager.as_mut() else {
+        let Some(manager) = self.credential_services.as_mut() else {
             return;
         };
         if let Some(wizard) = manager.wizard.as_mut()
@@ -1641,7 +1641,7 @@ impl HostsApp {
             if let Err(error) = self.refresh_hosts() {
                 self.set_status_format("storage_error", &[("error", &error)]);
             }
-            if let Some(manager) = self.credential_manager.as_ref() {
+            if let Some(manager) = self.credential_services.as_ref() {
                 self.vault_problems = manager.problems.clone();
             }
         }
@@ -1656,13 +1656,13 @@ impl HostsApp {
         self.poll_onepassword();
         self.approval_unlock();
         self.unlock_prompt_dialog(context);
-        self.credential_manager_dialog(context);
+        self.credential_services_dialog(context);
         self.setup_done_dialog(context);
     }
 
     pub(super) fn bitwarden_dialog_open(&self) -> bool {
         self.unlock_prompt.is_some()
-            || self.credential_manager.is_some()
+            || self.credential_services.is_some()
             || self.setup_done.is_some()
     }
 
@@ -1739,7 +1739,7 @@ impl HostsApp {
                         self.vault_session = session;
                         self.vault_state = Some(VaultState::Unlocked);
                     }
-                    if let Some(manager) = self.credential_manager.as_mut() {
+                    if let Some(manager) = self.credential_services.as_mut() {
                         manager.session = self.vault_session.as_ref().map(copy_key);
                     }
                     Ok(())
@@ -1898,7 +1898,7 @@ impl HostsApp {
                     self.vault_session = session;
                     self.vault_state = Some(VaultState::Unlocked);
                 }
-                if let Some(manager) = self.credential_manager.as_mut() {
+                if let Some(manager) = self.credential_services.as_mut() {
                     manager.session = self.vault_session.as_ref().map(copy_key);
                 }
                 match then {
@@ -1911,13 +1911,13 @@ impl HostsApp {
         }
     }
 
-    fn credential_manager_dialog(&mut self, context: &egui::Context) {
-        self.poll_credential_manager();
+    fn credential_services_dialog(&mut self, context: &egui::Context) {
+        self.poll_credential_services();
         let catalog = self.catalog.clone();
         let settings = self.store.bitwarden.clone();
         let hosts = self.store.hosts.clone();
         let mut enabled = settings.enabled;
-        let Some(manager) = self.credential_manager.as_mut() else {
+        let Some(manager) = self.credential_services.as_mut() else {
             return;
         };
         let mut action = None;
@@ -1931,9 +1931,9 @@ impl HostsApp {
         } else if manager.view == ManagerView::Bitwarden {
             "Bitwarden"
         } else {
-            catalog.text("credential_manager")
+            catalog.text("credential_services")
         };
-        dialog_shell(context, "credential_manager", 760.0, title, |ui| {
+        dialog_shell(context, "credential_services", 760.0, title, |ui| {
             if let Some(wizard) = manager.wizard.as_mut() {
                 action = wizard_body(ui, &catalog, wizard);
                 return;
@@ -1982,7 +1982,7 @@ impl HostsApp {
     }
 
     /// Closes the credential-services dialog, whichever page it shows.
-    pub(super) fn close_credential_manager(&mut self) {
+    pub(super) fn close_credential_services(&mut self) {
         self.onepassword.close();
         self.manager_act(ManagerAction::Close);
     }
@@ -2013,7 +2013,7 @@ fn services_overview(
     settings: &BitwardenSettings,
     hosts: &[crate::model::HostProfile],
     enabled: &mut bool,
-    manager: &mut CredentialManager,
+    manager: &mut CredentialServices,
     action: &mut Option<ManagerAction>,
 ) {
     ui.set_max_width(SETTINGS_WIDTH);
@@ -2109,7 +2109,7 @@ fn bitwarden_page(
     catalog: &Catalog,
     settings: &BitwardenSettings,
     hosts: &[crate::model::HostProfile],
-    manager: &mut CredentialManager,
+    manager: &mut CredentialServices,
     action: &mut Option<ManagerAction>,
 ) {
     ui.horizontal(|ui| {
@@ -2155,7 +2155,7 @@ fn account_tab(
     ui: &mut egui::Ui,
     catalog: &Catalog,
     settings: &BitwardenSettings,
-    manager: &mut CredentialManager,
+    manager: &mut CredentialServices,
     action: &mut Option<ManagerAction>,
 ) {
     let Some(profile) = settings
@@ -2477,7 +2477,7 @@ fn settings_tab(
     ui: &mut egui::Ui,
     catalog: &Catalog,
     settings: &BitwardenSettings,
-    manager: &mut CredentialManager,
+    manager: &mut CredentialServices,
     action: &mut Option<ManagerAction>,
 ) {
     // Long hints wrap inside the dialog instead of widening it.
@@ -2557,7 +2557,7 @@ fn items_tab(
     catalog: &Catalog,
     settings: &BitwardenSettings,
     hosts: &[crate::model::HostProfile],
-    manager: &mut CredentialManager,
+    manager: &mut CredentialServices,
     action: &mut Option<ManagerAction>,
 ) {
     if !settings.available() {
@@ -3374,7 +3374,7 @@ mod tests {
             }),
             ..BitwardenSettings::default()
         };
-        let mut manager = CredentialManager {
+        let mut manager = CredentialServices {
             view: ManagerView::Bitwarden,
             tab: ManagerTab::Account,
             status: None,
@@ -3443,7 +3443,7 @@ mod tests {
         session::store(&profile, &SessionKey::new("kept".into())).unwrap();
         app.vault_session = Some(SessionKey::new("kept".into()));
         app.vault_state = Some(VaultState::Unlocked);
-        app.credential_manager = Some(CredentialManager {
+        app.credential_services = Some(CredentialServices {
             view: ManagerView::Bitwarden,
             tab: ManagerTab::Settings,
             status: None,
@@ -3483,7 +3483,7 @@ mod tests {
         assert!(app.vault_session.is_none());
         assert_eq!(app.vault_state, Some(VaultState::Locked));
         assert!(
-            app.credential_manager
+            app.credential_services
                 .as_ref()
                 .is_some_and(|manager| manager.session.is_none()),
             "the dialog drops its copy too"

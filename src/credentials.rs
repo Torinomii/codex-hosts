@@ -4,7 +4,6 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const SERVICE: &str = "Codex Hosts";
-const LEGACY_SERVICE: &str = "Codex Remote GUI";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialKind {
@@ -50,9 +49,6 @@ pub fn store(id: Uuid, kind: CredentialKind, secret: &str) -> Result<(), Credent
 pub fn load(id: Uuid, kind: CredentialKind) -> Result<Option<Zeroizing<String>>, CredentialError> {
     match entry(id, kind)?.get_password() {
         Ok(secret) => Ok(Some(Zeroizing::new(secret))),
-        Err(KeyringError::NoEntry) if kind == CredentialKind::Password => {
-            load_and_migrate_legacy_password(id)
-        }
         Err(KeyringError::NoEntry) => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -217,11 +213,6 @@ fn transact(
 }
 
 pub fn delete(id: Uuid, kind: CredentialKind) -> Result<(), CredentialError> {
-    // Remove the migration source first: a deleted current password must never
-    // become eligible for legacy recovery on the next read.
-    if kind == CredentialKind::Password {
-        delete_entry(Entry::new(LEGACY_SERVICE, &id.to_string())?)?;
-    }
     delete_entry(entry(id, kind)?)
 }
 
@@ -237,22 +228,6 @@ fn entry(id: Uuid, kind: CredentialKind) -> Result<Entry, CredentialError> {
         SERVICE,
         &format!("{}:{}", id, kind.account_suffix()),
     )?)
-}
-
-fn load_and_migrate_legacy_password(
-    id: Uuid,
-) -> Result<Option<Zeroizing<String>>, CredentialError> {
-    let legacy = Entry::new(LEGACY_SERVICE, &id.to_string())?;
-    match legacy.get_password() {
-        Ok(secret) => {
-            let secret = Zeroizing::new(secret);
-            entry(id, CredentialKind::Password)?.set_password(secret.as_str())?;
-            delete_entry(legacy)?;
-            Ok(Some(secret))
-        }
-        Err(KeyringError::NoEntry) => Ok(None),
-        Err(error) => Err(error.into()),
-    }
 }
 
 #[derive(Debug, Error)]

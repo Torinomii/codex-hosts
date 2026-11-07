@@ -18,7 +18,7 @@ The fixed launcher requires `/usr/bin/sudo`, `/bin/sh`, and sudoers permission t
 
 The launch protocol sends READY, waits for the client's matching non-secret acknowledgment, then starts caller code with stdin closed. A bare EOF after cancellation cannot authorize that start. NOPASSWD and timestamp hits never load or send a password. After READY, target output cannot trigger password injection. Nonzero target exit codes remain `remote_error`; a failure to observe READY, a timeout or cancellation does not prove the command did not execute. Never replay an operation automatically.
 
-`user` is required on every call, including root execution. Advanced stores authentication settings and optional passwords, not execution targets. Existing JSON `default_user` values are ignored and omitted on save; existing credential IDs and secret slots remain. Older calls omitting `user` fail validation without execution. The GUI has no dedicated sudo/su save-and-test buttons or target dialog; ordinary connection tests are unchanged.
+`user` is required on every call, including root execution. Advanced stores authentication settings and optional passwords, not execution targets; a call omitting `user` fails validation without execution. The GUI has no dedicated sudo/su save-and-test buttons or target dialog; ordinary connection tests are unchanged.
 
 If the target or an SSH jump host has `require_call_approval:true`, the user must approve the complete call before connection. This applies even to passwordless sudo and is independent of `sudo_enabled`. Approval does not trust a host key or override remote sudoers policy. Read [approvals.md](approvals.md); never approve your own request or automatically resubmit after a denial.
 
