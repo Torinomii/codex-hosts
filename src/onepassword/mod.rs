@@ -141,11 +141,10 @@ impl<R: OpRunner> Op<R> {
                     .get_item(item_id)
                     .await
                     .map_err(|error| failure(error, alias))?;
-                if !write.expected_revision.is_empty()
-                    && current.summary().version.to_string() != write.expected_revision
-                {
-                    return Err(WriteFailure::Conflict);
-                }
+                vault_hosts::check_revision(
+                    &write.expected_revision,
+                    Some(&current.summary().version.to_string()),
+                )?;
                 let json = current
                     .patched(&fields)
                     .map_err(|error| failure(error, alias))?;

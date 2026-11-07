@@ -1,7 +1,8 @@
 //! Bitwarden in the window: the credential-services dialog (account setup
-//! wizard, vault status, the folder's items, settings), the jobs that keep
-//! vault-backed hosts in step with the folder (refresh, save, delete), and
-//! the master-password prompt. Every `bw` call runs on a worker thread with
+//! wizard, vault status, the folder's items, settings), the window's vault
+//! jobs (the folder refresh here; saves, deletes and transfers for every
+//! password manager through [`super::vaults`]), and the master-password
+//! prompt. Every `bw` call runs on a worker thread with
 //! its own runtime; the window only polls for results, so it never blocks on
 //! the CLI. Master passwords live in these structs as zeroizing strings for
 //! exactly as long as a dialog needs them.
@@ -22,8 +23,8 @@ use super::dialogs::dialog_shell;
 use super::host_list::HostGroup;
 use super::theme;
 use super::transfer::{self, TransferReport, TransferRequest};
+use super::vaults::{VaultAccess, Vaults, vaults_job};
 use super::{EditorSwitch, HostsApp};
-use crate::bitwarden::hosts;
 use crate::bitwarden::vault::LoginStep;
 use crate::bitwarden::{Account, Vault, VaultError, session};
 use crate::i18n::Catalog;
@@ -60,7 +61,7 @@ pub(super) fn explain(catalog: &Catalog, error: &VaultError) -> String {
     catalog.text(key).to_owned()
 }
 
-fn explain_remote(catalog: &Catalog, error: &RemoteFailure) -> String {
+pub(super) fn explain_remote(catalog: &Catalog, error: &RemoteFailure) -> String {
     if let Some(text) = super::onepassword::explain_code(catalog, error) {
         return text;
     }
@@ -240,7 +241,7 @@ fn copy_key(key: &SessionKey) -> SessionKey {
 
 /// The session a dialog holds in memory, else the stored one; otherwise a
 /// vault error the caller words as "locked".
-fn unlocked(account: &Account, memory: Option<SessionKey>) -> JobResult<Vault> {
+pub(super) fn unlocked(account: &Account, memory: Option<SessionKey>) -> JobResult<Vault> {
     if let Some(key) = memory {
         return Ok(account.vault(Some(key)));
     }
@@ -262,86 +263,17 @@ fn unlock_and_store(account: &Account, password: &MasterPassword) -> JobResult<V
     Ok(vault)
 }
 
-fn sync_if_stale(account: &Account, vault: &mut Vault, max_age_seconds: u64) -> JobResult<()> {
+pub(super) fn sync_if_stale(
+    account: &Account,
+    vault: &mut Vault,
+    max_age_seconds: u64,
+) -> JobResult<()> {
     if session::sync_is_fresh(account.id(), max_age_seconds) {
         return Ok(());
     }
     block_on(vault.sync())??;
     session::mark_synced(account.id())?;
     Ok(())
-}
-
-/// The JSON of a new host item: a Login item in the folder with the host
-/// URI and the codex-hosts fields.
-fn host_item_json(write: &HostWrite, folder: Option<Uuid>) -> Zeroizing<Vec<u8>> {
-    let password = match &write.password {
-        FieldEdit::Set(password) => serde_json::Value::String(password.as_str().to_owned()),
-        FieldEdit::Keep | FieldEdit::Clear => serde_json::Value::Null,
-    };
-    let item = serde_json::json!({
-        "type": 1,
-        "name": write.name,
-        "notes": null,
-        "favorite": false,
-        "reprompt": 0,
-        "folderId": folder,
-        "fields": write.codex_fields().iter().map(|(key, value)| serde_json::json!({
-            "name": format!("{}{key}", codex_hosts_bw::CODEX_FIELD_PREFIX),
-            "value": value,
-            "type": 0,
-            "linkedId": null,
-        })).collect::<Vec<_>>(),
-        "login": {
-            "username": write.username,
-            "password": password,
-            "uris": [{ "match": null, "uri": write.host_uri }]
-        }
-    });
-    Zeroizing::new(item.to_string().into_bytes())
-}
-
-/// Writes a host into its Bitwarden item, or creates the item in `folder`;
-/// an item changed since the write's revision is left alone.
-fn save_bitwarden_item(
-    vault: &mut Vault,
-    write: HostWrite,
-    folder: Option<Uuid>,
-) -> JobResult<(ItemKey, HostFacts)> {
-    let item = match write.item_id {
-        None => block_on(vault.create_item(host_item_json(&write, folder)))??,
-        Some(id) => {
-            let current = block_on(vault.get_item(id))??;
-            if !write.expected_revision.is_empty()
-                && current.changed_since(&write.expected_revision)
-            {
-                return Err(JobError::Conflict);
-            }
-            let fields = write.codex_fields();
-            let name = write.name.trim().to_owned();
-            let HostWrite {
-                username,
-                password,
-                host_uri,
-                ..
-            } = write;
-            let summary = current.summary();
-            let patch = LoginPatch {
-                name: (name != summary.name).then_some(name),
-                username: if Some(username.as_str()) == summary.username.as_deref() {
-                    FieldEdit::Keep
-                } else {
-                    FieldEdit::Set(username)
-                },
-                password,
-                host_uri: Some(host_uri),
-                codex_fields: Some(fields),
-            };
-            let json = current.apply_login_patch(&patch)?;
-            block_on(vault.edit_item(id, json))??
-        }
-    };
-    let facts = hosts::facts(item.summary()).map_err(JobError::Problem)?;
-    Ok((ItemKey::bitwarden(item.summary().id), facts))
 }
 
 // ---------------------------------------------------------------------------
@@ -379,128 +311,6 @@ impl From<vault_hosts::WriteFailure> for JobError {
             vault_hosts::WriteFailure::Problem(problem) => Self::Problem(problem),
             vault_hosts::WriteFailure::Remote(error) => Self::Remote(error),
         }
-    }
-}
-
-/// Runs a 1Password write on a worker; `op` itself waits for the app's
-/// prompt, so there is no unlock step to come back to.
-fn onepassword_job(
-    reporter: &Reporter,
-    work: impl FnOnce() -> JobResult<VaultOutcome> + Send + 'static,
-) -> Job<Result<VaultOutcome, JobError>> {
-    spawn_job(reporter.repaint.clone(), move || Ok(work()))
-}
-
-/// What a worker needs to open the Bitwarden vault the window uses.
-struct VaultAccess {
-    settings: BitwardenSettings,
-    memory: Option<SessionKey>,
-    max_age: u64,
-    folder: Option<Uuid>,
-}
-
-impl VaultAccess {
-    /// The password managers for one job; Bitwarden is unlocked (and synced
-    /// per the window) only when the job touches it. The inner error is a
-    /// lock the window can ask about.
-    fn open(
-        self,
-        with_bitwarden: bool,
-        catalog: &Catalog,
-    ) -> Result<JobResult<LiveVaults>, String> {
-        let mut vaults = LiveVaults { bitwarden: None };
-        if with_bitwarden {
-            let account = Account::from_settings(&self.settings)
-                .map_err(|error| explain_remote(catalog, &error))?;
-            let opened = unlocked(&account, self.memory).and_then(|mut vault| {
-                sync_if_stale(&account, &mut vault, self.max_age)?;
-                Ok(vault)
-            });
-            match opened {
-                Ok(vault) => vaults.bitwarden = Some((vault, self.folder)),
-                Err(error) => return Ok(Err(error)),
-            }
-        }
-        Ok(Ok(vaults))
-    }
-}
-
-/// The password managers as a transfer job reaches them: Bitwarden through
-/// the vault the job unlocked, 1Password through `op` and its own gate.
-struct LiveVaults {
-    /// The unlocked vault and the hosts folder, when the job touches
-    /// Bitwarden.
-    bitwarden: Option<(Vault, Option<Uuid>)>,
-}
-
-impl LiveVaults {
-    fn bitwarden(&mut self) -> JobResult<(&mut Vault, Option<Uuid>)> {
-        match self.bitwarden.as_mut() {
-            Some((vault, folder)) => Ok((vault, *folder)),
-            None => Err(JobError::Vault(VaultError::Locked)),
-        }
-    }
-}
-
-impl transfer::Vaults for LiveVaults {
-    fn read_password(&mut self, host: &HostProfile) -> JobResult<Option<Zeroizing<String>>> {
-        let Some(item) = host.vault() else {
-            return Ok(None);
-        };
-        match item.provider {
-            VaultProvider::Bitwarden => {
-                let (vault, _) = self.bitwarden()?;
-                match block_on(vault.resolve_password(item.item_id, Some(host.username.trim())))? {
-                    Ok(resolved) => Ok(Some(resolved.password)),
-                    Err(VaultError::PasswordMissing) => Ok(None),
-                    Err(error) => Err(error.into()),
-                }
-            }
-            VaultProvider::OnePassword => Ok(block_on(crate::onepassword::login_password(host))??),
-        }
-    }
-
-    fn list(&mut self, provider: VaultProvider) -> JobResult<Vec<(ItemKey, HostFacts)>> {
-        match provider {
-            VaultProvider::Bitwarden => {
-                let (vault, folder) = self.bitwarden()?;
-                let items = block_on(vault.list_items(folder))??;
-                Ok(items
-                    .iter()
-                    .filter(|item| item.folder_id == folder && item.deleted_date.is_none())
-                    .filter_map(|item| {
-                        hosts::facts(item)
-                            .ok()
-                            .map(|facts| (ItemKey::bitwarden(item.id), facts))
-                    })
-                    .collect())
-            }
-            VaultProvider::OnePassword => Ok(block_on(crate::onepassword::list_hosts())??),
-        }
-    }
-
-    fn save(&mut self, write: HostWrite) -> JobResult<(ItemKey, HostFacts)> {
-        match write.provider {
-            VaultProvider::Bitwarden => {
-                let (vault, folder) = self.bitwarden()?;
-                save_bitwarden_item(vault, write, folder)
-            }
-            VaultProvider::OnePassword => Ok(block_on(crate::onepassword::save_item(&write))??),
-        }
-    }
-
-    fn remove(&mut self, host: &HostProfile) -> JobResult<()> {
-        let Some(item) = host.vault() else {
-            return Ok(());
-        };
-        match item.provider {
-            VaultProvider::Bitwarden => {
-                let (vault, _) = self.bitwarden()?;
-                block_on(vault.delete_item(item.item_id))??;
-            }
-            VaultProvider::OnePassword => block_on(crate::onepassword::archive_item(host))??,
-        }
-        Ok(())
     }
 }
 
@@ -601,137 +411,127 @@ impl HostsApp {
         }
         let settings = self.store.bitwarden.clone();
         let reporter = self.reporter();
-        let memory = self.vault_session.as_ref().map(copy_key);
-        let max_age = settings.sync_max_age_seconds;
-        let folder = settings
-            .profile
-            .as_ref()
-            .and_then(|profile| profile.folder_id);
-        // A 1Password host is archived through `op`, not `bw`.
-        let onepassword_host = match &task {
-            VaultTask::Delete(id) => self
-                .store
-                .hosts
-                .iter()
-                .find(|host| {
-                    host.id == *id && host.vault_provider() == Some(VaultProvider::OnePassword)
-                })
-                .cloned(),
-            _ => None,
+        let access = VaultAccess {
+            memory: self.vault_session.as_ref().map(copy_key),
+            max_age: settings.sync_max_age_seconds,
+            folder: settings
+                .profile
+                .as_ref()
+                .and_then(|profile| profile.folder_id),
+            settings,
         };
-        let (kind, job, provider) = match (task, onepassword_host) {
-            (VaultTask::Save(write), _) if write.provider == VaultProvider::OnePassword => (
-                VaultTaskKind::Save(write.clone_without_password()),
-                onepassword_job(&reporter, move || {
-                    let (key, facts) = block_on(crate::onepassword::save_item(&write))??;
-                    Ok(VaultOutcome::Saved { key, facts })
-                }),
-                VaultProvider::OnePassword,
-            ),
-            (VaultTask::Delete(id), Some(host)) => (
-                VaultTaskKind::Delete(id),
-                onepassword_job(&reporter, move || {
-                    block_on(crate::onepassword::archive_item(&host))??;
-                    Ok(VaultOutcome::Deleted(id))
-                }),
-                VaultProvider::OnePassword,
-            ),
-            (VaultTask::Transfer(request), _) => {
-                let with_bitwarden = request.involves(VaultProvider::Bitwarden);
-                let provider = if with_bitwarden || !request.involves(VaultProvider::OnePassword) {
-                    VaultProvider::Bitwarden
-                } else {
-                    VaultProvider::OnePassword
-                };
-                let catalog = reporter.catalog.clone();
-                let access = VaultAccess {
+        let (repaint, catalog) = (reporter.repaint.clone(), reporter.catalog.clone());
+        // Every task but the Bitwarden refresh goes through the one
+        // password-manager interface, whichever provider holds the items.
+        let (kind, job, provider) = match task {
+            VaultTask::Refresh { quiet } => {
+                let VaultAccess {
                     settings,
                     memory,
                     max_age,
-                    folder,
+                    ..
+                } = access;
+                (
+                    VaultTaskKind::Refresh { quiet },
+                    vault_job(&reporter, settings, move |account| {
+                        let mut vault = if quiet {
+                            let key = match memory {
+                                Some(key) => Some(key),
+                                None => session::load_non_consuming(&account.profile)?,
+                            };
+                            account.vault(Some(key.ok_or(VaultError::Locked)?))
+                        } else {
+                            unlocked(&account, memory)?
+                        };
+                        let (result, _) = block_on(crate::bitwarden::refresh_store(
+                            &account, &mut vault, max_age,
+                        ))??;
+                        Ok(VaultOutcome::Refreshed(result))
+                    }),
+                    VaultProvider::Bitwarden,
+                )
+            }
+            VaultTask::Save(write) => {
+                let provider = write.provider;
+                (
+                    VaultTaskKind::Save(write.clone_without_password()),
+                    vaults_job(
+                        repaint,
+                        catalog,
+                        access,
+                        vec![provider],
+                        move |vaults, _| {
+                            let (key, facts) = vaults.save(write)?;
+                            Ok(VaultOutcome::Saved { key, facts })
+                        },
+                    ),
+                    provider,
+                )
+            }
+            VaultTask::Delete(id) => {
+                let Some(host) = self.store.hosts.iter().find(|host| host.id == id).cloned() else {
+                    return;
                 };
+                let provider = host.vault_provider().unwrap_or_default();
+                (
+                    VaultTaskKind::Delete(id),
+                    vaults_job(
+                        repaint,
+                        catalog,
+                        access,
+                        vec![provider],
+                        move |vaults, _| {
+                            vaults.remove(&host)?;
+                            Ok(VaultOutcome::Deleted(id))
+                        },
+                    ),
+                    provider,
+                )
+            }
+            VaultTask::Transfer(request) => {
+                let providers = [VaultProvider::Bitwarden, VaultProvider::OnePassword]
+                    .into_iter()
+                    .filter(|provider| request.involves(*provider))
+                    .collect::<Vec<_>>();
+                let provider = providers.first().copied().unwrap_or_default();
                 (
                     VaultTaskKind::Transfer(request.clone()),
-                    spawn_job(reporter.repaint.clone(), move || {
-                        let mut vaults = match access.open(with_bitwarden, &catalog)? {
-                            Ok(vaults) => vaults,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        Ok(
-                            transfer::run(&request, &mut vaults, |error| word(&catalog, error))
-                                .map(VaultOutcome::Transferred),
-                        )
-                    }),
+                    vaults_job(
+                        repaint,
+                        catalog,
+                        access,
+                        providers,
+                        move |vaults, catalog| {
+                            transfer::run(&request, vaults, |error| word(catalog, error))
+                                .map(VaultOutcome::Transferred)
+                        },
+                    ),
                     provider,
                 )
             }
-            (VaultTask::DeleteMany(hosts), _) => {
-                let with_bitwarden = hosts.iter().any(HostProfile::is_bitwarden_host);
-                let provider = if with_bitwarden {
-                    VaultProvider::Bitwarden
-                } else {
-                    VaultProvider::OnePassword
-                };
-                let catalog = reporter.catalog.clone();
-                let access = VaultAccess {
-                    settings,
-                    memory,
-                    max_age,
-                    folder,
-                };
+            VaultTask::DeleteMany(hosts) => {
+                let mut providers = hosts
+                    .iter()
+                    .filter_map(HostProfile::vault_provider)
+                    .collect::<Vec<_>>();
+                providers.sort_by_key(|provider| *provider != VaultProvider::Bitwarden);
+                providers.dedup();
+                let provider = providers.first().copied().unwrap_or_default();
                 (
                     VaultTaskKind::DeleteMany(hosts.clone()),
-                    spawn_job(reporter.repaint.clone(), move || {
-                        let mut vaults = match access.open(with_bitwarden, &catalog)? {
-                            Ok(vaults) => vaults,
-                            Err(error) => return Ok(Err(error)),
-                        };
-                        Ok(transfer::remove_items(&hosts, &mut vaults, |error| {
-                            word(&catalog, error)
-                        })
-                        .map(VaultOutcome::DeletedMany))
-                    }),
+                    vaults_job(
+                        repaint,
+                        catalog,
+                        access,
+                        providers,
+                        move |vaults, catalog| {
+                            transfer::remove_items(&hosts, vaults, |error| word(catalog, error))
+                                .map(VaultOutcome::DeletedMany)
+                        },
+                    ),
                     provider,
                 )
             }
-            (VaultTask::Refresh { quiet }, _) => (
-                VaultTaskKind::Refresh { quiet },
-                vault_job(&reporter, settings, move |account| {
-                    let mut vault = if quiet {
-                        let key = match memory {
-                            Some(key) => Some(key),
-                            None => session::load_non_consuming(&account.profile)?,
-                        };
-                        account.vault(Some(key.ok_or(VaultError::Locked)?))
-                    } else {
-                        unlocked(&account, memory)?
-                    };
-                    let (result, _) = block_on(crate::bitwarden::refresh_store(
-                        &account, &mut vault, max_age,
-                    ))??;
-                    Ok(VaultOutcome::Refreshed(result))
-                }),
-                VaultProvider::Bitwarden,
-            ),
-            (VaultTask::Save(write), _) => (
-                VaultTaskKind::Save(write.clone_without_password()),
-                vault_job(&reporter, settings, move |account| {
-                    let mut vault = unlocked(&account, memory)?;
-                    sync_if_stale(&account, &mut vault, max_age)?;
-                    let (key, facts) = save_bitwarden_item(&mut vault, write, folder)?;
-                    Ok(VaultOutcome::Saved { key, facts })
-                }),
-                VaultProvider::Bitwarden,
-            ),
-            (VaultTask::Delete(item_id), None) => (
-                VaultTaskKind::Delete(item_id),
-                vault_job(&reporter, settings, move |account| {
-                    let mut vault = unlocked(&account, memory)?;
-                    block_on(vault.delete_item(item_id))??;
-                    Ok(VaultOutcome::Deleted(item_id))
-                }),
-                VaultProvider::Bitwarden,
-            ),
         };
         self.vault_job = Some(VaultJob {
             kind,
@@ -3348,34 +3148,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_host_item_carries_the_uri_the_fields_and_the_folder() {
-        let write = HostWrite {
-            provider: VaultProvider::Bitwarden,
-            item_id: None,
-            external_id: None,
-            name: "build-box".to_owned(),
-            host_uri: "ssh://10.0.0.5:2222".to_owned(),
-            username: "deploy".to_owned(),
-            password: FieldEdit::Set(Zeroizing::new("pw".to_owned())),
-            description: " front door ".to_owned(),
-            tags: vec!["prod".to_owned(), "web".to_owned()],
-            expected_revision: String::new(),
-        };
-        let folder = Uuid::from_u128(7);
-        let json: serde_json::Value =
-            serde_json::from_slice(&host_item_json(&write, Some(folder))).unwrap();
-        assert_eq!(json["type"], 1);
-        assert_eq!(json["name"], "build-box");
-        assert_eq!(json["folderId"], folder.to_string());
-        assert_eq!(json["login"]["username"], "deploy");
-        assert_eq!(json["login"]["password"], "pw");
-        assert_eq!(json["login"]["uris"][0]["uri"], "ssh://10.0.0.5:2222");
-        let fields = json["fields"].as_array().unwrap();
-        assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0]["name"], "codex-hosts:description");
-        assert_eq!(fields[0]["value"], "front door");
-        assert_eq!(fields[1]["name"], "codex-hosts:tags");
-        assert_eq!(fields[1]["value"], "prod, web");
+    fn the_sync_window_reads_as_a_limit() {
         assert_eq!(
             sync_window_label(&Catalog::for_locale(Some("en")), 300),
             "At most every 5 minutes"

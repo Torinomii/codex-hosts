@@ -181,13 +181,103 @@ impl From<RemoteFailure> for WriteFailure {
     }
 }
 
+/// The check every password manager makes before it writes an item: one
+/// whose revision is not the one the editor read was changed elsewhere
+/// meanwhile. A write that read nothing (`expected` empty) creates or
+/// replaces without asking. This is a pre-write check, not an atomic
+/// compare-and-swap.
+pub(crate) fn check_revision(expected: &str, current: Option<&str>) -> Result<(), WriteFailure> {
+    if expected.is_empty() || current.is_some_and(|current| same_revision(current, expected)) {
+        Ok(())
+    } else {
+        Err(WriteFailure::Conflict)
+    }
+}
+
+/// How far apart two readings of one revision time can be. A server may
+/// answer a write with the time it set and keep that time rounded to its
+/// database's precision (Bitwarden on SQL Server keeps 1/300 s), so the
+/// revision a write returned and the one a later read shows can differ by
+/// a few milliseconds while naming the same change; another client's
+/// change lands much later.
+const SAME_REVISION_MILLIS: i64 = 10;
+
+/// Whether two readings of an item's revision name the same change, for
+/// any password manager: equal, or two UTC times (`2026-11-07T12:35:03.9233333Z`)
+/// a few milliseconds apart. Counters such as 1Password's versions compare
+/// as they are.
+pub(crate) fn same_revision(current: &str, expected: &str) -> bool {
+    current == expected
+        || matches!(
+            (revision_millis(current), revision_millis(expected)),
+            (Some(current), Some(expected)) if (current - expected).abs() <= SAME_REVISION_MILLIS
+        )
+}
+
+/// Milliseconds since 1970 of a UTC time written as
+/// `YYYY-MM-DDTHH:MM:SS[.fraction]Z`; `None` for any other text.
+fn revision_millis(text: &str) -> Option<i64> {
+    fn number(text: &str, digits: usize) -> Option<i64> {
+        (text.len() == digits && text.bytes().all(|byte| byte.is_ascii_digit()))
+            .then(|| text.parse().ok())
+            .flatten()
+    }
+    let (date, time) = text.strip_suffix('Z')?.split_once('T')?;
+    let mut date = date.split('-');
+    let (year, month, day) = (
+        number(date.next()?, 4)?,
+        number(date.next()?, 2)?,
+        number(date.next()?, 2)?,
+    );
+    let (clock, fraction) = time.split_once('.').unwrap_or((time, "0"));
+    let mut clock = clock.split(':');
+    let (hour, minute, second) = (
+        number(clock.next()?, 2)?,
+        number(clock.next()?, 2)?,
+        number(clock.next()?, 2)?,
+    );
+    if date.next().is_some()
+        || clock.next().is_some()
+        || !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+        || fraction.is_empty()
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let millis = format!("{fraction:0<3}")[..3].parse::<i64>().ok()?;
+    // Days from 1970-01-01 to the civil date (Howard Hinnant's algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    Some((((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis)
+}
+
 /// Writes the facts into a mirror profile; local state (including the SSH
 /// authentication method: a vault host may log in with a local key or the
 /// agent, the item password serves password logins) is untouched. A changed
 /// endpoint drops the host-key trust, as the editor does, so the next
-/// connection verifies the new server afresh.
+/// connection verifies the new server afresh. A revision that names the
+/// change the mirror already holds ([`same_revision`]) stays as it is, so
+/// the form the user has open still matches the stored host.
 pub(crate) fn apply(facts: &HostFacts, item: &ItemKey, host: &mut HostProfile) -> bool {
     let before = host.clone();
+    let revision = match host.vault.as_ref() {
+        Some(held)
+            if held.provider == item.provider
+                && held.item_id == item.id
+                && same_revision(&facts.revision, &held.revision_date) =>
+        {
+            held.revision_date.clone()
+        }
+        _ => facts.revision.clone(),
+    };
     let endpoint_changed = host.address.trim() != facts.address
         || host.port != facts.port
         || host.protocol != facts.protocol;
@@ -204,7 +294,7 @@ pub(crate) fn apply(facts: &HostFacts, item: &ItemKey, host: &mut HostProfile) -
         item_id: item.id,
         external_id: item.external_id.clone(),
         item_name: facts.alias.clone(),
-        revision_date: facts.revision.clone(),
+        revision_date: revision,
     });
     if endpoint_changed {
         host.host_fingerprint = None;
@@ -620,5 +710,89 @@ mod tests {
         assert!(apply(&facts("box", "10.0.0.6"), &item, &mut host));
         assert!(!host.verified && host.host_fingerprint.is_none());
         assert!(host.advanced.require_call_approval);
+    }
+
+    #[test]
+    fn a_revision_is_the_same_after_the_server_rounds_it() {
+        assert_eq!(revision_millis("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            revision_millis("2000-03-01T00:00:01.5Z"),
+            Some(951_868_801_500)
+        );
+        // A write's reply and the next read of the same edit.
+        assert!(same_revision(
+            "2026-11-07T12:35:03.9233333Z",
+            "2026-11-07T12:35:03.922Z"
+        ));
+        assert!(same_revision(
+            "2026-11-07T12:00:14.88Z",
+            "2026-11-07T12:00:14.879Z"
+        ));
+        assert!(!same_revision(
+            "2026-11-07T12:35:04.9233333Z",
+            "2026-11-07T12:35:03.922Z"
+        ));
+        // Counters compare as they are.
+        assert!(same_revision("7", "7"));
+        assert!(!same_revision("8", "7"));
+        for odd in [
+            "",
+            "7",
+            "2026-11-07 12:35:03Z",
+            "2026-11-07T12:35:03",
+            "2026-13-07T12:35:03Z",
+            "2026-11-07T12:35:03.Z",
+            "2026-11-07T12:35:03.9x3Z",
+            "+026-11-07T12:35:03Z",
+        ] {
+            assert_eq!(revision_millis(odd), None, "{odd}");
+        }
+    }
+
+    #[test]
+    fn every_provider_writes_only_over_the_revision_it_read() {
+        assert!(
+            check_revision("", None).is_ok(),
+            "a write that read nothing"
+        );
+        assert!(check_revision("7", Some("7")).is_ok());
+        assert!(matches!(
+            check_revision("7", Some("8")),
+            Err(WriteFailure::Conflict)
+        ));
+        assert!(matches!(
+            check_revision("7", None),
+            Err(WriteFailure::Conflict)
+        ));
+        assert!(
+            check_revision("2026-11-07T12:35:03.922Z", Some("2026-11-07T12:35:03.923Z")).is_ok()
+        );
+        assert!(matches!(
+            check_revision("2026-11-07T12:35:03.922Z", Some("2026-11-07T12:36:00.000Z")),
+            Err(WriteFailure::Conflict)
+        ));
+    }
+
+    #[test]
+    fn a_rounded_revision_leaves_the_mirror_as_it_is() {
+        let written = HostFacts {
+            revision: "2026-11-07T12:35:03.922Z".to_owned(),
+            ..facts("box", "10.0.0.5")
+        };
+        let read = HostFacts {
+            revision: "2026-11-07T12:35:03.923Z".to_owned(),
+            ..written.clone()
+        };
+        let item = ItemKey::bitwarden(Uuid::from_u128(9));
+        let mut host = mirror(&written, &item);
+        assert!(!apply(&read, &item, &mut host));
+        assert_eq!(host.vault.as_ref().unwrap().revision_date, written.revision);
+
+        let later = HostFacts {
+            revision: "2026-11-07T12:40:00.000Z".to_owned(),
+            ..written.clone()
+        };
+        assert!(apply(&later, &item, &mut host));
+        assert_eq!(host.vault.as_ref().unwrap().revision_date, later.revision);
     }
 }

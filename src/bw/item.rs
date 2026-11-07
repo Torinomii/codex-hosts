@@ -315,12 +315,6 @@ impl VaultItem {
             .ok_or(VaultParseError::MissingRevision)
     }
 
-    /// Whether another client changed the item since `baseline_revision`
-    /// was read. This is a pre-write check, not an atomic compare-and-swap.
-    pub fn changed_since(&self, baseline_revision: &str) -> bool {
-        self.summary.revision_date.as_deref() != Some(baseline_revision)
-    }
-
     /// The Login password, if the item is a Login and has one.
     pub fn login_password(&self) -> Result<Option<Zeroizing<String>>, VaultParseError> {
         self.expect_kind(ItemKind::Login)?;
@@ -521,8 +515,6 @@ mod tests {
         assert_eq!(item.summary().name, "build-box ssh");
         assert!(!item.is_deleted());
         assert_eq!(item.revision_date().unwrap(), "2026-11-02T01:00:00.000Z");
-        assert!(!item.changed_since("2026-11-02T01:00:00.000Z"));
-        assert!(item.changed_since("2026-10-31T00:00:00.000Z"));
         assert_eq!(
             item.login_password().unwrap().unwrap().as_str(),
             "s3cr3t-pw"
@@ -706,6 +698,5 @@ mod tests {
             no_revision.apply_login_patch(&LoginPatch::default()),
             Err(VaultParseError::MissingRevision)
         ));
-        assert!(no_revision.changed_since("anything"));
     }
 }

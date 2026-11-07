@@ -24,6 +24,7 @@ mod status;
 pub(crate) mod theme;
 mod toolbar;
 mod transfer;
+mod vaults;
 
 pub(crate) use theme::{configure_fonts, forget_password_history};
 
@@ -150,6 +151,9 @@ struct SavePlan {
     invalidate_test_state: bool,
     /// A vault draft: the profile is added to the store instead of replaced.
     is_new: bool,
+    /// "Test connection" asked for the save: the test runs once the item
+    /// write lands.
+    then_test: bool,
 }
 
 #[derive(Default)]
@@ -1124,6 +1128,7 @@ impl HostsApp {
             clear_login_password,
             invalidate_test_state,
             is_new: editor.draft,
+            then_test: false,
         })
     }
 
@@ -1160,6 +1165,7 @@ impl HostsApp {
             clear_login_password,
             invalidate_test_state,
             is_new,
+            then_test: _,
         } = plan;
         let mut updated_store = self.store.clone();
         if is_new {
@@ -1309,8 +1315,15 @@ impl HostsApp {
         }
         crate::vault_hosts::apply(facts, key, &mut plan.profile);
         let saved_alias = plan.profile.alias.clone();
+        let then_test = plan.then_test;
         let group = services::HostGroup::of_provider(Some(key.provider));
         match self.commit_editor_save(plan) {
+            Ok(()) if then_test => {
+                if let Some(id) = self.editor.as_ref().map(|editor| editor.profile.id) {
+                    self.start_test_host(id);
+                    self.set_status_key("testing");
+                }
+            }
             Ok(()) => {
                 self.set_vault_status(group, |texts| texts.saved);
                 if self.launch.codex_edit {
@@ -1499,9 +1512,29 @@ impl HostsApp {
         if self.ask_persistence_confirmation(PendingAction::Test) {
             return;
         }
-        match self.persist_editor() {
+        // A vault host with nothing to save is tested as stored: writing
+        // the unchanged item would only cost a round of password-manager
+        // calls before the test. One being written is tested after it.
+        let (saving, unchanged_vault_host) =
+            self.editor.as_ref().map_or((false, false), |editor| {
+                (
+                    editor.saving,
+                    editor.is_vault_host() && !editor.has_unsaved_changes(),
+                )
+            });
+        let saved = if saving && self.pending_vault_save.is_some() {
+            Ok(false)
+        } else if unchanged_vault_host {
+            self.refresh_hosts().map(|()| true)
+        } else {
+            self.persist_editor()
+        };
+        match saved {
             Ok(true) => {}
             Ok(false) => {
+                if let Some(plan) = self.pending_vault_save.as_mut() {
+                    plan.then_test = true;
+                }
                 self.set_vault_status(self.editor_group(), |texts| texts.saving);
                 return;
             }

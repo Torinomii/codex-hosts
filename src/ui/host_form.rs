@@ -2369,6 +2369,69 @@ mod tests {
     }
 
     #[test]
+    fn testing_a_vault_host_writes_only_a_changed_form_and_tests_after_the_write() {
+        if !in_isolated_store(
+            "ui::host_form::tests::testing_a_vault_host_writes_only_a_changed_form_and_tests_after_the_write",
+        ) {
+            return;
+        }
+        let _guard = crate::credentials::test_lock();
+        let context = egui::Context::default();
+        theme::configure_fonts(&context, "en");
+        let mut profile = vault_profile();
+        // Nothing listens here, so the probe ends at once.
+        profile.address = "127.0.0.1".into();
+        profile.port = 1;
+        let mut app = metadata_test_app(&context, "en", profile);
+        app.store.bitwarden.enabled = true;
+        app.store.bitwarden.cli_path = Some(std::path::PathBuf::from("C:/missing/bw.exe"));
+        app.store.bitwarden.profile = Some(crate::model::BitwardenProfile::default());
+        app.store.save().unwrap();
+        let id = app.store.hosts[0].id;
+        app.editor = Some(HostEditor::load(app.store.hosts[0].clone()));
+
+        // Unchanged: tested as stored, with no item write.
+        app.start_test();
+        assert!(app.vault_job.is_none() && app.pending_vault_save.is_none());
+        assert!(app.host_test_running(id));
+        app.test_operations.clear();
+        app.test_states.clear();
+
+        // Changed: the item is written first and the test waits for it,
+        // even when asked again meanwhile.
+        app.editor.as_mut().unwrap().profile.description = "front".into();
+        app.start_test();
+        assert!(app.vault_job.is_some());
+        assert!(!app.host_test_running(id));
+        app.start_test();
+        assert!(
+            app.pending_vault_save
+                .as_ref()
+                .is_some_and(|plan| plan.then_test)
+        );
+        assert!(!app.host_test_running(id));
+
+        app.vault_job = None;
+        let facts = crate::vault_hosts::HostFacts {
+            alias: "example".into(),
+            protocol: Protocol::Ssh,
+            address: "127.0.0.1".into(),
+            port: 1,
+            username: "deploy".into(),
+            description: "front".into(),
+            tags: Vec::new(),
+            revision: "rev-2".into(),
+        };
+        app.finish_vault_save(&crate::vault_hosts::ItemKey::bitwarden(id), &facts);
+        assert_eq!(stored_host().description, "front");
+        assert!(
+            app.host_test_running(id),
+            "the test runs once the write lands"
+        );
+        assert!(!app.editor.as_ref().unwrap().saving);
+    }
+
+    #[test]
     fn a_new_local_host_is_a_draft_until_its_first_save() {
         if !in_isolated_store(
             "ui::host_form::tests::a_new_local_host_is_a_draft_until_its_first_save",

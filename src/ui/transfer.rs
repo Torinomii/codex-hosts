@@ -21,6 +21,7 @@ use super::bitwarden::{JobError, JobResult, VaultTask};
 use super::dialogs::{dialog_button_row, dialog_shell};
 use super::services::HostGroup;
 use super::status::StatusKind;
+use super::vaults::Vaults;
 use crate::credentials::{self, CredentialKind};
 use crate::model::{HostProfile, VaultProvider, normalize_tags};
 use crate::vault_hosts::{self, HostFacts, HostWrite, ItemKey};
@@ -203,21 +204,6 @@ fn find_clash<'a>(
                 .find(|host| same_host(&host.facts, source))
                 .map(|host| (Clash::SameHost, host))
         })
-}
-
-/// What a transfer asks of the password managers. The window's worker
-/// passes the real CLIs; tests pass a fake.
-pub(super) trait Vaults {
-    /// The login password the item behind `host` holds, `None` when it has
-    /// none.
-    fn read_password(&mut self, host: &HostProfile) -> JobResult<Option<Zeroizing<String>>>;
-    /// The host items of `provider`'s folder or vault.
-    fn list(&mut self, provider: VaultProvider) -> JobResult<Vec<(ItemKey, HostFacts)>>;
-    /// Writes the item `write` names (or creates it) and reports the host
-    /// it describes now.
-    fn save(&mut self, write: HostWrite) -> JobResult<(ItemKey, HostFacts)>;
-    /// Moves the item behind `host` to its trash or archive.
-    fn remove(&mut self, host: &HostProfile) -> JobResult<()>;
 }
 
 /// One host that is now in the target store. No `Debug`: it carries the
