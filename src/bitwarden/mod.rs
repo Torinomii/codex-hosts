@@ -8,11 +8,13 @@
 //! `bw` only through the child's environment; the unlocked session key is
 //! kept in Credential Manager for as long as the re-authentication policy
 //! allows ([`session`]); the vault cache stays in the CLI's own data
-//! directory and is synced per the configured window before a host is used,
-//! so a change made elsewhere is picked up. Nothing here holds an HTTP stack
+//! directory. After a short-lived in-memory login expires, the next read
+//! syncs per the configured window. Nothing here holds an HTTP stack
 //! or a vault SDK.
 
+mod cache;
 pub(crate) mod hosts;
+pub(crate) mod probe;
 pub(crate) mod prompt;
 pub(crate) mod session;
 #[cfg(test)]
@@ -36,17 +38,25 @@ pub(crate) use vault::{RealRunner, Vault, VaultError};
 /// `bw` rewrites its data file, so calls from one process take turns.
 static CLI_GATE: Mutex<()> = Mutex::const_new(());
 
+pub(crate) fn clear_login_cache() {
+    cache::clear();
+}
+
 /// The configured account with everything a `bw` call needs.
 pub(crate) struct Account {
     pub(crate) profile: BitwardenProfile,
     exe: BwExecutable,
     data: BwProfile,
+    cache_minutes: u32,
 }
 
 impl Account {
     /// The configured account, or the reason a vault-backed host cannot be
     /// served right now.
     pub(crate) fn from_settings(settings: &BitwardenSettings) -> Result<Self, RemoteFailure> {
+        if !settings.available() {
+            cache::clear();
+        }
         if !settings.enabled {
             return Err(RemoteFailure::new(
                 "BITWARDEN_DISABLED",
@@ -71,6 +81,7 @@ impl Account {
             profile: profile.clone(),
             exe,
             data,
+            cache_minutes: settings.login_cache_minutes,
         })
     }
 
@@ -146,19 +157,36 @@ async fn ensure_fresh(
 /// asks for the master password twice under the per-call policy.
 const RECENT_SESSION_TTL: Duration = Duration::from_secs(30);
 
-static RECENT_SESSION: std::sync::Mutex<Option<(Zeroizing<String>, Instant)>> =
+static RECENT_SESSION: std::sync::Mutex<Option<(Uuid, Zeroizing<String>, Instant)>> =
     std::sync::Mutex::new(None);
 
-fn remember_session(key: &SessionKey) {
+fn remember_session(profile_id: Uuid, key: &SessionKey) {
     if let Ok(mut slot) = RECENT_SESSION.lock() {
-        *slot = Some((Zeroizing::new(key.expose().to_owned()), Instant::now()));
+        *slot = Some((
+            profile_id,
+            Zeroizing::new(key.expose().to_owned()),
+            Instant::now(),
+        ));
     }
 }
 
-fn take_recent_session() -> Option<SessionKey> {
+fn take_recent_session(profile_id: Uuid) -> Option<SessionKey> {
     let mut slot = RECENT_SESSION.lock().ok()?;
-    let (key, at) = slot.take()?;
-    (at.elapsed() <= RECENT_SESSION_TTL).then(|| SessionKey::new(key.as_str().to_owned()))
+    let (held, key, at) = slot.take()?;
+    (held == profile_id && at.elapsed() <= RECENT_SESSION_TTL)
+        .then(|| SessionKey::new(key.as_str().to_owned()))
+}
+
+/// Locking or retiring a session also erases its process-local snapshots.
+pub(super) fn clear_cached_session(profile_id: Uuid) {
+    cache::clear();
+    if let Ok(mut slot) = RECENT_SESSION.lock()
+        && slot
+            .as_ref()
+            .is_some_and(|(held, _, _)| *held == profile_id)
+    {
+        *slot = None;
+    }
 }
 
 /// Whether reading the vault now would ask for the master password: it is
@@ -166,15 +194,17 @@ fn take_recent_session() -> Option<SessionKey> {
 /// key the policy still allows is at hand. Anything unreadable counts as not
 /// due; the read itself reports it.
 pub(crate) fn unlock_due() -> bool {
-    let recent = RECENT_SESSION
-        .lock()
-        .is_ok_and(|slot| matches!(&*slot, Some((_, at)) if at.elapsed() <= RECENT_SESSION_TTL));
-    if recent {
-        return false;
-    }
     let Ok(settings) = settings() else {
         return false;
     };
+    let recent = RECENT_SESSION
+        .lock()
+        .is_ok_and(|slot| matches!(&*slot, Some((held, _, at))
+            if settings.available() && settings.profile.as_ref().is_some_and(|profile| profile.id == *held)
+                && at.elapsed() <= RECENT_SESSION_TTL));
+    if recent {
+        return false;
+    }
     match (&settings.profile, settings.available()) {
         (Some(profile), true) => matches!(session::peek(profile), Ok(false)),
         _ => false,
@@ -185,7 +215,7 @@ pub(crate) fn unlock_due() -> bool {
 /// obtained, the stored one, or the one the user creates in the codex-hosts
 /// window when the policy asks again.
 async fn unlocked_or_prompt(account: &Account) -> Result<Vault, RemoteFailure> {
-    if let Some(session) = take_recent_session() {
+    if let Some(session) = take_recent_session(account.id()) {
         return Ok(account.vault(Some(session)));
     }
     // An idle-expired key locks `bw` too before anything asks again.
@@ -195,6 +225,7 @@ async fn unlocked_or_prompt(account: &Account) -> Result<Vault, RemoteFailure> {
     match account.unlocked_vault() {
         Ok(vault) => Ok(vault),
         Err(error) if error.code == "BITWARDEN_LOCKED" => {
+            cache::clear();
             prompt::request_unlock().await?;
             account.unlocked_vault()
         }
@@ -254,54 +285,43 @@ pub(crate) struct VaultLogin {
 }
 
 /// Admits a login operation for a vault-backed host: unlocks (asking the
-/// user when the policy requires it), syncs per the configured window, reads
+/// user when the policy requires it), reuses a recent login or syncs and reads
 /// the item, and refreshes the mirror, so the connection that follows uses
 /// the endpoint, account and password the vault holds now. Every call goes
 /// through here, including one that reuses a retained session.
 pub(crate) async fn admit(host: &HostProfile) -> Result<AdmittedLogin, RemoteFailure> {
-    let item_key = ItemKey::of(host)
-        .ok_or_else(|| RemoteFailure::new("BITWARDEN_UNAVAILABLE", "not a vault host"))?;
-    let item_id = item_key.id;
     let _turn = CLI_GATE.lock().await;
     let settings = settings()?;
     let account = Account::from_settings(&settings)?;
     let mut vault = unlocked_or_prompt(&account).await?;
-    ensure_fresh(&account, &mut vault, settings.sync_max_age_seconds).await?;
-    let item = match vault.get_item(item_id).await {
-        Ok(item) => item,
-        Err(VaultError::ItemMissing) => {
-            vault_hosts::drop_mirror(item_id);
-            return Err(VaultError::ItemMissing.into_remote(&host.alias));
-        }
-        Err(error) => return Err(item_failure(error, &account, &host.alias)),
-    };
-    if item.is_deleted() {
-        vault_hosts::drop_mirror(item_id);
-        return Err(VaultError::ItemDeleted.into_remote(&host.alias));
-    }
-    let facts =
-        hosts::facts(item.summary()).map_err(|problem| problem_failure(&host.alias, &problem))?;
-    let password = item.login_password().ok().flatten();
-    let refreshed = match vault_hosts::persist_refreshed(&item_key, &facts) {
+    let (read, fresh) =
+        cache::read(&account, &mut vault, settings.sync_max_age_seconds, host).await?;
+    let refreshed = match vault_hosts::persist_refreshed(&read.key, &read.facts) {
         Ok(Some(stored)) => stored,
         _ => {
             let mut copy = host.clone();
-            vault_hosts::apply(&facts, &item_key, &mut copy);
+            vault_hosts::apply(&read.facts, &read.key, &mut copy);
             copy
         }
     };
     session::touch(account.id()).map_err(unavailable)?;
+    if fresh {
+        cache::remember(&account, &vault, settings.sync_max_age_seconds, &read)?;
+    }
     let session = vault
         .take_session()
         .ok_or_else(|| VaultError::Locked.into_remote(&account.profile.email))?;
     Ok(AdmittedLogin {
         host: refreshed,
         admission: Admission {
-            item_id,
-            revision: facts.revision,
+            item_id: read.key.id,
+            revision: read.facts.revision,
             session_fingerprint: session::fingerprint(&session),
         },
-        login: VaultLogin { session, password },
+        login: VaultLogin {
+            session,
+            password: read.password,
+        },
     })
 }
 
@@ -312,27 +332,24 @@ pub(crate) async fn resolve_login_password(
     host: &HostProfile,
     session: Option<SessionKey>,
 ) -> Result<Zeroizing<String>, RemoteFailure> {
-    let item_id = host
-        .vault()
-        .ok_or_else(|| RemoteFailure::new("BITWARDEN_UNAVAILABLE", "not a vault host"))?
-        .item_id;
     let _turn = CLI_GATE.lock().await;
     let settings = settings()?;
     let account = Account::from_settings(&settings)?;
     let mut vault = match session {
         Some(session) => account.vault(Some(session)),
-        None => {
-            let mut vault = unlocked_or_prompt(&account).await?;
-            ensure_fresh(&account, &mut vault, settings.sync_max_age_seconds).await?;
-            vault
-        }
+        None => unlocked_or_prompt(&account).await?,
     };
-    let resolved = vault
-        .resolve_password(item_id, Some(host.username.trim()))
-        .await
-        .map_err(|error| item_failure(error, &account, &host.alias))?;
+    let (read, fresh) =
+        cache::read(&account, &mut vault, settings.sync_max_age_seconds, host).await?;
+    if read.facts.username != host.username.trim() {
+        return Err(VaultError::UsernameMismatch.into_remote(&host.alias));
+    }
+    if fresh {
+        cache::remember(&account, &vault, settings.sync_max_age_seconds, &read)?;
+    }
     session::touch(account.id()).map_err(unavailable)?;
-    Ok(resolved.password)
+    read.password
+        .ok_or_else(|| VaultError::PasswordMissing.into_remote(&host.alias))
 }
 
 /// Lists the folder and mirrors it into the store (saved when something
@@ -344,6 +361,7 @@ pub(crate) async fn refresh_store(
     vault: &mut Vault,
     max_age_seconds: u64,
 ) -> Result<(Reconciled, Vec<codex_hosts_bw::ItemSummary>), RemoteFailure> {
+    cache::clear();
     let folder = folder_of(account)?;
     ensure_fresh(account, vault, max_age_seconds).await?;
     let items = vault
@@ -357,6 +375,7 @@ pub(crate) async fn refresh_store(
         store.save().map_err(unavailable)?;
     }
     session::touch(account.id()).map_err(unavailable)?;
+    cache::remember_listing(account, vault, max_age_seconds);
     Ok((result, items))
 }
 
@@ -373,7 +392,7 @@ pub(crate) async fn discover() -> Result<bool, RemoteFailure> {
     let account = Account::from_settings(&settings)?;
     let mut vault = unlocked_or_prompt(&account).await?;
     if let Some(key) = vault.session() {
-        remember_session(key);
+        remember_session(account.id(), key);
     }
     refresh_store(&account, &mut vault, settings.sync_max_age_seconds).await?;
     Ok(true)
@@ -393,7 +412,28 @@ pub(crate) async fn refresh_quietly() -> Result<Option<Reconciled>, RemoteFailur
         return Ok(None);
     };
     let mut vault = account.vault(Some(session));
+    if cache::listing_fresh(&account, &vault, settings.sync_max_age_seconds) {
+        return Ok(None);
+    }
     refresh_store(&account, &mut vault, settings.sync_max_age_seconds)
         .await
         .map(|(reconciled, _)| Some(reconciled))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recent_session_is_account_scoped_and_cleared_on_lock() {
+        let first = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let key = SessionKey::new("synthetic-recent-session".into());
+        remember_session(first, &key);
+        assert!(take_recent_session(other).is_none());
+        assert!(take_recent_session(first).is_none());
+        remember_session(first, &key);
+        clear_cached_session(first);
+        assert!(take_recent_session(first).is_none());
+    }
 }

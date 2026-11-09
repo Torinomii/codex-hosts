@@ -16,6 +16,7 @@
 pub mod host_uri;
 pub mod interactive;
 pub mod item;
+pub mod operation;
 pub mod output;
 pub mod parse;
 pub mod policy;

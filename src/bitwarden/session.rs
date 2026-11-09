@@ -188,6 +188,7 @@ pub(crate) fn touch(profile_id: Uuid) -> Result<(), String> {
 /// Removes the stored key; the vault is locked for codex-hosts until the
 /// master password is entered again.
 pub(crate) fn forget(profile_id: Uuid) -> Result<(), String> {
+    super::clear_cached_session(profile_id);
     credentials::delete(profile_id, CredentialKind::BitwardenSession(profile_id))
         .map_err(|error| error.to_string())?;
     if let Ok(dir) = data_dir(profile_id) {
@@ -265,6 +266,7 @@ pub(crate) fn sync_is_fresh(profile_id: Uuid, max_age_seconds: u64) -> bool {
 }
 
 pub(crate) fn mark_synced(profile_id: Uuid) -> Result<(), String> {
+    super::cache::clear();
     let dir = data_dir(profile_id)?;
     write_stamp(&dir, SYNCED_FILE)
 }

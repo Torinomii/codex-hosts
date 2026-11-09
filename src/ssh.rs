@@ -141,6 +141,9 @@ pub struct RemoteFailure {
     pub message: Box<str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_alias: Option<Box<str>>,
+    /// Internal identity of a failed hop, so a GUI trust prompt edits that hop.
+    #[serde(skip)]
+    pub host_id: Option<uuid::Uuid>,
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub host_key: Option<Box<HostKeyFailure>>,
 }
@@ -164,6 +167,7 @@ impl RemoteFailure {
             code,
             message: message.into().into_boxed_str(),
             host_alias: None,
+            host_id: None,
             host_key: None,
         }
     }
@@ -188,6 +192,7 @@ impl RemoteFailure {
             }
             .into(),
             host_alias: Some(host.alias.clone().into_boxed_str()),
+            host_id: Some(host.id),
             host_key: Some(Box::new(HostKeyFailure {
                 expected_fingerprint: expected,
                 observed_fingerprint: Some(observed.fingerprint.into_boxed_str()),
@@ -238,6 +243,7 @@ impl client::Handler for ServerKeyObserver {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SessionKey {
     parent: Option<Box<SessionKey>>,
+    probe_scope: Option<uuid::Uuid>,
     host_id: uuid::Uuid,
     address: String,
     port: u16,
@@ -273,6 +279,7 @@ impl SessionKey {
             });
         Self {
             parent: parent.cloned().map(Box::new),
+            probe_scope: vault_hosts::probe::scope(),
             host_id: host.id,
             address: host.address.trim().to_owned(),
             port: host.port,
@@ -796,35 +803,16 @@ pub fn finish_batch_scope(scope: uuid::Uuid) {
     disconnect_sessions(session_pool().finish_batch_scope(scope));
 }
 
-pub fn profile_may_require_interaction(profile: &HostProfile, hosts: &[HostProfile]) -> bool {
-    resolve_ssh_chain(profile, hosts).is_ok_and(|chain| {
-        chain.iter().any(|host| match host.ssh_auth {
-            SshAuth::SshAgent => true,
-            SshAuth::PrivateKey => {
-                let path = std::path::Path::new(host.private_key_path.trim());
-                fido::looks_like_fido_handle(path)
-                    || load_secret_key(path, None).is_ok_and(|key| fido::is_security_key(&key))
-            }
-            SshAuth::Password => false,
-        })
-    })
-}
-
-pub fn probe(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    execute(profile, hosts, "hostname", limits)
-}
-
-pub fn execute(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    command: &str,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    execute_with_input(profile, hosts, command, None, limits)
+fn host_may_require_interaction(host: &HostProfile) -> bool {
+    match host.ssh_auth {
+        SshAuth::SshAgent => true,
+        SshAuth::PrivateKey => {
+            let path = std::path::Path::new(host.private_key_path.trim());
+            fido::looks_like_fido_handle(path)
+                || load_secret_key(path, None).is_ok_and(|key| fido::is_security_key(&key))
+        }
+        SshAuth::Password => false,
+    }
 }
 
 pub fn validate_stdin(stdin: Option<&str>) -> Result<(), RemoteFailure> {
@@ -835,18 +823,6 @@ pub fn validate_stdin(stdin: Option<&str>) -> Result<(), RemoteFailure> {
         ));
     }
     Ok(())
-}
-
-pub fn execute_with_input(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    command: &str,
-    stdin: Option<&str>,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    ssh_runtime().block_on(execute_with_input_async(
-        profile, hosts, command, stdin, limits,
-    ))
 }
 
 pub(crate) async fn execute_with_input_async(
@@ -1342,7 +1318,7 @@ async fn pooled_connection(
     if let Err(error) = &connected {
         session_pool().block_reconnect(limits.batch_scope, &key);
         if error.code == "JUMP_CHANNEL_FAILED"
-            && let Some(parent) = parent
+            && let Some(parent) = parent.filter(|parent| parent.handle.is_closed())
         {
             session_pool().remove(parent);
             session_pool().block_reconnect(limits.batch_scope, &parent.key);
@@ -1366,7 +1342,7 @@ async fn connect_one(
 ) -> Result<Arc<PooledSession>, RemoteFailure> {
     // A retained session must survive quiet stretches between calls, so the
     // link is watched with keepalives instead of the first call's command timeout.
-    let config = Arc::new(if retention.is_some() {
+    let config = Arc::new(if retention.is_some() || limits.batch_scope.is_some() {
         client::Config {
             inactivity_timeout: None,
             keepalive_interval: Some(host.advanced.keepalive()),
@@ -1456,7 +1432,11 @@ async fn connect_one(
     }
 
     let auth_key_fingerprint = run_with_optional_timeout(
-        limits.connect_timeout,
+        if host_may_require_interaction(host) {
+            vault_hosts::probe::auth_timeout().or(limits.connect_timeout)
+        } else {
+            limits.connect_timeout
+        },
         "AUTH_TIMEOUT",
         "SSH authentication timed out.",
         authenticate(&mut session, host, vault_login),
@@ -2269,6 +2249,10 @@ mod tests {
         assert_eq!(value["expected_algorithm"], "ssh-ed25519");
         assert_eq!(value["observed_algorithm"], "ssh-rsa");
         assert!(value.get("host_key").is_none());
+        assert!(
+            value.get("host_id").is_none(),
+            "hop identity stays internal"
+        );
     }
 
     #[test]
@@ -2344,20 +2328,11 @@ mod tests {
             private_key_path: "id_ecdsa_sk".to_owned(),
             ..HostProfile::default()
         };
-        assert!(profile_may_require_interaction(
-            &hardware,
-            &[hardware.clone()]
-        ));
+        assert!(host_may_require_interaction(&hardware));
         hardware.private_key_path = "id_ed25519".to_owned();
-        assert!(!profile_may_require_interaction(
-            &hardware,
-            &[hardware.clone()]
-        ));
+        assert!(!host_may_require_interaction(&hardware));
         hardware.ssh_auth = SshAuth::SshAgent;
-        assert!(profile_may_require_interaction(
-            &hardware,
-            &[hardware.clone()]
-        ));
+        assert!(host_may_require_interaction(&hardware));
     }
 
     #[test]

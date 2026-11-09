@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use zeroize::{Zeroize, Zeroizing};
 
+use super::operation::{self, Control, Stage, Stop};
 use super::policy::{BwInvocation, MAX_OUTPUT_BYTES};
 
 /// What a finished child left behind. Both streams may contain whole vault
@@ -33,6 +34,9 @@ pub enum BwRunError {
     /// The child did not finish within the invocation's timeout; it was killed.
     #[error("the CLI did not finish within {0:?}")]
     Timeout(Duration),
+    /// The GUI cancelled this operation; the child was stopped and reaped.
+    #[error("the credential operation was cancelled")]
+    Cancelled,
     /// Reading from or writing to the child failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -55,6 +59,32 @@ pub async fn run_command(
     payload: Option<Zeroizing<Vec<u8>>>,
     timeout: Duration,
 ) -> Result<BwOutput, BwRunError> {
+    let control = Control::current();
+    let stage = control
+        .as_ref()
+        .map(|control| control.begin(command.as_std().get_args()));
+    let timeout = control
+        .as_ref()
+        .map_or(timeout, |control| control.remaining(timeout));
+    if let Some(control) = &control {
+        if timeout.is_zero() {
+            control.stop(Stop::TimedOut);
+        }
+        if let Some(reason) = control.snapshot().stopped {
+            return Err(match reason {
+                Stop::Cancelled => BwRunError::Cancelled,
+                Stop::TimedOut => BwRunError::Timeout(timeout),
+            });
+        }
+        if std::path::Path::new(command.as_std().get_program())
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case("op.exe"))
+            && matches!(stage, Some(Stage::Reading | Stage::Writing))
+        {
+            control.stage(Stage::Authorizing);
+        }
+    }
     command
         .stdin(if payload.is_some() {
             Stdio::piped()
@@ -81,7 +111,9 @@ pub async fn run_command(
             stdin.shutdown().await?;
             drop(stdin);
         }
-        let (stdout, stderr) = tokio::try_join!(read_capped(stdout), read_capped(stderr))?;
+        let progress = control.clone().zip(stage);
+        let (stdout, stderr) =
+            tokio::try_join!(read_capped(stdout, progress), read_capped(stderr, None))?;
         let status = child.wait().await?;
         Ok::<BwOutput, BwRunError>(BwOutput {
             exit_code: status.code(),
@@ -90,16 +122,26 @@ pub async fn run_command(
         })
     };
 
-    let outcome = tokio::time::timeout(timeout, work).await;
+    let outcome = tokio::select! {
+        result = tokio::time::timeout(timeout, work) => Some(result),
+        () = operation::cancelled(control.as_ref()) => None,
+    };
     match outcome {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => {
+        Some(Ok(Ok(output))) => Ok(output),
+        Some(Ok(Err(error))) => {
             let _ = child.kill().await;
             Err(error)
         }
-        Err(_) => {
+        Some(Err(_)) => {
+            if let Some(control) = &control {
+                control.stop(Stop::TimedOut);
+            }
             let _ = child.kill().await;
             Err(BwRunError::Timeout(timeout))
+        }
+        None => {
+            let _ = child.kill().await;
+            Err(BwRunError::Cancelled)
         }
     }
 }
@@ -116,6 +158,7 @@ impl std::fmt::Debug for BwOutput {
 
 async fn read_capped<R: AsyncRead + Unpin>(
     mut reader: R,
+    mut progress: Option<(Control, Stage)>,
 ) -> Result<Zeroizing<Vec<u8>>, BwRunError> {
     let mut buffer = Zeroizing::new(Vec::new());
     let mut chunk = [0u8; 8192];
@@ -125,6 +168,9 @@ async fn read_capped<R: AsyncRead + Unpin>(
             Ok(read) => read,
             Err(error) => break Err(BwRunError::Io(error)),
         };
+        if let Some((control, stage)) = progress.take() {
+            control.stage(stage);
+        }
         if buffer.len() + read > MAX_OUTPUT_BYTES {
             break Err(BwRunError::OutputTooLarge);
         }

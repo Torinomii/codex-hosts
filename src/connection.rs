@@ -2,16 +2,7 @@ use crate::model::{HostProfile, Protocol};
 use crate::ssh::{self, OperationLimits, RemoteFailure, RemoteManyResult, RemoteResult};
 use crate::telnet;
 
-pub fn probe(
-    profile: &HostProfile,
-    hosts: &[HostProfile],
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    match profile.protocol {
-        Protocol::Ssh => ssh::probe(profile, hosts, limits),
-        Protocol::Telnet => telnet::probe(profile, limits),
-    }
-}
+pub(crate) mod probes;
 
 pub async fn execute_sudo_async(
     profile: &HostProfile,

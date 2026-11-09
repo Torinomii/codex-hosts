@@ -8,7 +8,7 @@
 //! exactly as long as a dialog needs them.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
 use codex_hosts_bw::{
@@ -88,33 +88,7 @@ pub(super) fn problem_key(problem: &ItemProblem) -> &'static str {
 // ---------------------------------------------------------------------------
 // Worker jobs
 
-/// A worker result the dialog polls for.
-pub(super) struct Job<T>(Receiver<Result<T, String>>);
-
-impl<T> Job<T> {
-    /// `None` while the worker runs.
-    pub(super) fn poll(&self) -> Option<Result<T, String>> {
-        match self.0.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err("worker stopped".to_owned())),
-        }
-    }
-}
-
-pub(super) fn spawn_job<T: Send + 'static>(
-    repaint: egui::Context,
-    work: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> Job<T> {
-    let (sender, receiver) = mpsc::channel();
-    thread::spawn(move || {
-        let result = work();
-        if sender.send(result).is_ok() {
-            repaint.request_repaint();
-        }
-    });
-    Job(receiver)
-}
+pub(super) use super::jobs::{Job, spawn_job};
 
 pub(super) fn block_on<T>(future: impl std::future::Future<Output = T>) -> Result<T, String> {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -206,11 +180,15 @@ fn vault_job<T: Send + 'static>(
     work: impl FnOnce(Account) -> JobResult<T> + Send + 'static,
 ) -> Job<Result<T, JobError>> {
     let catalog = reporter.catalog.clone();
-    spawn_job(reporter.repaint.clone(), move || {
-        let account =
-            Account::from_settings(&settings).map_err(|error| explain_remote(&catalog, &error))?;
-        Ok(work(account))
-    })
+    spawn_job(
+        reporter.repaint.clone(),
+        reporter.catalog.clone(),
+        move || {
+            let account = Account::from_settings(&settings)
+                .map_err(|error| explain_remote(&catalog, &error))?;
+            Ok(work(account))
+        },
+    )
 }
 
 /// Locks `bw` with a key codex-hosts just retired, off the window thread,
@@ -943,6 +921,7 @@ impl Wizard {
                 policy: self.chosen_policy(),
             }),
             sync_max_age_seconds: current.sync_max_age_seconds,
+            login_cache_minutes: current.login_cache_minutes,
         }
     }
 
@@ -1010,6 +989,25 @@ enum ManagerAction {
 }
 
 impl HostsApp {
+    pub(super) fn show_vault_progress(&self, ui: &mut egui::Ui) -> bool {
+        if let Some(running) = &self.vault_job {
+            let service = match running.provider {
+                VaultProvider::Bitwarden => "Bitwarden",
+                VaultProvider::OnePassword => "1Password",
+            };
+            running.job.show(ui, &self.catalog, service);
+        } else if let Some(job) = self
+            .credential_services
+            .as_ref()
+            .and_then(|manager| manager.job.as_ref())
+        {
+            job.show(ui, &self.catalog, "Bitwarden");
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// Opens the credential-services dialog from the toolbar.
     pub(super) fn open_credential_services(&mut self) {
         let idle_minutes = match self
@@ -1055,7 +1053,11 @@ impl HostsApp {
 
     fn save_bitwarden_settings(&mut self) {
         match self.store.save() {
-            Ok(()) => {}
+            Ok(()) => {
+                if let Err(error) = vault_hosts::cache::reset(VaultProvider::Bitwarden) {
+                    self.set_status_format("storage_error", &[("error", &error)]);
+                }
+            }
             Err(error) => self.set_status_format("storage_error", &[("error", &error.to_string())]),
         }
     }
@@ -1249,6 +1251,9 @@ impl HostsApp {
                 }));
             }
             ManagerAction::WizardCancel => {
+                if let Some(job) = &manager.job {
+                    job.cancel();
+                }
                 manager.wizard = None;
             }
             ManagerAction::WizardLogin | ManagerAction::WizardRetryLogin => {
@@ -1917,6 +1922,11 @@ impl HostsApp {
         let settings = self.store.bitwarden.clone();
         let hosts = self.store.hosts.clone();
         let mut enabled = settings.enabled;
+        let mut cache_minutes = [
+            settings.login_cache_minutes,
+            self.store.onepassword.login_cache_minutes,
+        ];
+        let mut clear_cache = [false; 2];
         let Some(manager) = self.credential_services.as_mut() else {
             return;
         };
@@ -1934,6 +1944,21 @@ impl HostsApp {
             catalog.text("credential_services")
         };
         dialog_shell(context, "credential_services", 760.0, title, |ui| {
+            clear_cache = super::vault_cache::controls(ui, &catalog, &mut cache_minutes);
+            if let Some(job) = &manager.job {
+                job.show(ui, &catalog, "Bitwarden");
+            }
+            self.onepassword.show_progress(ui, &catalog);
+            if let Some(running) = &self.vault_job {
+                running.job.show(
+                    ui,
+                    &catalog,
+                    match running.provider {
+                        VaultProvider::Bitwarden => "Bitwarden",
+                        VaultProvider::OnePassword => "1Password",
+                    },
+                );
+            }
             if let Some(wizard) = manager.wizard.as_mut() {
                 action = wizard_body(ui, &catalog, wizard);
                 return;
@@ -1969,6 +1994,7 @@ impl HostsApp {
                 action = Some(ManagerAction::Close);
             }
         });
+        self.apply_vault_cache_settings(cache_minutes, clear_cache);
         if enabled != settings.enabled {
             self.store.bitwarden.enabled = enabled;
             self.save_bitwarden_settings();

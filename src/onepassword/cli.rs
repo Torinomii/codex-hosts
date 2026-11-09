@@ -245,6 +245,22 @@ impl OpCall {
         Self::with_ids(&["item", "get"], &[item], account, vault, TIMEOUT_VAULT)
     }
 
+    /// The CLI accepts a JSON array of item IDs on stdin for a single read.
+    pub(crate) fn items_get(account: &str, vault: &str, items: &[&str]) -> Result<Self, OpError> {
+        if items.is_empty() || items.iter().any(|id| !is_op_id(id)) {
+            return Err(OpError::BadId);
+        }
+        let ids: Vec<_> = items
+            .iter()
+            .map(|id| serde_json::json!({"id": id}))
+            .collect();
+        let input = Zeroizing::new(serde_json::to_vec(&ids).map_err(|_| OpError::Parse)?);
+        Ok(
+            Self::with_ids(&["item", "get"], &[], account, vault, TIMEOUT_VAULT)?
+                .with_payload(input),
+        )
+    }
+
     /// Creates an item from its JSON template.
     pub(crate) fn item_create(
         account: &str,
@@ -331,6 +347,10 @@ pub(crate) trait OpRunner: Send + Sync {
         exe: &OpExecutable,
         call: OpCall,
     ) -> impl Future<Output = Result<BwOutput, BwRunError>> + Send;
+
+    fn start_desktop_app(&self) -> impl Future<Output = Result<bool, BwRunError>> + Send {
+        async { Ok(false) }
+    }
 }
 
 /// The real CLI, under the same output cap and timeout as `bw`.
@@ -345,6 +365,10 @@ impl OpRunner for RealRunner {
     ) -> impl Future<Output = Result<BwOutput, BwRunError>> + Send {
         let command = call.command(exe);
         codex_hosts_bw::run_command(command, call.payload, call.timeout)
+    }
+
+    async fn start_desktop_app(&self) -> Result<bool, BwRunError> {
+        super::desktop::start().map_err(BwRunError::Spawn)
     }
 }
 
@@ -406,6 +430,17 @@ impl OpError {
     pub(crate) fn retry_once(&self) -> bool {
         matches!(self, Self::AppUnavailable)
     }
+}
+
+/// This diagnostic is emitted before the CLI connects to the app. A lost
+/// connection can occur after dispatch and must not replay a vault write.
+pub(crate) fn failed_before_app_connection(output: &BwOutput) -> bool {
+    let message = b"cannot connect to 1password app";
+    output.exit_code != Some(0)
+        && output
+            .stderr
+            .windows(message.len())
+            .any(|part| part.eq_ignore_ascii_case(message))
 }
 
 /// Classifies a finished call: stdout on success, otherwise the reason read
@@ -785,6 +820,25 @@ pub(crate) fn parse_item(stdout: Zeroizing<Vec<u8>>) -> Result<OpItem, OpError> 
     })
 }
 
+/// Bulk output can be a JSON array or a stream of whole-item objects.
+/// Borrowed raw slices avoid materializing passwords in ordinary JSON strings.
+pub(crate) fn parse_items(stdout: Zeroizing<Vec<u8>>) -> Result<Vec<OpItem>, OpError> {
+    use serde_json::value::RawValue;
+    let items: Vec<&RawValue> =
+        if stdout.iter().find(|byte| !byte.is_ascii_whitespace()) == Some(&b'[') {
+            serde_json::from_slice(&stdout).map_err(|_| OpError::Parse)?
+        } else {
+            serde_json::Deserializer::from_slice(&stdout)
+                .into_iter::<&RawValue>()
+                .collect::<Result<_, _>>()
+                .map_err(|_| OpError::Parse)?
+        };
+    items
+        .into_iter()
+        .map(|item| parse_item(Zeroizing::new(item.get().as_bytes().to_vec())))
+        .collect()
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     use std::collections::VecDeque;
@@ -915,6 +969,37 @@ pub(crate) mod test_support {
 mod tests {
     use super::test_support::*;
     use super::*;
+
+    #[test]
+    fn bulk_reads_validate_ids_and_parse_arrays_or_object_streams() {
+        let call = OpCall::items_get(ACCOUNT, VAULT, &[ITEM]).unwrap();
+        assert_eq!(call.args().last().unwrap(), "-");
+        let input: Value = serde_json::from_slice(call.payload().unwrap()).unwrap();
+        assert_eq!(input, serde_json::json!([{"id": ITEM}]));
+        assert!(matches!(
+            OpCall::items_get(ACCOUNT, VAULT, &["--help"]),
+            Err(OpError::BadId)
+        ));
+        assert!(matches!(
+            OpCall::items_get(ACCOUNT, VAULT, &[]),
+            Err(OpError::BadId)
+        ));
+        let item = item_json(ITEM, "batch", 1, "synthetic-batch-password");
+        for output in [format!("[{item},{item}]"), format!("{item}\n{item}\n")] {
+            let parsed = parse_items(Zeroizing::new(output.into_bytes())).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert!(
+                parsed[0]
+                    .password()
+                    .unwrap()
+                    .is_some_and(|p| p.as_str() == "synthetic-batch-password")
+            );
+            assert!(!format!("{parsed:?}").contains("synthetic-batch-password"));
+        }
+        for output in ["null", "[{}]", "{", "{} {}"] {
+            assert!(parse_items(Zeroizing::new(output.as_bytes().to_vec())).is_err());
+        }
+    }
 
     fn output(code: i32, stderr: &str) -> BwOutput {
         BwOutput {

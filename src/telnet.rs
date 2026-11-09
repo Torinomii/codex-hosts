@@ -54,36 +54,6 @@ const LOGIN_FAILURE_TEXTS: [&str; 3] =
 const SHELL_SETTLE: Duration = Duration::from_millis(500);
 const SHELL_SILENT_LIMIT: Duration = Duration::from_secs(3);
 
-pub fn probe(
-    profile: &HostProfile,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    execute(profile, "hostname", limits)
-}
-
-pub fn execute(
-    profile: &HostProfile,
-    command: &str,
-    limits: OperationLimits,
-) -> Result<RemoteResult, RemoteFailure> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| RemoteFailure::new("RUNTIME_CREATE_FAILED", error.to_string()))?;
-    let result = runtime.block_on(bounded(
-        limits.total_timeout,
-        TOTAL_TIMEOUT_CODE,
-        "The complete Telnet operation exceeded its time limit.",
-        execute_async(profile, command, limits),
-    ));
-    if limits.total_timeout.is_some() {
-        runtime.shutdown_timeout(Duration::from_millis(50));
-    } else {
-        drop(runtime);
-    }
-    result
-}
-
 pub(crate) async fn execute_bounded(
     profile: &HostProfile,
     command: &str,

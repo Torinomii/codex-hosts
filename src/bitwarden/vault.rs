@@ -423,6 +423,23 @@ impl<R: CliRunner> Vault<R> {
         Ok(VaultItem::parse(output.stdout)?)
     }
 
+    /// One CLI read for a connection-test snapshot, retaining full items in
+    /// zeroizing buffers rather than discarding their login fields.
+    pub(crate) async fn read_items(&mut self, folder: Uuid) -> Result<Vec<VaultItem>, VaultError> {
+        let session = self.require_session()?;
+        let invocation = BwInvocation::list_items(&self.exe, &self.profile, session, Some(folder));
+        let output = self.run_ok(invocation).await?;
+        let items: Vec<&serde_json::value::RawValue> = serde_json::from_slice(&output.stdout)
+            .map_err(|_| VaultParseError::UnexpectedShape("an item array"))?;
+        items
+            .into_iter()
+            .map(|item| {
+                VaultItem::parse(Zeroizing::new(item.get().as_bytes().to_vec()))
+                    .map_err(VaultError::from)
+            })
+            .collect()
+    }
+
     pub(crate) async fn create_item(
         &mut self,
         json: Zeroizing<Vec<u8>>,

@@ -19,6 +19,16 @@ path = "src/bw/lib.rs"
 name = "codex-hosts"
 path = "src/main.rs"
 
+[[example]]
+name = "fake_op"
+path = "scripts/test-fixtures/fake_op.rs"
+test = false
+
+[[example]]
+name = "fake_bw"
+path = "scripts/test-fixtures/fake_bw.rs"
+test = false
+
 [dependencies]
 base64 = "0.22"
 csv = "1"
@@ -30,7 +40,7 @@ rmcp = { version = "3.4", default-features = false, features = ["server", "macro
 russh = "0.62.5"
 schemars = { version = "1", features = ["uuid1"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 sys-locale = "0.3.2"
 thiserror = "2"
 tokio-util = "0.7"
@@ -42,7 +52,7 @@ zeroize = "1"
 ciborium = "0.2"
 p256 = { version = "0.14", features = ["ecdsa"] }
 sha2 = "0.11"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_Security", "Win32_Security_Authorization", "Win32_Networking_WindowsWebServices", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_Shell", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_System_Registry", "Win32_Security", "Win32_Security_Authorization", "Win32_Networking_WindowsWebServices", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_UI_WindowsAndMessaging"] }
 
 [build-dependencies]
 serde_json = "1"

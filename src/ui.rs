@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -18,12 +18,16 @@ mod bitwarden;
 mod dialogs;
 mod host_form;
 mod host_list;
+mod jobs;
 mod onepassword;
+#[cfg(test)]
+mod probe_tests;
 mod services;
 mod status;
 pub(crate) mod theme;
 mod toolbar;
 mod transfer;
+mod vault_cache;
 mod vaults;
 
 pub(crate) use theme::{configure_fonts, forget_password_history};
@@ -43,9 +47,7 @@ use crate::model::{
     AuthPersistence, HostFilter, HostProfile, Prefill, Protocol, SshAuth, VaultHostRef,
     VaultProvider, normalize_tags,
 };
-use crate::ssh::{
-    OperationLimits, RemoteFailure, RemoteResult, TOTAL_TIMEOUT_CODE, VerifiedHostKey,
-};
+use crate::ssh::{RemoteFailure, TOTAL_TIMEOUT_CODE, VerifiedHostKey};
 use crate::storage::HostStore;
 
 #[derive(Debug, Clone, Default)]
@@ -518,14 +520,9 @@ impl HostEditor {
     }
 }
 
-const GUI_TEST_TIMEOUT: Duration = Duration::from_secs(10);
-const GUI_INTERACTIVE_TEST_TIMEOUT: Duration = Duration::from_secs(60);
-const MAX_CONCURRENT_TESTS: usize = 8;
-
 struct TestOperation {
-    receiver: Receiver<(Instant, Result<RemoteResult, RemoteFailure>)>,
-    started_at: Instant,
-    timeout: Duration,
+    receiver: Receiver<connection::probes::Outcome>,
+    _worker: Arc<connection::probes::Worker>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,7 +540,7 @@ struct FingerprintPrompt {
     observed: String,
     expected_algorithm: Option<String>,
     observed_algorithm: Option<String>,
-    retry_test: bool,
+    retry_test: Option<Uuid>,
     close_after_choice: bool,
 }
 
@@ -606,7 +603,6 @@ pub struct HostsApp {
     editor: Option<HostEditor>,
     status: StatusMessage,
     test_operations: HashMap<Uuid, TestOperation>,
-    pending_tests: VecDeque<Uuid>,
     test_hosts_snapshot: Option<Arc<Vec<HostProfile>>>,
     test_states: HashMap<Uuid, HostTestState>,
     testing_all: bool,
@@ -745,7 +741,7 @@ impl HostsApp {
                 observed: observed.clone(),
                 expected_algorithm: editor.profile.host_key_algorithm.clone(),
                 observed_algorithm: launch.observed_algorithm.clone(),
-                retry_test: false,
+                retry_test: None,
                 close_after_choice: true,
             })
         });
@@ -808,7 +804,6 @@ impl HostsApp {
             editor,
             status,
             test_operations: HashMap::new(),
-            pending_tests: VecDeque::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
             testing_all: false,
@@ -1551,7 +1546,7 @@ impl HostsApp {
     }
 
     fn host_test_running(&self, id: Uuid) -> bool {
-        self.test_operations.contains_key(&id) || self.pending_tests.contains(&id)
+        self.test_operations.contains_key(&id)
     }
 
     fn start_test_host(&mut self, id: Uuid) {
@@ -1562,45 +1557,43 @@ impl HostsApp {
     }
 
     fn start_test_worker(&mut self, id: Uuid, hosts: Arc<Vec<HostProfile>>) {
-        let Some(profile) = hosts.iter().find(|host| host.id == id).cloned() else {
-            return;
-        };
-        let (sender, receiver) = mpsc::channel();
-        let started_at = Instant::now();
-        let timeout = gui_test_timeout(&profile, hosts.as_ref());
-        let repaint_context = self.repaint_context.clone();
-        self.repaint_context.request_repaint_after(timeout);
-        thread::spawn(move || {
-            let result = connection::probe(&profile, hosts.as_ref(), gui_test_limits(timeout));
-            if sender.send((Instant::now(), result)).is_ok() {
-                repaint_context.request_repaint();
-            }
-        });
-        self.test_operations.insert(
-            id,
-            TestOperation {
-                receiver,
-                started_at,
-                timeout,
-            },
-        );
-        self.test_states.insert(id, HostTestState::Testing);
+        self.start_test_workers(vec![id], hosts);
     }
 
-    fn start_pending_tests(&mut self) {
-        let Some(hosts) = self.test_hosts_snapshot.clone() else {
-            return;
-        };
-        while self.test_operations.len() < MAX_CONCURRENT_TESTS {
-            let Some(id) = self.pending_tests.pop_front() else {
-                break;
-            };
-            self.start_test_worker(id, Arc::clone(&hosts));
+    fn start_test_workers(&mut self, ids: Vec<Uuid>, hosts: Arc<Vec<HostProfile>>) {
+        let mut senders = HashMap::new();
+        let mut receivers = Vec::new();
+        for id in ids {
+            if hosts.iter().any(|host| host.id == id) {
+                let (sender, receiver) = mpsc::channel();
+                senders.insert(id, sender);
+                receivers.push((id, receiver));
+            }
+        }
+        let ids = receivers.iter().map(|(id, _)| *id).collect();
+        let repaint = self.repaint_context.clone();
+        let worker =
+            connection::probes::start(hosts, ids, Default::default(), move |id, outcome| {
+                if let Some(sender) = senders.get(&id)
+                    && sender.send(outcome).is_ok()
+                {
+                    repaint.request_repaint();
+                }
+            });
+        for (id, receiver) in receivers {
+            self.test_operations.insert(
+                id,
+                TestOperation {
+                    receiver,
+                    _worker: Arc::clone(&worker),
+                },
+            );
+            self.test_states.insert(id, HostTestState::Testing);
         }
     }
 
     fn tests_idle(&self) -> bool {
-        self.test_operations.is_empty() && self.pending_tests.is_empty()
+        self.test_operations.is_empty()
     }
 
     fn start_all_tests(&mut self) {
@@ -1641,60 +1634,35 @@ impl HostsApp {
         self.test_states.clear();
         self.test_states
             .extend(ids.iter().copied().map(|id| (id, HostTestState::Testing)));
-        self.pending_tests = ids.into_iter().collect();
-        self.test_hosts_snapshot = Some(Arc::new(self.store.hosts.clone()));
+        let hosts = Arc::new(self.store.hosts.clone());
+        self.test_hosts_snapshot = Some(Arc::clone(&hosts));
         self.testing_all = true;
-        self.start_pending_tests();
+        self.start_test_workers(ids, hosts);
         self.set_status_key("testing_all");
     }
 
     fn poll_tests(&mut self) {
+        if !self.tests_idle() {
+            self.repaint_context
+                .request_repaint_after(Duration::from_millis(250));
+        }
         let mut completed = Vec::new();
         for (&id, operation) in &self.test_operations {
             match operation.receiver.try_recv() {
-                Ok((finished_at, result)) => {
-                    if test_timed_out(
-                        finished_at.duration_since(operation.started_at),
-                        operation.timeout,
-                    ) {
-                        completed.push((
-                            id,
-                            Err(RemoteFailure::new(
-                                "TEST_TIMEOUT",
-                                "The connection test exceeded its configured time limit.",
-                            )),
-                        ));
-                    } else {
-                        completed.push((id, result));
-                    }
-                }
+                Ok(outcome) => completed.push((id, outcome)),
                 Err(mpsc::TryRecvError::Disconnected) => completed.push((
                     id,
-                    Err(RemoteFailure::new(
+                    connection::probes::Outcome::failed(RemoteFailure::new(
                         "TEST_WORKER_STOPPED",
                         "The connection test worker stopped unexpectedly.",
                     )),
                 )),
-                Err(mpsc::TryRecvError::Empty)
-                    if test_timed_out(operation.started_at.elapsed(), operation.timeout) =>
-                {
-                    completed.push((
-                        id,
-                        Err(RemoteFailure::new(
-                            "TEST_TIMEOUT",
-                            "The connection test exceeded its configured time limit.",
-                        )),
-                    ));
-                }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
         for (id, result) in completed {
             self.test_operations.remove(&id);
             self.finish_test(id, result);
-        }
-        if self.testing_all {
-            self.start_pending_tests();
         }
         if self.testing_all && self.tests_idle() {
             self.testing_all = false;
@@ -1711,6 +1679,7 @@ impl HostsApp {
                 if let Some(id) = self.editor.as_ref().map(|editor| editor.profile.id) {
                     self.sync_editor_verification_from_store(id);
                 }
+                reconcile_host_editor(&mut self.editor, &mut self.selected, &self.store);
             }
             self.test_hosts_snapshot = None;
             let succeeded = self
@@ -1738,33 +1707,47 @@ impl HostsApp {
         }
     }
 
-    fn finish_test(&mut self, id: Uuid, result: Result<RemoteResult, RemoteFailure>) {
+    fn finish_test(&mut self, id: Uuid, outcome: connection::probes::Outcome) {
+        let connection::probes::Outcome { result, refreshed } = outcome;
+        let mut updated_store = self.store.clone();
+        for (key, facts) in refreshed {
+            if updated_store
+                .hosts
+                .iter()
+                .any(|host| crate::vault_hosts::ItemKey::of(host).as_ref() == Some(&key))
+            {
+                crate::vault_hosts::refresh_mirror(&mut updated_store.hosts, &key, &facts);
+            }
+        }
+        if let Ok(result) = &result {
+            for verified in &result.verified_host_keys {
+                if let Some(host) = updated_store
+                    .hosts
+                    .iter_mut()
+                    .find(|host| host.id == verified.host_id)
+                {
+                    apply_verified_host_key(host, verified);
+                }
+            }
+        }
+        let changed = updated_store.hosts != self.store.hosts;
+        if self.testing_all {
+            self.store = updated_store;
+            self.test_store_dirty |= changed;
+        } else if changed {
+            if let Err(error) = updated_store.save() {
+                self.test_states.insert(id, HostTestState::Failed);
+                self.set_status_format("storage_error", &[("error", &error.to_string())]);
+                return;
+            }
+            self.store = updated_store;
+            self.sync_editor_verification_from_store(id);
+            reconcile_host_editor(&mut self.editor, &mut self.selected, &self.store);
+        }
         match result {
             Ok(result) => {
                 self.test_states.insert(id, HostTestState::Succeeded);
                 let identity = result.stdout.trim().to_owned();
-                let mut updated_store = self.store.clone();
-                let mut metadata_changed = false;
-                for verified in &result.verified_host_keys {
-                    if let Some(stored) = updated_store
-                        .hosts
-                        .iter_mut()
-                        .find(|host| host.id == verified.host_id)
-                    {
-                        metadata_changed |= apply_verified_host_key(stored, verified);
-                    }
-                }
-                if self.testing_all {
-                    self.store = updated_store;
-                    self.test_store_dirty |= metadata_changed;
-                } else if metadata_changed {
-                    if let Err(error) = updated_store.save() {
-                        self.set_status_format("storage_error", &[("error", &error.to_string())]);
-                        return;
-                    }
-                    self.store = updated_store;
-                    self.sync_editor_verification_from_store(id);
-                }
                 if !self.testing_all && self.selected == Some(id) {
                     self.set_status_format("status_test_ok", &[("identity", identity.as_str())]);
                 }
@@ -1780,7 +1763,7 @@ impl HostsApp {
                 if !self.testing_all && self.selected == Some(id) {
                     let details = error.host_key.unwrap_or_default();
                     self.fingerprint_prompt = Some(FingerprintPrompt {
-                        host_id: id,
+                        host_id: error.host_id.unwrap_or(id),
                         alias: error
                             .host_alias
                             .map(|value| value.into_string())
@@ -1798,7 +1781,7 @@ impl HostsApp {
                         observed_algorithm: details
                             .observed_algorithm
                             .map(|value| value.into_string()),
-                        retry_test: true,
+                        retry_test: Some(id),
                         close_after_choice: false,
                     });
                 }
@@ -1900,9 +1883,9 @@ impl HostsApp {
                     self.set_status_format("callback_error", &[("error", &error)]);
                 }
             }
-        } else if prompt.retry_test {
-            self.start_test_host(prompt.host_id);
-            if self.selected == Some(prompt.host_id) {
+        } else if let Some(target) = prompt.retry_test {
+            self.start_test_host(target);
+            if self.selected == Some(target) {
                 self.set_status_key("testing");
             }
         }
@@ -1972,7 +1955,6 @@ impl HostsApp {
         }
         crate::ssh::invalidate_profile(id);
         self.test_operations.remove(&id);
-        self.pending_tests.retain(|pending| *pending != id);
         self.test_states.remove(&id);
         self.selected = self.store.hosts.first().map(|host| host.id);
         self.editor = self
@@ -2074,7 +2056,6 @@ impl HostsApp {
         for id in &ids {
             crate::ssh::invalidate_profile(*id);
             self.test_operations.remove(id);
-            self.pending_tests.retain(|pending| pending != id);
             self.test_states.remove(id);
         }
         self.selected = self.store.hosts.first().map(|host| host.id);
@@ -2124,7 +2105,6 @@ impl HostsApp {
                 let _ = credentials::delete_host(host);
                 crate::ssh::invalidate_profile(host.id);
                 self.test_operations.remove(&host.id);
-                self.pending_tests.retain(|pending| *pending != host.id);
                 self.test_states.remove(&host.id);
             }
             if self
@@ -2633,10 +2613,6 @@ fn should_hide_to_tray(
     close_requested && !codex_edit && !exiting && !hidden && !restoring
 }
 
-fn test_timed_out(elapsed: Duration, timeout: Duration) -> bool {
-    elapsed >= timeout
-}
-
 fn should_replace_callback(existing: &str, new: &str) -> bool {
     fn priority(status: &str) -> u8 {
         match status {
@@ -2647,28 +2623,6 @@ fn should_replace_callback(existing: &str, new: &str) -> bool {
     }
 
     priority(new) > priority(existing) || new == existing
-}
-
-fn gui_test_timeout(profile: &HostProfile, hosts: &[HostProfile]) -> Duration {
-    if profile.protocol == Protocol::Ssh
-        && crate::ssh::profile_may_require_interaction(profile, hosts)
-    {
-        GUI_INTERACTIVE_TEST_TIMEOUT
-    } else {
-        GUI_TEST_TIMEOUT
-    }
-}
-
-fn gui_test_limits(timeout: Duration) -> OperationLimits {
-    OperationLimits {
-        total_timeout: Some(timeout),
-        connect_timeout: Some(timeout),
-        command_timeout: Some(timeout),
-        output_bytes: None,
-        batch_scope: None,
-        retain_sessions: false,
-        approved: false,
-    }
 }
 
 fn rollback_import_credentials(hosts: &[HostProfile]) {
@@ -2899,7 +2853,6 @@ mod tests {
             editor: Some(editor),
             status: StatusMessage::info(""),
             test_operations: HashMap::new(),
-            pending_tests: VecDeque::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
             testing_all: false,
@@ -3373,32 +3326,6 @@ mod tests {
         reconcile_host_editor(&mut editor, &mut selected, &store);
         assert!(editor.is_none());
         assert!(selected.is_none());
-    }
-
-    #[test]
-    fn connection_test_timeout_allows_windows_hardware_prompts() {
-        assert!(!test_timed_out(
-            Duration::from_millis(9_999),
-            GUI_TEST_TIMEOUT
-        ));
-        assert!(test_timed_out(Duration::from_secs(10), GUI_TEST_TIMEOUT));
-        assert_eq!(
-            gui_test_limits(GUI_INTERACTIVE_TEST_TIMEOUT).total_timeout,
-            Some(GUI_INTERACTIVE_TEST_TIMEOUT)
-        );
-
-        let mut host = HostProfile {
-            protocol: Protocol::Ssh,
-            ssh_auth: SshAuth::PrivateKey,
-            private_key_path: "id_ecdsa_sk".to_owned(),
-            ..HostProfile::default()
-        };
-        assert_eq!(
-            gui_test_timeout(&host, &[host.clone()]),
-            GUI_INTERACTIVE_TEST_TIMEOUT
-        );
-        host.private_key_path = "id_ed25519".to_owned();
-        assert_eq!(gui_test_timeout(&host, &[host.clone()]), GUI_TEST_TIMEOUT);
     }
 
     #[test]

@@ -275,7 +275,7 @@ pub(super) fn vaults_job<T: Send + 'static>(
     providers: Vec<VaultProvider>,
     work: impl FnOnce(&mut LiveVaults, &Catalog) -> JobResult<T> + Send + 'static,
 ) -> Job<Result<T, JobError>> {
-    spawn_job(repaint, move || {
+    spawn_job(repaint, catalog.clone(), move || {
         let mut vaults = match access.open(&providers, &catalog)? {
             Ok(vaults) => vaults,
             Err(error) => return Ok(Err(error)),

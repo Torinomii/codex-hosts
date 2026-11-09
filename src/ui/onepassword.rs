@@ -227,6 +227,14 @@ pub(super) struct OnePasswordUi {
 }
 
 impl OnePasswordUi {
+    pub(super) fn show_progress(&self, ui: &mut egui::Ui, catalog: &Catalog) -> bool {
+        if let Some(job) = &self.job {
+            job.show(ui, catalog, "1Password");
+            true
+        } else {
+            false
+        }
+    }
     pub(super) fn reading(&self) -> bool {
         self.job.is_some()
     }
@@ -294,9 +302,11 @@ impl HostsApp {
             wizard.error = None;
         }
         let catalog = self.catalog.clone();
-        self.onepassword.job = Some(spawn_job(self.repaint_context.clone(), move || {
-            Ok(work(&catalog))
-        }));
+        self.onepassword.job = Some(spawn_job(
+            self.repaint_context.clone(),
+            self.catalog.clone(),
+            move || Ok(work(&catalog)),
+        ));
     }
 
     /// Lists the vault on a worker; the window mirrors it when it lands.
@@ -462,6 +472,8 @@ impl HostsApp {
     fn save_onepassword_settings(&mut self) {
         if let Err(error) = self.store.save() {
             self.set_status_format("storage_error", &[("error", &error.to_string())]);
+        } else if let Err(error) = crate::vault_hosts::cache::reset(VaultProvider::OnePassword) {
+            self.set_status_format("storage_error", &[("error", &error)]);
         }
     }
 
@@ -515,6 +527,7 @@ impl HostsApp {
             enabled: true,
             cli_path: Some(PathBuf::from(wizard.cli_path.trim())),
             account: Some(account),
+            login_cache_minutes: self.store.onepassword.login_cache_minutes,
         };
         self.save_onepassword_settings();
         self.close_credential_services();
@@ -622,6 +635,9 @@ impl HostsApp {
             PageAction::CancelSetup => {
                 let configured = self.service_configured(HostGroup::OnePassword);
                 let panel = &mut self.onepassword;
+                if let Some(job) = &panel.job {
+                    job.cancel();
+                }
                 panel.wizard = None;
                 panel.view = if configured { View::Page } else { View::Closed };
             }
@@ -1169,7 +1185,7 @@ mod tests {
                 }];
             }
             let (hold, wait) = std::sync::mpsc::channel::<()>();
-            app.onepassword.job = Some(spawn_job(context.clone(), move || {
+            app.onepassword.job = Some(spawn_job(context.clone(), catalog.clone(), move || {
                 let _ = wait.recv();
                 Err("stopped".to_owned())
             }));

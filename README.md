@@ -39,7 +39,7 @@ A Windows SSH / Telnet host manager and MCP server for Codex. Save a host once, 
 
 ## What's new in 0.4.0
 
-- **Bitwarden hosts:** every Login item in a chosen folder is a host (name = alias, `ssh://` or `telnet://` URI = endpoint, username and password = login). It is read through the official `bw` CLI before each use, so vault edits apply on the next call.
+- **Bitwarden hosts:** every Login item in a chosen folder is a host (name = alias, `ssh://` or `telnet://` URI = endpoint, username and password = login), read through the official `bw` CLI.
 - **1Password hosts:** the same for the Login items of a chosen 1Password vault, read through the official `op` CLI and the 1Password desktop app. Unlocking stays in 1Password.
 - **Managed in the window:** create, edit and delete vault hosts in the same editor as local ones. Jump hosts, call approval and Advanced settings stay in `codex-hosts`.
 
@@ -167,8 +167,12 @@ A Bitwarden or 1Password host is its Login item: alias, endpoint, username, pass
 
 To move or copy hosts between Windows Credential Manager, Bitwarden and 1Password, right-click a host and choose **Move to** or **Copy to**, or select several under **Batch manage** and choose **Move / copy…**. The login password goes straight from one store to the other; key passphrases, sudo and su passwords, host-key trust and the Advanced settings come along. A copy gets the name `<alias>-copy`, because names are unique across all stores. A move removes the original only after the copy is saved, and a Bitwarden or 1Password original goes to the trash or archive. When the target already has a host with the same name, or one reaching the same server as the same user, the dialog lists it and you choose: **Skip** (the default) leaves both alone, **Overwrite** writes the host over the existing one (a moved host also gives it its name; an existing password stays if the host has none), and **Keep both** adds it with a number after its name. **Batch manage › Delete** sends the items of Bitwarden and 1Password hosts to the trash or archive too.
 
+Repeated vault reads reuse a process-local snapshot of the host facts and login password for **60 idle minutes by default**; every cache hit renews the expiry. Under **Credential services › Login information cache**, set each provider to 0–1440 minutes (0 disables caching) or choose **Clear cache now**. Clearing also notifies other GUI/MCP instances, whose idle caches are erased within about a second. Each provider holds at most 128 hosts, clears expired passwords even while idle, and never writes them to disk. Refreshing the host group, editing an item or changing settings invalidates the relevant snapshots. Bitwarden still checks its session policy on every call and never caches logins under **every call**. External 1Password changes or locks affect cached reads when the cache expires or is cleared; continued cache hits keep renewing it. Editing always reads the current item before checking for conflicts.
+
+Credential-service background tasks show their authorization, sync, read or write stage, total and stage elapsed time, and a **Cancel** button. CLI processes stop and are reaped before the task leaves its busy state. Each task has a 120-second total deadline in addition to shorter CLI limits. Cancellation or timeout during a write may leave completed changes; refresh and check before repeating the action.
+
 - **Bitwarden:** **Ask again** sets how long the vault stays unlocked: every call, until idle for a set time, until `codex-hosts` closes, or until you lock it. The kept session key is stored in Windows Credential Manager, and ending it also runs `bw lock`.
-- **1Password:** `codex-hosts` never handles your account password. The 1Password app asks you to allow codex-hosts and decides how long that lasts.
+- **1Password:** `codex-hosts` never handles your account password. The 1Password app asks you to allow codex-hosts and decides how long that lasts. If the app cannot be reached, codex-hosts finds and opens it from registered MSIX packages or common installation folders. Sign-in, unlocking and authorization stay in the 1Password app.
 
 </details>
 

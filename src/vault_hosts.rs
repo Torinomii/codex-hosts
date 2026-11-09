@@ -23,6 +23,11 @@ use crate::ssh::RemoteFailure;
 use crate::storage::HostStore;
 use crate::{bitwarden, onepassword};
 
+pub(crate) mod cache;
+#[cfg(test)]
+mod cache_tests;
+pub(crate) mod probe;
+
 /// Custom field holding the host description.
 pub(crate) const DESCRIPTION_FIELD: &str = "description";
 /// Custom field holding the tags, comma separated.
@@ -389,34 +394,36 @@ pub(crate) fn reconcile(
     result
 }
 
-/// Writes the refreshed facts of one item into the stored mirror and returns
-/// the stored profile. A renamed item whose new name clashes with another
-/// host keeps its previous alias in the store. `None` when the mirror is
-/// not in the store (removed meanwhile).
+/// Applies refreshed facts to an existing mirror. A name clash preserves
+/// its local alias; the return value says whether the mirror changed.
+pub(crate) fn refresh_mirror(hosts: &mut [HostProfile], item: &ItemKey, facts: &HostFacts) -> bool {
+    let clash = hosts
+        .iter()
+        .any(|host| host.id != item.id && host.alias.trim().eq_ignore_ascii_case(&facts.alias));
+    let Some(host) = hosts.iter_mut().find(|host| host.id == item.id) else {
+        return false;
+    };
+    let before = host.clone();
+    apply(facts, item, host);
+    if clash {
+        host.alias.clone_from(&before.alias);
+    }
+    *host != before
+}
+
+/// Saves a refreshed mirror and returns it, or None if it was removed meanwhile.
 pub(crate) fn persist_refreshed(
     item: &ItemKey,
     facts: &HostFacts,
 ) -> Result<Option<HostProfile>, String> {
     let _write = crate::storage::write_lock();
     let mut store = HostStore::load().map_err(|error| error.to_string())?;
-    let clash = store
-        .hosts
-        .iter()
-        .any(|host| host.id != item.id && host.alias.trim().eq_ignore_ascii_case(&facts.alias));
-    let Some(host) = store.hosts.iter_mut().find(|host| host.id == item.id) else {
-        return Ok(None);
-    };
-    let previous_alias = host.alias.clone();
-    let mut changed = apply(facts, item, host);
-    if clash {
-        host.alias = previous_alias;
-        changed = true;
-    }
-    let refreshed = host.clone();
+    let changed = refresh_mirror(&mut store.hosts, item, facts);
+    let refreshed = store.hosts.iter().find(|host| host.id == item.id).cloned();
     if changed {
         store.save().map_err(|error| error.to_string())?;
     }
-    Ok(Some(refreshed))
+    Ok(refreshed)
 }
 
 /// Removes the mirror of an item that no longer exists; best effort.
@@ -483,6 +490,9 @@ fn not_a_vault_host() -> RemoteFailure {
 /// manager. Every call goes through here, including one that reuses a
 /// retained session.
 pub(crate) async fn admit(host: &HostProfile) -> Result<AdmittedLogin, RemoteFailure> {
+    if let Some(prepared) = probe::admitted(host) {
+        return prepared;
+    }
     match host.vault_provider() {
         Some(VaultProvider::Bitwarden) => {
             let admitted = bitwarden::admit(host).await?;
@@ -529,6 +539,9 @@ pub(crate) async fn resolve_login_password(
     host: &HostProfile,
     login: Option<VaultLogin>,
 ) -> Result<Zeroizing<String>, RemoteFailure> {
+    if let Some(prepared) = probe::password(host) {
+        return prepared;
+    }
     match host.vault_provider() {
         Some(VaultProvider::Bitwarden) => {
             let session = login.and_then(|login| match login {

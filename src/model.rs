@@ -346,6 +346,24 @@ pub const DEFAULT_SYNC_MAX_AGE_SECONDS: u64 = 0;
 /// Calls that follow each other closely (a batch, a probe then an exec) share
 /// one sync even under "sync before every use".
 pub const MIN_SYNC_SPACING_SECONDS: u64 = 5;
+/// Idle lifetime of a vault login snapshot; a cache hit starts it again.
+pub const DEFAULT_LOGIN_CACHE_MINUTES: u32 = 60;
+pub const MAX_LOGIN_CACHE_MINUTES: u32 = 1440;
+fn is_default_login_cache_minutes(minutes: &u32) -> bool {
+    *minutes == DEFAULT_LOGIN_CACHE_MINUTES
+}
+
+fn deserialize_login_cache_minutes<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let minutes = u32::deserialize(deserializer)?;
+    if minutes > MAX_LOGIN_CACHE_MINUTES {
+        return Err(serde::de::Error::custom(
+            "login_cache_minutes must be between 0 and 1440",
+        ));
+    }
+    Ok(minutes)
+}
 /// The sync-window choices the Bitwarden settings offer, in seconds.
 pub const SYNC_MAX_AGE_CHOICES: [u64; 4] = [0, 60, 5 * 60, 30 * 60];
 /// Folder the wizard proposes for host credentials.
@@ -381,6 +399,12 @@ pub struct OnePasswordSettings {
     /// The chosen account and vault.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<OnePasswordAccount>,
+    /// Idle minutes to keep login snapshots in memory; 0 disables caching.
+    #[serde(
+        skip_serializing_if = "is_default_login_cache_minutes",
+        deserialize_with = "deserialize_login_cache_minutes"
+    )]
+    pub login_cache_minutes: u32,
 }
 
 impl Default for OnePasswordSettings {
@@ -389,6 +413,7 @@ impl Default for OnePasswordSettings {
             enabled: true,
             cli_path: None,
             account: None,
+            login_cache_minutes: DEFAULT_LOGIN_CACHE_MINUTES,
         }
     }
 }
@@ -449,6 +474,12 @@ pub struct BitwardenSettings {
     /// How old the vault cache may be when a vault host is used, in seconds;
     /// 0 syncs before every use.
     pub sync_max_age_seconds: u64,
+    /// Idle minutes to keep login snapshots in memory; 0 disables caching.
+    #[serde(
+        skip_serializing_if = "is_default_login_cache_minutes",
+        deserialize_with = "deserialize_login_cache_minutes"
+    )]
+    pub login_cache_minutes: u32,
 }
 
 impl Default for BitwardenSettings {
@@ -458,6 +489,7 @@ impl Default for BitwardenSettings {
             cli_path: None,
             profile: None,
             sync_max_age_seconds: DEFAULT_SYNC_MAX_AGE_SECONDS,
+            login_cache_minutes: DEFAULT_LOGIN_CACHE_MINUTES,
         }
     }
 }

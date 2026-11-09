@@ -6,12 +6,19 @@
 //! section's `description` and `tags` fields. The window creates, edits and
 //! archives those items like Bitwarden's. Signing in, unlocking, and
 //! authorizing each process (Windows Hello) are the 1Password app's;
-//! codex-hosts keeps no 1Password credential, session, or re-authentication
-//! policy. Listing never reads a password: `op item list` carries no
+//! codex-hosts keeps no 1Password account credential, session, or re-authentication
+//! policy. Host login snapshots have a configurable sliding idle lifetime
+//! in process memory, defaulting to 60 minutes.
+//! Listing never reads a password: `op item list` carries no
 //! secrets, so the description and tags of a listed host stay as last read
 //! from its item and are refreshed whenever the host is used.
 
+mod cache;
 pub(crate) mod cli;
+mod desktop;
+pub(crate) mod probe;
+#[cfg(test)]
+mod process_tests;
 
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -29,6 +36,10 @@ use cli::{OpCall, OpError, OpExecutable, OpItem, OpItemSummary, OpRunner, RealRu
 /// One prompt at a time: calls from this process take turns, so the first
 /// one's Windows Hello authorization serves the rest.
 static CLI_GATE: Mutex<()> = Mutex::const_new(());
+
+pub(crate) fn clear_login_cache() {
+    cache::clear();
+}
 
 /// Namespace of the profile ids derived from 1Password item ids.
 const ITEM_NAMESPACE: Uuid = Uuid::from_u128(0x6f1d_0c2e_8a54_4c7e_9b3f_2d61_a0e4_51c7);
@@ -53,12 +64,16 @@ pub(crate) struct Op<R: OpRunner = RealRunner> {
     runner: R,
     exe: OpExecutable,
     pub(crate) account: OnePasswordAccount,
+    cache_minutes: u32,
 }
 
 impl Op {
     /// The configured account, or the reason 1Password hosts cannot be
     /// served right now.
     pub(crate) fn from_settings(settings: &OnePasswordSettings) -> Result<Self, RemoteFailure> {
+        if !settings.available() {
+            cache::clear();
+        }
         if !settings.enabled {
             return Err(RemoteFailure::new(
                 "ONEPASSWORD_DISABLED",
@@ -72,7 +87,9 @@ impl Op {
             ));
         };
         let exe = OpExecutable::new(cli_path).map_err(|error| failure(error, ""))?;
-        Ok(Self::new(RealRunner, exe, account.clone()))
+        let mut op = Self::new(RealRunner, exe, account.clone());
+        op.cache_minutes = settings.login_cache_minutes;
+        Ok(op)
     }
 }
 
@@ -82,6 +99,7 @@ impl<R: OpRunner> Op<R> {
             runner,
             exe,
             account,
+            cache_minutes: crate::model::DEFAULT_LOGIN_CACHE_MINUTES,
         }
     }
 
@@ -89,7 +107,11 @@ impl<R: OpRunner> Op<R> {
         &self,
         make: impl Fn() -> Result<OpCall, OpError>,
     ) -> Result<Zeroizing<Vec<u8>>, OpError> {
-        run_once_more(&self.runner, &self.exe, make).await
+        let result = run_with_app_start(&self.runner, &self.exe, make).await;
+        if result.is_err() {
+            cache::clear();
+        }
+        result
     }
 
     pub(crate) fn item_key(&self, item_id: &str) -> ItemKey {
@@ -98,6 +120,7 @@ impl<R: OpRunner> Op<R> {
 
     /// The vault's items; nothing secret is read.
     pub(crate) async fn list_items(&self) -> Result<Vec<OpItemSummary>, OpError> {
+        cache::clear();
         let (account, vault) = (&self.account.account_id, &self.account.vault_id);
         let stdout = self.run(|| OpCall::item_list(account, vault)).await?;
         cli::parse_item_list(&stdout)
@@ -115,6 +138,7 @@ impl<R: OpRunner> Op<R> {
     /// Writes the host into its item, or creates the item. An existing item
     /// whose version is not the one the editor read is left alone.
     pub(crate) async fn save(&self, write: &HostWrite) -> Result<OpItem, WriteFailure> {
+        cache::clear();
         let (account, vault) = (&self.account.account_id, &self.account.vault_id);
         let mut codex = write.codex_fields();
         let section: Vec<(&str, String)> = [DESCRIPTION_FIELD, TAGS_FIELD]
@@ -159,6 +183,7 @@ impl<R: OpRunner> Op<R> {
     /// Moves the item to the 1Password archive; an item already gone is
     /// fine.
     pub(crate) async fn archive(&self, item_id: &str) -> Result<(), OpError> {
+        cache::clear();
         let (account, vault) = (&self.account.account_id, &self.account.vault_id);
         match self
             .run(|| OpCall::item_archive(account, vault, item_id))
@@ -221,21 +246,43 @@ pub(crate) async fn create_vault(
     name: &str,
 ) -> Result<cli::OpVault, OpError> {
     let _turn = CLI_GATE.lock().await;
-    let stdout = run_once_more(&RealRunner, exe, || OpCall::vault_create(account, name)).await?;
+    let stdout =
+        run_with_app_start(&RealRunner, exe, || OpCall::vault_create(account, name)).await?;
     cli::parse_vault(&stdout)
 }
 
-/// Runs `call` once more when the first attempt could not reach the app.
-async fn run_once_more<R: OpRunner>(
+/// Retains the transient-error retry, then opens the desktop app when it is
+/// installed but unreachable. Only connection-to-app failures are retried;
+/// authorization refusals and command errors are returned as they are.
+async fn run_with_app_start<R: OpRunner>(
     runner: &R,
     exe: &OpExecutable,
     make: impl Fn() -> Result<OpCall, OpError>,
 ) -> Result<Zeroizing<Vec<u8>>, OpError> {
     let mut retried = false;
+    let mut startup_deadline = None;
     loop {
         let output = runner.run(exe, make()?).await.map_err(cli::run_failure)?;
+        let before_connection = cli::failed_before_app_connection(&output);
         match cli::outcome(output) {
-            Err(error) if error.retry_once() && !retried => retried = true,
+            Err(error) if error.retry_once() && before_connection => {
+                if !retried {
+                    retried = true;
+                    continue;
+                }
+                match startup_deadline {
+                    None => {
+                        if !runner.start_desktop_app().await.map_err(cli::run_failure)? {
+                            return Err(error);
+                        }
+                        startup_deadline =
+                            Some(tokio::time::Instant::now() + std::time::Duration::from_secs(15));
+                    }
+                    Some(deadline) if tokio::time::Instant::now() >= deadline => return Err(error),
+                    Some(_) => {}
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
             other => return other,
         }
     }
@@ -246,9 +293,9 @@ async fn run_once_more<R: OpRunner>(
 pub(crate) async fn check_cli(
     exe: &OpExecutable,
 ) -> Result<(String, Vec<cli::OpAccount>), OpError> {
-    let version = run_once_more(&RealRunner, exe, || Ok(OpCall::version())).await?;
+    let version = run_with_app_start(&RealRunner, exe, || Ok(OpCall::version())).await?;
     let (major, minor, patch) = cli::parse_version(&version)?;
-    let accounts = run_once_more(&RealRunner, exe, || Ok(OpCall::account_list())).await?;
+    let accounts = run_with_app_start(&RealRunner, exe, || Ok(OpCall::account_list())).await?;
     let accounts = cli::parse_accounts(&accounts)?;
     if accounts.is_empty() {
         return Err(OpError::IntegrationOff);
@@ -263,7 +310,7 @@ pub(crate) async fn list_vaults(
     account: &str,
 ) -> Result<Vec<cli::OpVault>, OpError> {
     let _turn = CLI_GATE.lock().await;
-    let stdout = run_once_more(&RealRunner, exe, || OpCall::vault_list(account)).await?;
+    let stdout = run_with_app_start(&RealRunner, exe, || OpCall::vault_list(account)).await?;
     cli::parse_vaults(&stdout)
 }
 
@@ -407,34 +454,33 @@ async fn read_item<R: OpRunner>(op: &Op<R>, host: &HostProfile) -> Result<OpItem
     }
 }
 
-/// Admits a login operation for a 1Password host: reads the item (the app
+/// Admits a login operation for a 1Password host: reads or reuses a short-lived
+/// in-memory item snapshot (the app
 /// asks the user when this process is not authorized yet) and refreshes the
 /// mirror, so the connection uses the endpoint, account and password the
 /// vault holds now.
 pub(crate) async fn admit(host: &HostProfile) -> Result<AdmittedLogin, RemoteFailure> {
     let _turn = CLI_GATE.lock().await;
     let op = Op::from_settings(&settings()?)?;
-    let item = read_item(&op, host).await?;
-    let facts = item_facts(&item).map_err(|problem| problem_failure(&host.alias, &problem))?;
-    let password = item
-        .password()
-        .map_err(|error| failure(error, &host.alias))?;
-    let key = op.item_key(&item.summary().id);
-    let refreshed = match vault_hosts::persist_refreshed(&key, &facts) {
+    let (read, fresh) = cache::read(&op, host).await?;
+    let refreshed = match vault_hosts::persist_refreshed(&read.key, &read.facts) {
         Ok(Some(stored)) => stored,
         _ => {
             let mut copy = host.clone();
-            vault_hosts::apply(&facts, &key, &mut copy);
+            vault_hosts::apply(&read.facts, &read.key, &mut copy);
             copy
         }
     };
+    if fresh {
+        cache::remember(&op, &read)?;
+    }
     Ok(AdmittedLogin {
         host: refreshed,
         admission: Admission::OnePassword {
-            item_id: key.id,
-            revision: facts.revision,
+            item_id: read.key.id,
+            revision: read.facts.revision,
         },
-        login: VaultLogin::OnePassword(password),
+        login: VaultLogin::OnePassword(read.password),
     })
 }
 
@@ -458,9 +504,8 @@ pub(crate) async fn login_password(
 ) -> Result<Option<Zeroizing<String>>, RemoteFailure> {
     let _turn = CLI_GATE.lock().await;
     let op = Op::from_settings(&settings()?)?;
-    let item = read_item(&op, host).await?;
-    let facts = item_facts(&item).map_err(|problem| problem_failure(&host.alias, &problem))?;
-    if facts.username != host.username.trim() {
+    let (read, fresh) = cache::read(&op, host).await?;
+    if read.facts.username != host.username.trim() {
         return Err(RemoteFailure::new(
             "ONEPASSWORD_ITEM_MISMATCH",
             format!(
@@ -469,10 +514,10 @@ pub(crate) async fn login_password(
             ),
         ));
     }
-    Ok(item
-        .password()
-        .map_err(|error| failure(error, &host.alias))?
-        .filter(|password| !password.is_empty()))
+    if fresh {
+        cache::remember(&op, &read)?;
+    }
+    Ok(read.password.filter(|password| !password.is_empty()))
 }
 
 /// Lists the vault and mirrors it into the store (saved when something
@@ -527,6 +572,151 @@ mod tests {
     }
 
     const OTHER: &str = "testother00000000000000000";
+
+    struct StartingRunner {
+        scripted: Scripted,
+        starts: std::sync::atomic::AtomicUsize,
+        found: bool,
+        always_unavailable: bool,
+    }
+
+    impl OpRunner for StartingRunner {
+        async fn run(
+            &self,
+            exe: &OpExecutable,
+            call: OpCall,
+        ) -> Result<codex_hosts_bw::BwOutput, codex_hosts_bw::BwRunError> {
+            if self.always_unavailable {
+                return Ok(codex_hosts_bw::BwOutput {
+                    exit_code: Some(1),
+                    stdout: Zeroizing::new(Vec::new()),
+                    stderr: Zeroizing::new(b"cannot connect to 1Password app".to_vec()),
+                });
+            }
+            self.scripted.run(exe, call).await
+        }
+
+        async fn start_desktop_app(&self) -> Result<bool, codex_hosts_bw::BwRunError> {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.found)
+        }
+    }
+
+    impl StartingRunner {
+        fn new(answers: Vec<Answer>, found: bool) -> Self {
+            Self {
+                scripted: Scripted::new(answers),
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                found,
+                always_unavailable: false,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_app_is_started_once_and_given_time_to_connect() {
+        let error = || {
+            (
+                vec!["account", "list"],
+                Some(1),
+                String::new(),
+                "cannot connect to 1Password app",
+            )
+        };
+        let runner = StartingRunner::new(
+            vec![
+                error(),
+                error(),
+                error(),
+                (vec!["account", "list"], Some(0), "[]".into(), ""),
+            ],
+            true,
+        );
+        let result = run_with_app_start(&runner, &stub_op("desktop-start"), || {
+            Ok(OpCall::account_list())
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.as_slice(), b"[]");
+        assert_eq!(runner.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(runner.scripted.finished());
+    }
+
+    #[tokio::test]
+    async fn authorization_and_command_failures_neither_launch_nor_repeat() {
+        for message in [
+            "authorization was denied",
+            "no accounts configured",
+            "command failed",
+        ] {
+            let runner = StartingRunner::new(
+                vec![(vec!["account", "list"], Some(1), String::new(), message)],
+                true,
+            );
+            let result = run_with_app_start(&runner, &stub_op("desktop-no-retry"), || {
+                Ok(OpCall::account_list())
+            })
+            .await;
+            assert!(result.is_err());
+            assert_eq!(runner.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert!(runner.scripted.finished());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_desktop_app_preserves_the_unavailable_error() {
+        let error = || {
+            (
+                vec!["account", "list"],
+                Some(1),
+                String::new(),
+                "cannot connect to 1Password app",
+            )
+        };
+        let runner = StartingRunner::new(vec![error(), error()], false);
+        let result = run_with_app_start(&runner, &stub_op("desktop-missing"), || {
+            Ok(OpCall::account_list())
+        })
+        .await;
+        assert!(matches!(result, Err(OpError::AppUnavailable)));
+        assert_eq!(runner.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(runner.scripted.finished());
+    }
+
+    #[tokio::test]
+    async fn transport_loss_does_not_repeat_a_vault_write() {
+        for message in ["LostConnectionToApp", "connectionreset"] {
+            let runner = StartingRunner::new(
+                vec![(vec!["item", "create"], Some(1), String::new(), message)],
+                true,
+            );
+            let result = run_with_app_start(&runner, &stub_op("desktop-write-loss"), || {
+                OpCall::item_create(ACCOUNT, VAULT, Zeroizing::new(b"{}".to_vec()))
+            })
+            .await;
+            assert!(matches!(result, Err(OpError::AppUnavailable)));
+            assert_eq!(runner.starts.load(std::sync::atomic::Ordering::SeqCst), 0);
+            assert_eq!(runner.scripted.payloads().len(), 1);
+            assert!(runner.scripted.finished());
+        }
+    }
+
+    #[tokio::test]
+    async fn app_startup_stops_retrying_when_the_app_never_connects() {
+        let mut runner = StartingRunner::new(Vec::new(), true);
+        runner.always_unavailable = true;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_with_app_start(&runner, &stub_op("desktop-timeout"), || {
+                Ok(OpCall::account_list())
+            }),
+        )
+        .await
+        .expect("desktop startup retry must be bounded");
+        assert!(matches!(result, Err(OpError::AppUnavailable)));
+        assert_eq!(runner.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn item_keys_are_stable_and_keep_the_op_id() {
@@ -706,8 +896,13 @@ mod tests {
     /// id>|<vault id>", with a `p0-fake-host` Login item in that vault. Run
     /// with `--ignored`; the app asks once for this test process.
     #[test]
-    #[ignore = "needs the 1Password app and a test vault"]
+    #[ignore = "manual only: scripts/check.ps1 -Step op-live"]
     fn live_listing_and_item_read() {
+        let starts_before = desktop::START_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        let app = desktop::detect()
+            .expect("desktop app discovery succeeds")
+            .expect("a real 1Password desktop app is installed in a supported location");
+        assert!(app.is_file());
         let spec = std::env::var("CODEX_HOSTS_OP_LIVE").expect("CODEX_HOSTS_OP_LIVE");
         let [exe, account_id, vault_id] = spec.split('|').collect::<Vec<_>>()[..] else {
             panic!("CODEX_HOSTS_OP_LIVE = <op.exe>|<account>|<vault>");
@@ -725,10 +920,16 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let (_, accounts) = runtime.block_on(check_cli(&op.exe)).unwrap();
+        assert!(
+            accounts
+                .iter()
+                .any(|account| account.account_uuid == op.account.account_id)
+        );
         let items = runtime.block_on(op.list_items()).unwrap();
         let mut store = HostStore::default();
         let result = reconcile(&op, &mut store, &items);
-        println!("hosts {}, problems {:?}", result.hosts, result.problems);
+        assert!(result.hosts > 0, "the test vault contains a host fixture");
         let host = store.find_alias("p0-fake-host").unwrap().clone();
         let item_id = host.vault().unwrap().external_id.clone().unwrap();
         let item = runtime.block_on(op.get_item(&item_id)).unwrap();
@@ -738,6 +939,13 @@ mod tests {
         assert!(item.password().unwrap().is_some_and(|p| !p.is_empty()));
         let missing = runtime.block_on(op.get_item("zzzzzzzzzzzzzzzzzzzzzzzzzz"));
         assert_eq!(missing.unwrap_err().code(), "ONEPASSWORD_ITEM_MISSING");
+        if std::env::var_os("CODEX_HOSTS_OP_EXPECT_APP_START").is_some() {
+            assert!(
+                desktop::START_COUNT.load(std::sync::atomic::Ordering::SeqCst) > starts_before,
+                "the real desktop launch path must execute during a cold-start test"
+            );
+            println!("Automatic desktop launch verified.");
+        }
     }
 
     #[test]

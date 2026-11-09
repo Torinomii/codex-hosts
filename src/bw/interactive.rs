@@ -17,6 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::UnboundedReceiver;
 use zeroize::{Zeroize, Zeroizing};
 
+use super::operation::{self, Control, Stage, Stop};
 use super::output::{CliFailure, OutputError, classify_failure, parse_raw_session};
 use super::policy::{BwInvocation, MAX_OUTPUT_BYTES, SessionKey};
 use super::runner::BwRunError;
@@ -87,8 +88,26 @@ pub async fn login(
     answers: &mut UnboundedReceiver<Zeroizing<String>>,
 ) -> Result<LoginOutcome, LoginError> {
     debug_assert!(invocation.is_interactive());
-    let deadline = tokio::time::Instant::now() + invocation.timeout();
-    let timeout = invocation.timeout();
+    let control = Control::current();
+    if let Some(control) = &control {
+        control.stage(Stage::Authorizing);
+    }
+    let timeout = control.as_ref().map_or(invocation.timeout(), |control| {
+        control.remaining(invocation.timeout())
+    });
+    if let Some(control) = &control {
+        if timeout.is_zero() {
+            control.stop(Stop::TimedOut);
+        }
+        if let Some(reason) = control.snapshot().stopped {
+            return Err(match reason {
+                Stop::Cancelled => BwRunError::Cancelled,
+                Stop::TimedOut => BwRunError::Timeout(timeout),
+            }
+            .into());
+        }
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut command = invocation.command();
     command
         .stdin(Stdio::piped())
@@ -167,8 +186,10 @@ pub async fn login(
                 Err(error) => break Err(BwRunError::Io(error).into()),
             },
             () = tokio::time::sleep_until(deadline) => {
+                if let Some(control) = &control { control.stop(Stop::TimedOut); }
                 break Err(BwRunError::Timeout(timeout).into());
             }
+            () = operation::cancelled(control.as_ref()) => break Err(BwRunError::Cancelled.into()),
         }
     };
     // Every early exit leaves the child running; none of them may keep it.

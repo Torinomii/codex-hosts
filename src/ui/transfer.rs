@@ -855,7 +855,6 @@ impl HostsApp {
                 let _ = credentials::delete_host(host);
                 crate::ssh::invalidate_profile(host.id);
                 self.test_operations.remove(&host.id);
-                self.pending_tests.retain(|pending| *pending != host.id);
                 self.test_states.remove(&host.id);
             }
             let open = self.selected;

@@ -67,6 +67,7 @@ pub(super) fn status_kind_for_key(key: &str) -> StatusKind {
         | "op_setup_done"
         | "vault_refreshed"
         | "hosts_refreshed" => StatusKind::Success,
+        "vault_cache_cleared" | "vault_cache_saved" => StatusKind::Success,
         _ if key.ends_with("_error")
             || key.ends_with("_failed")
             || key.ends_with("_timeout")
@@ -114,7 +115,7 @@ impl HostsApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(12.0);
                 let summary = if self.testing_all {
-                    let running = self.test_operations.len() + self.pending_tests.len();
+                    let running = self.test_operations.len();
                     self.catalog.format(
                         "status_testing_progress",
                         &[("remaining", &running.to_string())],
@@ -131,6 +132,11 @@ impl HostsApp {
                 ui.label(RichText::new(summary).weak());
                 ui.separator();
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    if self.show_vault_progress(ui)
+                        || self.onepassword.show_progress(ui, &self.catalog)
+                    {
+                        return;
+                    }
                     ui.add(egui::Label::new(&self.status.text).truncate())
                         .on_hover_text(&self.status.text);
                 });
