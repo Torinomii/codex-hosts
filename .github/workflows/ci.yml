@@ -1,15 +1,12 @@
 name: Check
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
 
 permissions:
   contents: read
 
-# A newer push to the same branch or pull request replaces a run in progress.
+# New commits to a pull request replace its in-progress check.
 concurrency:
   group: check-${{ github.ref }}
   cancel-in-progress: true
