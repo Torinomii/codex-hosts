@@ -17,15 +17,16 @@ $archivePath = Join-Path $OutputDirectory 'codex-hosts-windows-x86_64.zip'
 if ((Test-Path -LiteralPath $archivePath) -or (Test-Path -LiteralPath "$archivePath.sha256")) {
     throw "Output already exists: $archivePath. Choose a fresh output directory."
 }
-$required = @('SKILL.md', 'agents/openai.yaml', 'references/approvals.md', 'references/sudo.md',
+$required = @('SKILL.md', 'VERSION', 'agents/openai.yaml', 'references/approvals.md', 'references/sudo.md',
     'references/su.md', 'references/hardware-keys.md', 'references/host-editor.md',
-    'references/long-running.md', 'references/temporary-secrets.md', 'references/tool-protocol.md')
+    'references/long-running.md', 'references/temporary-secrets.md', 'references/tool-protocol.md',
+    'references/setup.md', 'references/vault-hosts.md', 'references/file-transfer.md', 'references/errors.md')
 foreach ($relative in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $skill $relative) -PathType Leaf)) { throw "Required Skill file missing: $relative" }
 }
 # Include all Skill documents/metadata, including newly added references, but
 # never follow a local bin link into build products or include local backups.
-$documents = @((Get-Item -LiteralPath (Join-Path $skill 'SKILL.md')))
+$documents = @(Get-Item -LiteralPath (Join-Path $skill 'SKILL.md'), (Join-Path $skill 'VERSION'))
 foreach ($directory in @('agents', 'references')) {
     $root = Get-Item -LiteralPath (Join-Path $skill $directory)
     $entries = @($root) + @(Get-ChildItem -LiteralPath $root.FullName -Recurse -Force)

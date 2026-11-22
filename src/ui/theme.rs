@@ -5,6 +5,18 @@ use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily};
 
 use crate::i18n::Catalog;
 
+pub(super) const PANE_HEADER_TOP: f32 = 10.0;
+pub(super) const SECTION_TEXT_SIZE: f32 = 15.0;
+
+pub(super) fn host_pane_type(ui: &mut egui::Ui) {
+    use egui::TextStyle::{Body, Button, Heading, Small};
+    for (role, size) in [(Heading, 18.0), (Body, 14.0), (Button, 14.0), (Small, 12.0)] {
+        if let Some(font) = ui.style_mut().text_styles.get_mut(&role) {
+            font.size = size;
+        }
+    }
+}
+
 pub(super) fn apply_style(context: &egui::Context) {
     context.all_styles_mut(|style| {
         style.spacing.button_padding = egui::vec2(12.0, 6.0);

@@ -32,12 +32,10 @@ fn main() {
         Ok(LaunchMode::Gui(options)) => launch_gui(*options),
         Ok(LaunchMode::TemporarySecrets(session)) => {
             let _ = session;
-            if !temporary_secrets::restore_existing(true) {
-                launch_gui(ui::LaunchOptions {
-                    show_temporary: true,
-                    ..Default::default()
-                });
-            }
+            launch_gui(ui::LaunchOptions {
+                show_temporary: true,
+                ..Default::default()
+            });
         }
         Ok(LaunchMode::Mcp) => std::process::exit(mcp::run()),
         Ok(LaunchMode::Version) => {
@@ -51,15 +49,26 @@ fn main() {
 }
 
 fn launch_gui(options: ui::LaunchOptions) {
-    if !options.codex_edit && temporary_secrets::restore_existing(options.show_temporary) {
+    let restore = if options.codex_edit {
+        Ok(false)
+    } else {
+        temporary_secrets::restore_existing(options.show_temporary)
+    };
+    if matches!(restore, Ok(true)) {
         return;
     }
     let preferred_locale = storage::HostStore::load_recovering()
         .ok()
         .and_then(|store| store.preferred_locale);
-    let title = i18n::Catalog::for_locale(preferred_locale.as_deref())
-        .text("app_title")
-        .to_owned();
+    let catalog = i18n::Catalog::for_locale(preferred_locale.as_deref());
+    let title = catalog.text("app_title").to_owned();
+    if restore.is_err() {
+        rfd::MessageDialog::new()
+            .set_title(&title)
+            .set_description(catalog.text("temp_incompatible_holder"))
+            .show();
+        return;
+    }
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-256.png"))
         .expect("embedded application icon is valid");
     let native_options = eframe::NativeOptions {

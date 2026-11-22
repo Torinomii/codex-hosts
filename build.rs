@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=languages");
     println!("cargo:rerun-if-changed=assets/icon.ico");
 
@@ -11,7 +12,7 @@ fn main() {
         winresource::WindowsResource::new()
             .set_icon("assets/icon.ico")
             .compile()
-            .expect("cannot embed Windows application icon");
+            .expect("cannot embed Windows application icon and version information");
     }
 
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));

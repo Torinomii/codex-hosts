@@ -27,17 +27,25 @@ const APPROVAL_LIFETIME: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
-    #[serde(rename = "request")]
+    // A holder that still permits IPC clear rejects these actions before touching
+    // the vault. Current holders also accept the original client spellings.
+    #[serde(rename = "manual_clear_declare", alias = "request")]
     Declare {
         fields: Vec<String>,
     },
+    #[serde(rename = "manual_clear_status", alias = "status")]
     Status,
+    Restore {
+        temporary: bool,
+    },
     Show {
         temporary: bool,
     },
+    /// Older clients can still send this action. The holder always rejects it.
     Clear {
         fields: Vec<String>,
     },
+    #[serde(rename = "manual_clear_execute", alias = "execute")]
     Execute(Execution),
     ReviewSsh {
         id: Uuid,
@@ -129,6 +137,7 @@ impl Response {
 }
 
 const HOLDER_SHARES_JOB_WARNING: &str = "The secret window was started inside the caller's job object and will close when that process (usually Codex) exits. Start the codex-hosts GUI by hand before opening secrets to keep the window independent.";
+pub(crate) const INCOMPATIBLE_HOLDER: &str = "TEMPORARY_WINDOW_INCOMPATIBLE";
 
 // Deliberately no Serialize or Debug on secret-bearing types.
 struct Field {
@@ -172,9 +181,9 @@ impl Default for Vault {
     }
 }
 
-fn validate_names(names: &[String], allow_empty: bool) -> Result<(), &'static str> {
+fn validate_names(names: &[String]) -> Result<(), &'static str> {
     let mut unique = HashSet::new();
-    if (!allow_empty && names.is_empty()) || names.len() > MAX_FIELDS {
+    if names.is_empty() || names.len() > MAX_FIELDS {
         return Err("FIELD_NAMES_INVALID");
     }
     for name in names {
@@ -192,7 +201,7 @@ fn validate_names(names: &[String], allow_empty: bool) -> Result<(), &'static st
 
 impl Vault {
     fn request(&mut self, names: &[String]) -> Result<(), &'static str> {
-        validate_names(names, false)?;
+        validate_names(names)?;
         let added = names
             .iter()
             .filter(|name| !self.fields.iter().any(|f| &f.name == *name))
@@ -224,21 +233,6 @@ impl Vault {
         self.fields
             .iter()
             .any(|field| field.requires_approval != self.default_requires_approval)
-    }
-    fn clear(&mut self, names: &[String]) -> Result<(), &'static str> {
-        validate_names(names, true)?;
-        if names
-            .iter()
-            .any(|n| !self.fields.iter().any(|f| &f.name == n))
-        {
-            return Err("FIELD_NOT_FOUND");
-        }
-        for field in &mut self.fields {
-            if names.is_empty() || names.contains(&field.name) {
-                field.clear();
-            }
-        }
-        Ok(())
     }
     fn status(&self) -> Vec<FieldStatus> {
         self.fields
@@ -312,7 +306,6 @@ impl Execution {
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect::<Vec<_>>(),
-            false,
         )
     }
 }
@@ -504,6 +497,9 @@ impl SecretsApp {
     }
     fn handle(&mut self, request: Request) -> Response {
         let request = match request {
+            Request::Clear { .. } => {
+                return Response::error(self.session, "SECRET_CLEAR_UI_ONLY");
+            }
             Request::ReviewSsh { id, review } => {
                 let status = self.ssh_approvals.submit(id, review);
                 self.restore_requested |= status == "pending";
@@ -532,7 +528,10 @@ impl SecretsApp {
             }
             request => request,
         };
-        if !matches!(&request, Request::Status | Request::Show { .. }) {
+        if !matches!(
+            &request,
+            Request::Status | Request::Show { .. } | Request::Restore { .. }
+        ) {
             self.input_status = "ok";
         }
         let mut operation_id = None;
@@ -545,7 +544,7 @@ impl SecretsApp {
                 }
                 result
             }
-            Request::Show { temporary } => {
+            Request::Show { temporary } | Request::Restore { temporary } => {
                 if temporary {
                     self.visible = true;
                 }
@@ -553,14 +552,6 @@ impl SecretsApp {
                 Ok(())
             }
             Request::Status => Ok(()),
-            Request::Clear { fields } => {
-                // Clear also revokes pending approvals; running child already owns its environment.
-                let result = self.vault.clear(&fields);
-                if result.is_ok() {
-                    self.cancel_pending();
-                }
-                result
-            }
             Request::Execute(execution) => match self.vault.environment(&execution) {
                 Err(code) => Err(code),
                 Ok(_) => {
@@ -598,7 +589,8 @@ impl SecretsApp {
                     Ok(())
                 }
             },
-            Request::ReviewSsh { .. }
+            Request::Clear { .. }
+            | Request::ReviewSsh { .. }
             | Request::TakeSshApproval { .. }
             | Request::CancelSshApproval { .. }
             | Request::UnlockBitwarden { .. }
@@ -1362,7 +1354,7 @@ impl SecretsApp {
                 egui::ScrollArea::vertical()
                     .id_salt("temporary_secret_scroll")
                     .auto_shrink([false, false])
-                    .min_scrolled_height(96.0)
+                    .min_scrolled_height(0.0)
                     .show(ui, |ui| self.field_rows(ui));
             });
         });
@@ -1514,46 +1506,50 @@ impl SecretsApp {
     fn history(&mut self, ui: &mut egui::Ui) {
         let mut stop = false;
         ui.add_space(4.0);
-        egui::Frame::new()
+        let frame = egui::Frame::new()
             .fill(crate::ui::theme::section_fill(ui.visuals()))
             .stroke(crate::ui::theme::section_stroke(ui.visuals()))
             .corner_radius(8.0)
-            .inner_margin(egui::Margin::symmetric(12, 8))
-            .show(ui, |ui| {
-                ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.strong(self.catalog.text("temp_operations"));
-                    egui::ScrollArea::vertical()
-                        .id_salt("temporary_history_scroll")
-                        .auto_shrink([false, true])
-                        .max_height(150.0)
-                        .show(ui, |ui| {
-                            for operation in self.operations.iter().rev() {
-                                ui.horizontal(|ui| {
-                                    let tone = status_tone(&operation.result.status);
-                                    ui.label(
-                                        egui::RichText::new("●").color(tone.color(ui.visuals())),
-                                    );
-                                    if operation.result.status == "running"
-                                        && ui.small_button(self.catalog.text("temp_stop")).clicked()
-                                    {
-                                        stop = true;
-                                    }
-                                    ui.add(
-                                        egui::Label::new(operation_summary(
-                                            &self.catalog,
-                                            operation,
-                                        ))
+            .inner_margin(egui::Margin::symmetric(12, 8));
+        // Reserve the history's space from the bottom before drawing its rows
+        // top-down. Leave at least half of the remaining height for the fields.
+        let gap = ui.spacing().item_spacing.y;
+        let text_height = ui.text_style_height(&egui::TextStyle::Body);
+        let row_height = ui.spacing().interact_size.y.max(text_height);
+        let rows_height = (row_height + gap) * self.operations.len() as f32 - gap;
+        let height = frame.total_margin().sum().y + text_height + gap + rows_height.min(150.0);
+        let size = egui::vec2(
+            ui.available_width(),
+            height.min(ui.available_height() * 0.5),
+        );
+        ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+            frame.show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.strong(self.catalog.text("temp_operations"));
+                egui::ScrollArea::vertical()
+                    .id_salt("temporary_history_scroll")
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for operation in self.operations.iter().rev() {
+                            ui.horizontal(|ui| {
+                                let tone = status_tone(&operation.result.status);
+                                ui.label(egui::RichText::new("●").color(tone.color(ui.visuals())));
+                                if operation.result.status == "running"
+                                    && ui.small_button(self.catalog.text("temp_stop")).clicked()
+                                {
+                                    stop = true;
+                                }
+                                ui.add(
+                                    egui::Label::new(operation_summary(&self.catalog, operation))
                                         .truncate(),
-                                    )
-                                    .on_hover_text(
-                                        operation.execution.program.display().to_string(),
-                                    );
-                                });
-                            }
-                        });
-                });
+                                )
+                                .on_hover_text(operation.execution.program.display().to_string());
+                            });
+                        }
+                    });
             });
+        });
         if stop && let Some(running) = &self.running {
             running.cancel.store(true, Ordering::Relaxed);
         }
@@ -1572,26 +1568,37 @@ pub fn current_user_sid() -> std::io::Result<String> {
     }
 }
 
-pub fn restore_existing(temporary: bool) -> bool {
+pub fn restore_existing(temporary: bool) -> Result<bool, &'static str> {
     #[cfg(windows)]
     {
-        ipc::discover(Request::Show { temporary }).is_ok()
+        match ipc::discover(Request::Restore { temporary }) {
+            Ok(response) => check_holder(response).map(|_| true),
+            Err(_) => Ok(false),
+        }
     }
     #[cfg(not(windows))]
     {
         let _ = temporary;
-        false
+        Ok(false)
     }
 }
 
 pub fn open(fields: Vec<String>) -> Result<Response, &'static str> {
-    validate_names(&fields, false)?;
+    validate_names(&fields)?;
     request_gui(Request::Declare { fields })
+}
+
+fn check_holder(response: Response) -> Result<Response, &'static str> {
+    if response.code.as_deref() == Some(INCOMPATIBLE_HOLDER) {
+        Err(INCOMPATIBLE_HOLDER)
+    } else {
+        Ok(response)
+    }
 }
 
 pub(crate) fn request_gui(request: Request) -> Result<Response, &'static str> {
     if let Ok(response) = ipc::discover(request.clone()) {
-        return Ok(response);
+        return check_holder(response);
     }
     let exe = std::env::current_exe().map_err(|_| "TEMPORARY_WINDOW_FAILED")?;
     let (mut child, shares_job) = spawn_holder(&exe).map_err(|_| "TEMPORARY_WINDOW_FAILED")?;
@@ -1601,7 +1608,7 @@ pub(crate) fn request_gui(request: Request) -> Result<Response, &'static str> {
             if shares_job {
                 response.warning = Some(HOLDER_SHARES_JOB_WARNING.into());
             }
-            return Ok(response);
+            return check_holder(response);
         }
         // A concurrent launcher may exit after handing off to the winning instance.
         let _ = child.try_wait();
@@ -1674,7 +1681,7 @@ fn job_kills_on_close() -> bool {
 pub fn call(session: Uuid, request: Request) -> Result<Response, &'static str> {
     #[cfg(windows)]
     {
-        ipc::call(session, request).map_err(|_| "TEMPORARY_SESSION_UNAVAILABLE")
+        check_holder(ipc::call(session, request).map_err(|_| "TEMPORARY_SESSION_UNAVAILABLE")?)
     }
     #[cfg(not(windows))]
     {
@@ -1682,6 +1689,9 @@ pub fn call(session: Uuid, request: Request) -> Result<Response, &'static str> {
         Err("PLATFORM_UNSUPPORTED")
     }
 }
+
+#[cfg(all(test, windows))]
+pub(crate) use tests::app as isolated_test_app;
 
 #[cfg(test)]
 mod tests {
@@ -1725,7 +1735,7 @@ mod tests {
             .request(&["project-local-qwen-apikey".into()])
             .unwrap();
         assert!(!vault.fields[0].requires_approval); // Reopening preserves the user's choice.
-        vault.clear(&[]).unwrap();
+        vault.fields[0].clear();
         assert!(!vault.fields[0].requires_approval);
         let old: FieldStatus =
             serde_json::from_str(r#"{"name":"old-holder","ready":true}"#).unwrap();
@@ -1741,10 +1751,10 @@ mod tests {
         let mut vault = vault();
         assert!(vault.request(&["new".into(), "\n".into()]).is_err());
         assert_eq!(vault.fields.len(), 1);
-        assert!(validate_names(&["x".into(), "x".into()], false).is_err());
-        assert!(validate_names(&["x".repeat(257)], false).is_err());
-        assert!(validate_names(&vec!["x".into(); 65], false).is_err());
-        assert!(validate_names(&[], false).is_err());
+        assert!(validate_names(&["x".into(), "x".into()]).is_err());
+        assert!(validate_names(&["x".repeat(257)]).is_err());
+        assert!(validate_names(&vec!["x".into(); 65]).is_err());
+        assert!(validate_names(&[]).is_err());
         vault
             .request(&[
                 "project-local-qwen-apikey".into(),
@@ -1769,9 +1779,7 @@ mod tests {
                 .contains("sentinel")
         );
         vault.fields[0].draft.push_str("replacement");
-        assert!(vault.clear(&["unknown".into()]).is_err());
-        assert!(vault.status()[0].ready);
-        vault.clear(&[]).unwrap();
+        vault.fields[0].clear();
         assert!(!vault.status()[0].ready);
         assert!(vault.fields[0].draft.is_empty());
         assert!(Vault::default().fields.is_empty());
@@ -1861,7 +1869,7 @@ mod tests {
         );
     }
     #[cfg(windows)]
-    fn app() -> SecretsApp {
+    pub(crate) fn app() -> SecretsApp {
         let session = Uuid::new_v4();
         let (sender, inbox) = mpsc::sync_channel(8);
         let server = ipc::Server::start(session, sender, egui::Context::default()).unwrap();
@@ -2049,7 +2057,7 @@ mod tests {
             app.handle(Request::Execute(call));
             assert_eq!(app.operations[1].result.status, "queued");
             if clear {
-                app.handle(Request::Clear { fields: vec![] });
+                app.delete_all_fields();
             } else {
                 app.vault.fields[0].requires_approval = true;
                 app.record_input_status("ok");
@@ -2064,7 +2072,7 @@ mod tests {
     #[cfg(windows)]
     fn successful_save_returns_saved_status_without_plaintext() {
         let mut app = app();
-        app.vault.clear(&[]).unwrap();
+        app.vault.fields[0].clear();
         app.vault.fields[0].draft.push_str("replacement-sentinel");
 
         app.save_field(0).unwrap();
@@ -2078,9 +2086,10 @@ mod tests {
                 .contains("replacement-sentinel")
         );
 
-        let cleared = app.handle(Request::Clear { fields: vec![] });
-        assert_eq!(cleared.status, "ok");
-        assert!(!cleared.fields[0].ready);
+        let rejected = app.handle(Request::Clear { fields: vec![] });
+        assert_eq!(rejected.code.as_deref(), Some("SECRET_CLEAR_UI_ONLY"));
+        assert_eq!(app.handle(Request::Status).status, "saved");
+        assert!(app.vault.status()[0].ready);
     }
 
     #[test]
@@ -2106,12 +2115,24 @@ mod tests {
         });
         assert!(more.fields[0].ready);
         assert!(!more.fields[1].ready);
-        app.handle(Request::Clear {
-            fields: vec!["project-local-qwen-apikey".into()],
-        });
-        assert_eq!(
-            app.handle(Request::Execute(execution())).code.as_deref(),
-            Some("SECRET_MISSING")
+        app.vault.fields[0].draft.push_str("unsaved-replacement");
+        for json in [
+            r#"{"action":"clear","fields":["project-local-qwen-apikey"]}"#,
+            r#"{"action":"clear","fields":[]}"#,
+        ] {
+            let rejected = app.handle(serde_json::from_str(json).unwrap());
+            assert_eq!(rejected.status, "error");
+            assert_eq!(rejected.code.as_deref(), Some("SECRET_CLEAR_UI_ONLY"));
+            let status = app.handle(Request::Status);
+            assert_eq!(status.session, session);
+            assert!(status.fields[0].ready && !status.fields[1].ready);
+            assert!(status.operations.iter().all(|op| op.status == "pending"));
+            assert_eq!(app.vault.fields[0].draft.as_str(), "unsaved-replacement");
+        }
+        assert!(
+            app.handle(Request::Execute(execution()))
+                .operation_id
+                .is_some()
         );
     }
 
@@ -2123,7 +2144,7 @@ mod tests {
         assert!(response.operation_id.is_some());
         assert!(app.running.is_none());
         assert_eq!(response.operations[0].status, "pending");
-        app.handle(Request::Clear { fields: vec![] });
+        app.delete_all_fields();
         let id = response.operation_id.unwrap();
         app.approve(id, &egui::Context::default());
         assert!(app.running.is_none());
@@ -2135,31 +2156,68 @@ mod tests {
     }
     #[test]
     #[cfg(windows)]
-    fn approval_executes_then_reports_only_exit_metadata() {
+    fn approved_runs_reuse_saved_values_after_failure_and_success() {
         let mut app = app();
-        let mut execution = execution();
-        // A cold PowerShell start on a busy CI runner can exceed 5 s.
-        execution.timeout_ms = 60_000;
-        execution.args = vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
-            "if ($env:API_KEY -eq 'temporary-sentinel') { Write-Output $env:API_KEY; exit 0 } else { exit 9 }".into()];
-        let id = app
-            .handle(Request::Execute(execution))
-            .operation_id
-            .unwrap();
-        app.approve(id, &egui::Context::default());
-        let deadline = Instant::now() + WAIT;
-        while app.running.is_some() && Instant::now() < deadline {
-            app.poll();
-            thread::sleep(Duration::from_millis(10));
+        for (exit_code, status) in [(7, "failed"), (0, "completed")] {
+            let mut run = execution();
+            run.timeout_ms = 60_000;
+            run.args = vec![
+                "-NoProfile".into(),
+                "-NonInteractive".into(),
+                "-Command".into(),
+                format!(
+                    "if ($env:API_KEY -ne 'temporary-sentinel') {{ exit 9 }}; Write-Output $env:API_KEY; exit {exit_code}"
+                ),
+            ];
+            let id = app.handle(Request::Execute(run)).operation_id.unwrap();
+            app.approve(id, &egui::Context::default());
+            let deadline = Instant::now() + WAIT;
+            while app.running.is_some() && Instant::now() < deadline {
+                app.poll();
+                thread::sleep(Duration::from_millis(10));
+            }
+            let rejected = app.handle(Request::Clear {
+                fields: vec!["project-local-qwen-apikey".into()],
+            });
+            assert_eq!(rejected.code.as_deref(), Some("SECRET_CLEAR_UI_ONLY"));
+            let response = app.handle(Request::Status);
+            assert!(response.fields[0].ready);
+            let result = response.operations.last().unwrap();
+            assert_eq!(result.id, id);
+            assert_eq!(result.status, status);
+            assert_eq!(result.exit_code, Some(exit_code));
+            assert!(
+                !serde_json::to_string(&response)
+                    .unwrap()
+                    .contains("temporary-sentinel")
+            );
         }
-        assert!(app.running.is_none());
-        assert_eq!(app.operations[0].result.status, "completed");
-        assert_eq!(app.operations[0].result.exit_code, Some(0));
-        assert!(
-            !serde_json::to_string(&app.response())
-                .unwrap()
-                .contains("temporary-sentinel")
-        );
+    }
+    #[test]
+    fn clicking_clear_only_clears_that_fields_value_and_draft() {
+        let mut app = app();
+        app.vault.request(&["another-token".into()]).unwrap();
+        app.vault.fields[1].draft.push_str("other-sentinel");
+        app.save_field(1).unwrap();
+        app.vault.fields[0].draft.push_str("unsaved-replacement");
+        app.vault.fields[0].requires_approval = false;
+        app.visible = true;
+        let context = egui::Context::default();
+        let catalog = Catalog::for_locale(Some("en"));
+        warm_approval(&mut app, &context, &catalog);
+        let clear = context.data(|data| {
+            data.get_temp::<egui::Rect>(egui::Id::new((
+                "temporary_clear",
+                &app.vault.fields[0].name,
+            )))
+            .unwrap()
+        });
+        approval_click(&mut app, &context, &catalog, clear.center());
+        let status = app.handle(Request::Status);
+        assert_eq!(status.fields.len(), 2);
+        assert!(!status.fields[0].ready && !status.fields[0].requires_approval);
+        assert!(app.vault.fields[0].draft.is_empty());
+        assert!(status.fields[1].ready && status.fields[1].requires_approval);
     }
     #[test]
     #[cfg(windows)]
@@ -2189,9 +2247,9 @@ mod tests {
         });
         assert!(first.vault.status()[0].ready);
         assert!(!first.vault.status()[1].ready);
-        second.handle(Request::Clear { fields: vec![] });
+        second.delete_all_fields();
         assert!(first.vault.status()[0].ready);
-        assert!(!second.vault.status()[0].ready);
+        assert!(second.vault.fields.is_empty());
     }
     #[test]
     #[cfg(windows)]
@@ -2240,7 +2298,7 @@ mod tests {
     fn execution_protocol_round_trip_contains_only_field_references() {
         let request = Request::Execute(execution());
         let encoded = serde_json::to_string(&request).unwrap();
-        assert!(encoded.contains("\"action\":\"execute\""));
+        assert!(encoded.contains("\"action\":\"manual_clear_execute\""));
         assert!(matches!(
             serde_json::from_str::<Request>(&encoded).unwrap(),
             Request::Execute(_)
@@ -2958,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_field_list_invalidates_delete_confirmation_and_mcp_clear_keeps_fields() {
+    fn changed_field_list_invalidates_delete_confirmation() {
         let mut app = app();
         app.delete_all_prompt = Some(app.vault.fields.iter().map(|f| f.name.clone()).collect());
         app.handle(Request::Declare {
@@ -2969,9 +3027,7 @@ mod tests {
         assert!(app.delete_all_prompt.is_none());
         assert_eq!(app.notice, Some("temp_fields_changed"));
         assert_eq!(app.vault.fields.len(), 2);
-        let response = app.handle(Request::Clear { fields: vec![] });
-        assert_eq!(response.fields.len(), 2);
-        assert!(response.fields.iter().all(|f| !f.ready));
+        assert!(app.vault.status()[0].ready);
     }
 
     #[test]
@@ -3269,15 +3325,25 @@ mod tests {
 
     #[test]
     fn activity_bar_stays_in_view_below_many_fields_and_carries_results() {
-        fn texts(shape: &egui::Shape, found: &mut Vec<(String, egui::Rect)>) {
+        fn texts(shape: &egui::Shape, clip: egui::Rect, found: &mut Vec<(String, egui::Rect)>) {
             match shape {
-                egui::Shape::Text(text) => found.push((
-                    text.galley.job.text.clone(),
-                    text.galley.rect.translate(text.pos.to_vec2()),
-                )),
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, found)),
+                egui::Shape::Text(text) => {
+                    assert!(!text.galley.job.text.contains("temporary-sentinel"));
+                    let rect = text.galley.rect.translate(text.pos.to_vec2());
+                    if clip.contains_rect(rect) {
+                        found.push((text.galley.job.text.clone(), rect));
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| texts(s, clip, found)),
                 _ => {}
             }
+        }
+        fn visible_text(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
+            let mut found = Vec::new();
+            for clipped in &output.shapes {
+                texts(&clipped.shape, clipped.clip_rect, &mut found);
+            }
+            found
         }
         fn blue(shape: &egui::Shape) -> bool {
             match shape {
@@ -3297,22 +3363,28 @@ mod tests {
                     )
                     .unwrap();
                 app.visible = true;
-                let id = Uuid::new_v4();
-                app.operations.push_back(Operation {
-                    execution: execution(),
-                    expires: Instant::now() + APPROVAL_LIFETIME,
-                    result: OperationStatus {
-                        id,
-                        status: "completed".into(),
-                        exit_code: Some(0),
-                    },
-                });
+                for index in 0..MAX_OPERATIONS {
+                    let mut run = execution();
+                    run.program.set_file_name(format!("job-{index}.exe"));
+                    let failed = index % 3 == 1;
+                    app.operations.push_back(Operation {
+                        execution: run,
+                        expires: Instant::now() + APPROVAL_LIFETIME,
+                        result: OperationStatus {
+                            id: Uuid::new_v4(),
+                            status: if failed { "failed" } else { "completed" }.into(),
+                            exit_code: Some(i32::from(failed)),
+                        },
+                    });
+                }
                 let context = egui::Context::default();
                 crate::ui::configure_fonts(&context, locale);
                 let catalog = Catalog::for_locale(Some(locale));
                 app.catalog = catalog.clone();
-                app.result_feedback(id);
-                let expected = operation_summary(&catalog, &app.operations[0]);
+                let latest = app.operations.back().unwrap();
+                let expected = operation_summary(&catalog, latest);
+                let oldest = operation_summary(&catalog, &app.operations[0]);
+                app.result_feedback(latest.result.id);
                 let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
                 for history in [false, true] {
                     app.history_open = history;
@@ -3340,10 +3412,7 @@ mod tests {
                         window.bottom() - bar.bottom() < 40.0,
                         "{locale}: {bar:?} {window:?}"
                     );
-                    let mut found = Vec::new();
-                    for shape in &output.shapes {
-                        texts(&shape.shape, &mut found);
-                    }
+                    let found = visible_text(&output);
                     assert!(
                         found
                             .iter()
@@ -3351,20 +3420,54 @@ mod tests {
                         "{locale}: {expected} not in the bar"
                     );
                     if history {
-                        let heading = catalog.text("temp_operations");
-                        assert!(
+                        let bounds = |label: &str| {
                             found
                                 .iter()
-                                .any(|(text, rect)| text == heading && window.contains_rect(*rect))
+                                .find(|(text, rect)| text == label && rect.bottom() < bar.top())
+                                .unwrap_or_else(|| {
+                                    panic!("{locale} {size:?}: {label} missing above footer")
+                                })
+                                .1
+                        };
+                        let field = bounds(&app.vault.fields[0].name);
+                        let heading = bounds(catalog.text("temp_operations"));
+                        let newest = bounds(&expected);
+                        assert!(field.bottom() < heading.top() && heading.bottom() < newest.top());
+                        assert!(!found.iter().any(|(text, _)| text == &oldest));
+                        let wheel = egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -1200.0),
+                            phase: egui::TouchPhase::Move,
+                            modifiers: egui::Modifiers::NONE,
+                        };
+                        approval_frame(
+                            &mut app,
+                            &context,
+                            &catalog,
+                            size,
+                            vec![egui::Event::PointerMoved(newest.center()), wheel],
+                        );
+                        for _ in 0..6 {
+                            approval_frame(&mut app, &context, &catalog, size, vec![]);
+                        }
+                        let scrolled = visible_text(
+                            &approval_frame(&mut app, &context, &catalog, size, vec![]).0,
+                        );
+                        assert!(scrolled.iter().any(|(text, rect)| text == &oldest
+                            && rect.top() > heading.bottom()
+                            && rect.bottom() < bar.top()));
+                        assert!(scrolled.iter().any(|(text, rect)| text
+                            == &app.vault.fields[0].name
+                            && *rect == field));
+                    } else {
+                        assert!(
+                            !found
+                                .iter()
+                                .any(|(text, _)| text == catalog.text("temp_operations"))
                         );
                     }
                     // Results no longer arrive as a blue box over the editor.
                     assert!(!output.shapes.iter().any(|s| blue(&s.shape)));
-                    assert!(
-                        found
-                            .iter()
-                            .all(|(text, _)| !text.contains("temporary-sentinel"))
-                    );
                 }
             }
         }

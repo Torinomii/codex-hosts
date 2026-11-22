@@ -127,7 +127,7 @@ pub(super) async fn open_host_editor(
         RemoteFailure::new(
             "EDITOR_NO_RESULT",
             format!(
-                "The host editor exited with {status} without writing a result; treat it as not saved."
+                "The host editor exited with {status} without a result. Earlier changes may already be stored."
             ),
         )
     })?;

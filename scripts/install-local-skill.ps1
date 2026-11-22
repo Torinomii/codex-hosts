@@ -115,9 +115,10 @@ function Test-BuildEnvironment([string]$Root) {
 }
 
 function Assert-Skill([string]$Source) {
-    $required = @('SKILL.md', 'agents\openai.yaml', 'references\approvals.md', 'references\sudo.md',
+    $required = @('SKILL.md', 'VERSION', 'agents\openai.yaml', 'references\approvals.md', 'references\sudo.md',
         'references\su.md', 'references\hardware-keys.md', 'references\host-editor.md',
-        'references\long-running.md', 'references\temporary-secrets.md', 'references\tool-protocol.md')
+        'references\long-running.md', 'references\temporary-secrets.md', 'references\tool-protocol.md',
+        'references\setup.md', 'references\vault-hosts.md', 'references\file-transfer.md', 'references\errors.md')
     foreach ($relative in $required) {
         $file = Join-Path $Source $relative
         if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or (Get-Item -LiteralPath $file).Length -eq 0) {

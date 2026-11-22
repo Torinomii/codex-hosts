@@ -209,10 +209,10 @@ struct ListHostsParams {
 struct ProbeParams {
     /// Saved host alias; matching ignores ASCII case and surrounding whitespace.
     alias: String,
-    /// Bounds connection and authentication; leave room for a hardware touch or PIN.
+    /// SSH connection and authentication phases, or TCP connection only for Telnet.
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
-    /// Bounds the remote `hostname` command.
+    /// Bounds the remote `hostname` command and, for Telnet, the login dialogue.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
 }
@@ -239,10 +239,10 @@ struct ExecParams {
     alias: String,
     /// The exact command line to run on the remote host; sent as-is, never rewritten.
     command: String,
-    /// Bounds connection and authentication; leave room for a hardware touch or PIN.
+    /// SSH connection and authentication phases, or TCP connection only for Telnet.
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
-    /// Bounds the remote command; when omitted, the host profile's default, else 10 minutes.
+    /// Bounds the remote command including the login dialogue for Telnet. Defaults to the host setting or 10 minutes.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
 }
@@ -271,7 +271,7 @@ struct ExecManyParams {
     alias: String,
     /// 1 to 64 independent short commands, run concurrently over one authenticated connection.
     commands: Vec<String>,
-    /// Concurrent channels on the connection (1-16, default 8).
+    /// Concurrent command channels on this host (1-16, default 8), capped by its max_channels.
     #[serde(default)]
     max_concurrency: Option<usize>,
     /// Bounds connection and authentication.
@@ -287,16 +287,16 @@ struct ExecManyParams {
 struct BatchProbeParams {
     /// Explicit list of 1 to 256 saved host aliases; an empty list is rejected, never "all hosts".
     aliases: Vec<String>,
-    /// Hosts worked on at the same time (1-16, default 8).
+    /// Concurrent host workers (1-16, default 8), capped by the number of requested hosts.
     #[serde(default)]
     max_concurrency: Option<usize>,
-    /// Bounds each host's connection and authentication.
+    /// Bounds SSH connection and authentication phases, or just the TCP connection for Telnet.
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
-    /// Bounds each host's remote `hostname`.
+    /// Bounds each host's remote `hostname` and, for Telnet, its login dialogue.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
-    /// Deadline for the whole batch; hosts that have not started by then are reported as BATCH_TIMEOUT.
+    /// Optional shared execution deadline. Starts after batch admission and any required approval.
     #[serde(default)]
     batch_timeout_ms: Option<u64>,
     /// Keep going after a host fails (default true); false stops starting new hosts after the first error or non-zero exit.
@@ -311,16 +311,16 @@ struct BatchExecParams {
     aliases: Vec<String>,
     /// The same command line, sent exactly as given to every listed host.
     command: String,
-    /// Hosts worked on at the same time (1-16, default 8).
+    /// Concurrent host workers (1-16, default 8), capped by the number of requested hosts.
     #[serde(default)]
     max_concurrency: Option<usize>,
-    /// Bounds each host's connection and authentication.
+    /// Bounds SSH connection and authentication phases, or just the TCP connection for Telnet.
     #[serde(default)]
     connect_timeout_ms: Option<u64>,
-    /// Bounds each host's command.
+    /// Bounds each host's command and, for Telnet, its login dialogue.
     #[serde(default)]
     command_timeout_ms: Option<u64>,
-    /// Deadline for the whole batch; hosts that have not started by then are reported as BATCH_TIMEOUT.
+    /// Optional shared execution deadline. Starts after batch admission and any required approval.
     #[serde(default)]
     batch_timeout_ms: Option<u64>,
     /// Keep going after a host fails (default true); false stops starting new hosts after the first error or non-zero exit.
@@ -357,7 +357,7 @@ impl Server {
 
     #[tool(
         name = "list_hosts",
-        description = "List saved SSH/Telnet host profiles with their non-secret connection details, trust state, and whether the required credential is stored. Run once per task and plan from the snapshot.",
+        description = "List saved SSH/Telnet profiles and trust metadata. For local password hosts, has_required_secret is false for both a missing credential and a Credential Manager read failure. An unlisted vault alias can still resolve on the requested host operation.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn list_hosts(&self, Parameters(params): Parameters<ListHostsParams>) -> CallToolResult {
@@ -514,7 +514,7 @@ impl Server {
 
     #[tool(
         name = "open_host_editor",
-        description = "Open the codex-hosts editor window for one alias, prefilled with every non-secret detail given, so the user can add the password, passphrase or PIN, or confirm a reported host key. Returns saved, trusted, or cancelled; a missing result is a failure, never success. Use it as soon as an alias is missing or incomplete instead of asking for connection details in chat.",
+        description = "Open the codex-hosts editor window for one alias, prefilled with every non-secret detail given, so the user can add the password, passphrase or PIN, or confirm a reported host key. A new local alias and its prefilled details can be stored as the window opens. Continue only on saved or trusted. Cancellation or a lost result leaves earlier writes in place. For an unlisted alias, let the requested host operation attempt vault discovery before creating a local entry.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -559,7 +559,7 @@ impl Server {
 
     #[tool(
         name = "temporary_secrets_run",
-        description = "Start a trusted local program with secret fields injected into its environment by name. Fields require popup approval by default; the user may turn it off per field in the app. If any referenced field requires approval, the popup reviews the exact program, arguments, directory and mappings before launch. Returns an operation_id to poll with temporary_secrets_status; no child output is returned. This executes code and is reviewed like exec.",
+        description = "Start a trusted local program with secret fields injected into its environment by name. Saved fields remain available for later runs. Fields require popup approval by default; the user may turn it off per field in the app. If any referenced field requires approval, the popup reviews the exact program, arguments, directory and mappings before launch. Returns an operation_id to poll with temporary_secrets_status; no child output is returned. This executes code and is reviewed like exec.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -571,23 +571,6 @@ impl Server {
         Parameters(params): Parameters<secrets::RunParams>,
     ) -> CallToolResult {
         finish(secrets::flag_errors(secrets::run(params).await))
-    }
-
-    #[tool(
-        name = "temporary_secrets_clear",
-        description = "Clear named secret values from the session (an empty list clears all) and cancel pending approvals.",
-        annotations(
-            read_only_hint = false,
-            destructive_hint = true,
-            idempotent_hint = true,
-            open_world_hint = false
-        )
-    )]
-    async fn temporary_secrets_clear(
-        &self,
-        Parameters(params): Parameters<secrets::ClearParams>,
-    ) -> CallToolResult {
-        finish(secrets::flag_errors(secrets::clear(params).await))
     }
 
     #[tool(
@@ -629,7 +612,7 @@ impl Server {
 
     #[tool(
         name = "batch_exec",
-        description = "Run the same command on an explicit list of saved hosts (fan-out), with results in input order and a per-batch output budget. Partition heterogeneous hosts by shell before using it. Cancelling stops the batch; commands already started may finish on their hosts.",
+        description = "Run the same command on an explicit list of saved hosts (fan-out), with results in input order and a per-batch output budget. Partition heterogeneous hosts by shell. Inspect each host result before any retry, including APPROVAL_TARGET_CHANGED. Other hosts may already have executed. On cancellation, commands already started may finish on their hosts.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -977,42 +960,62 @@ fn instructions() -> String {
     format!(
         "codex-hosts gives Codex access to saved SSH/Telnet hosts without exposing credentials. \
 Passwords, key passphrases, and FIDO PINs are entered only in the app's own windows and never \
-appear in tool parameters or results. Results use tool-protocol schema_version {schema}: status is \
-ok, remote_error (non-zero exit_code), or error with a code. \
-When omitted, timeouts use the host profile's defaults, else connect_timeout_ms {connect} ms and \
-command_timeout_ms {command} ms; the \
-maximum for any timeout is {max_timeout} ms. Limits: {max_hosts} hosts per batch, {max_many} \
-commands per exec_many, batch concurrency up to {max_conc}, batch output up to {max_out} bytes. \
+appear in tool parameters or results. Results use tool-protocol schema_version {schema}. A single command returns ok, \
+remote_error (non-zero exit_code), or error with a code. \
+For batches inspect results by host even when the overall status is completed_with_errors. \
+APPROVAL_TARGET_CHANGED stops execution on the affected target. Keep completed hosts out of any retry. \
+Review the updated destination before retrying an affected host within the user's request. \
+After cancellation, a disconnect or a client timeout, an already-started remote command may still be running. \
+Check its state or completion log before any restart. \
+When omitted, connect_timeout_ms and command_timeout_ms use the host profile's defaults, else \
+{connect} ms and {command} ms respectively. SSH applies the connect timeout to individual connection and \
+authentication phases. Telnet uses it for TCP only and includes login in the command timeout. \
+batch_timeout_ms starts after batch admission and any required approval. It has no default deadline. \
+Remote timeout values are capped at {max_timeout} ms. A batch accepts up to {max_hosts} hosts and \
+{max_out} bytes of output. max_concurrency defaults to {default_conc} and ranges from 1 to {max_conc}. \
+A batch caps workers by host count. exec_many accepts up to {max_many} commands on one host and \
+also caps concurrency by that host's max_channels. \
 SSH hosts authenticate with a password, a private key (including OpenSSH FIDO handles), or an \
 SSH agent; Telnet hosts with a password. Every call authenticates again unless the host's profile \
 keeps the session; a hardware key may need a touch on each call. A host's optional require_call_approval \
 setting (default false, changed only in the app) asks for one GUI approval before each SSH tool call, \
 covering all listed commands and hosts from call launch to completion; authorization never carries \
 over to another call, even on a kept connection. Temporary secret fields require approval by default, \
-unless the user has disabled it for every referenced field in the app. When a call fails with \
-CREDENTIAL_MISSING, HOSTKEY_UNKNOWN, HOSTKEY_MISMATCH, or PROFILE_INVALID, call open_host_editor \
-for that alias instead of asking for details in chat. A host whose list entry reports \
+unless the user has disabled it for every referenced field in the app. Saved fields can be reused \
+across calls. Only the user can clear them in the temporary secrets window. \
+On TEMPORARY_WINDOW_INCOMPATIBLE, ask the user to exit the old tray app when ready to lose its values and reopen the updated app. \
+Use the requested host operation for an unlisted alias so it can discover configured vault hosts. \
+After ALIAS_NOT_FOUND, open the editor if local creation is intended. For PROFILE_INVALID or \
+CREDENTIAL_MISSING, open it for the affected alias. For HOSTKEY_UNKNOWN or HOSTKEY_MISMATCH, \
+use the reported hop and observed key. Only saved or trusted confirms the editor action. \
+Opening a new local alias can persist prefilled details immediately. Cancellation does not undo earlier \
+writes, and after EDITOR_TIMEOUT the window can still save. has_required_secret:false can mean a \
+missing credential or a read failure. For CREDENTIAL_READ_FAILED check the Windows user and \
+Credential Manager access before asking for a replacement. \
+Bitwarden and 1Password can cache host facts and login passwords in process memory. \
+Each service defaults to {cache_minutes} idle minutes, renewed on a hit. Zero disables caching. \
+External edits may remain unseen until a fresh read. The user can clear the cache in Credential services. \
+Bitwarden checks its unlock policy on each use and skips login caching under its every-call policy. \
+A host whose list entry reports \
 credential_source bitwarden is defined by a Login item in one folder of the user's Bitwarden vault \
-(name = alias, ssh:// or telnet:// URI = endpoint, username and password = login); codex-hosts re-reads \
-the item through the official bw CLI before every use, so changes made in the vault apply at once, \
-and a host created in that folder is found on the next call even if list_hosts did not show it yet. \
+(name = alias, ssh:// or telnet:// URI = endpoint, username and password = login). \
+The official bw CLI supplies fresh reads. Looking up an unknown alias can discover a new folder item. \
 While the vault is locked, list_hosts keeps those hosts as last seen and a call to one waits while \
 the codex-hosts window asks the user for the master password (inside the call approval when one is \
 due); BITWARDEN_LOCKED means that prompt was cancelled or expired. BITWARDEN_SIGNED_OUT and \
 BITWARDEN_DISABLED mean the user must log in or enable Bitwarden in the window (switched off, those \
 hosts are not listed). Never ask for the master password in chat or run bw yourself. \
 BITWARDEN_ITEM_MISSING or BITWARDEN_ITEM_MISMATCH means the item was removed or no longer describes a \
-host, which the user fixes in Bitwarden or through open_host_editor. \
+host. Repair it in Bitwarden, or use open_host_editor if the alias still belongs to a listed Bitwarden profile. \
 A host whose list entry reports credential_source onepassword is a Login item in one vault of the \
 user's 1Password account (title = alias, ssh:// or telnet:// URL = endpoint, username and password = \
-login), read through the official op CLI and the 1Password app before every use; the app's window \
-creates, edits and archives such items, changes made in 1Password apply at once, and list_hosts \
-shows the host as last read. A call to such a host may wait while the \
+login). The official op CLI and the 1Password app supply fresh reads. The window creates, edits \
+and archives items. list_hosts shows the last locally known hosts. A call to such a host may wait while the \
 1Password app asks the user to allow codex-hosts. ONEPASSWORD_LOCKED means that prompt was declined \
 or not answered; ONEPASSWORD_UNAVAILABLE, ONEPASSWORD_NOT_CONFIGURED, ONEPASSWORD_CLI_UNSUPPORTED, \
 and ONEPASSWORD_DISABLED mean the user must open the 1Password app or finish or enable its setup in \
 the codex-hosts window; ONEPASSWORD_ITEM_MISSING or ONEPASSWORD_ITEM_MISMATCH means the item was \
-removed or no longer describes a host, which the user fixes in 1Password or through open_host_editor. \
+removed or no longer describes a host. Repair it in 1Password, or use open_host_editor if the alias still belongs to a listed 1Password profile. \
 Never ask for 1Password \
 credentials in chat or run op yourself. \
 exec_sudo accepts an absolute program and argv, \
@@ -1024,13 +1027,15 @@ For SUDO_AUTO_AUTH_DISABLED or SUDO_CREDENTIAL_MISSING, use open_host_editor. \
 For su use exec_su with required per-call user, an absolute program and exact argv with independent Advanced permission for password supply. \
 Su authenticates the target user; passwords from the shared sudo_credentials list are optional for \
 remote passwordless policies, including root-to-user. No record is required on that path. Results \
-include su_user. For SU_AUTO_AUTH_DISABLED or SU_CREDENTIAL_MISSING, use open_host_editor. Never retry a command automatically.",
+include su_user. For SU_AUTO_AUTH_DISABLED or SU_CREDENTIAL_MISSING, use open_host_editor. Retry corrected pre-execution failures only for the affected work. Reconcile any uncertain execution first.",
         schema = SCHEMA_VERSION,
         connect = DEFAULT_CONNECT_TIMEOUT.as_millis(),
         command = DEFAULT_COMMAND_TIMEOUT.as_millis(),
         max_timeout = tool::MAX_TOOL_TIMEOUT_MS,
         max_hosts = tool::MAX_BATCH_HOSTS,
         max_many = tool::MAX_EXEC_MANY_COMMANDS,
+        cache_minutes = crate::model::DEFAULT_LOGIN_CACHE_MINUTES,
+        default_conc = DEFAULT_BATCH_CONCURRENCY,
         max_conc = tool::MAX_BATCH_CONCURRENCY,
         max_out = tool::MAX_BATCH_OUTPUT_BYTES,
     )
@@ -1065,7 +1070,6 @@ mod tests {
                 "list_hosts",
                 "open_host_editor",
                 "probe",
-                "temporary_secrets_clear",
                 "temporary_secrets_open",
                 "temporary_secrets_run",
                 "temporary_secrets_status"

@@ -732,7 +732,7 @@ dependencies = [
 
 [[package]]
 name = "codex-hosts"
-version = "0.4.0"
+version = "0.4.4"
 dependencies = [
  "base64",
  "ciborium",
@@ -745,6 +745,7 @@ dependencies = [
  "rmcp",
  "russh",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "sha2 0.11.0",

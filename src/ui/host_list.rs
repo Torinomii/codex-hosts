@@ -22,8 +22,6 @@ pub(super) const LIST_INSET: f32 = 12.0;
 const ROW_PADDING_Y: f32 = 9.0;
 const ROW_LINE_GAP: f32 = 3.0;
 const ROW_ACCENT_WIDTH: f32 = 3.0;
-const DETAIL_SIZE: f32 = 11.5;
-const SECONDARY_SIZE: f32 = 11.0;
 const BADGE_SIZE: f32 = 10.0;
 const BADGE_HEIGHT: f32 = 14.0;
 const BADGE_PADDING_X: f32 = 4.0;
@@ -238,7 +236,7 @@ fn group_row(
             egui::pos2(text_left, rect.center().y),
             egui::Align2::LEFT_CENTER,
             text,
-            egui::FontId::proportional(13.0),
+            egui::FontId::proportional(super::theme::SECTION_TEXT_SIZE),
             ui.visuals().strong_text_color(),
         );
     }
@@ -284,7 +282,7 @@ fn note_row(ui: &mut egui::Ui, text: &str, row_height: f32) {
         let color = ui.visuals().weak_text_color();
         let galley = ui.painter().layout(
             text.to_owned(),
-            egui::FontId::proportional(DETAIL_SIZE),
+            egui::TextStyle::Small.resolve(ui.style()),
             color,
             rect.width() - 2.0 * LIST_INSET,
         );
@@ -304,18 +302,13 @@ pub(super) fn host_row_fill(state: Option<HostTestState>, dark_mode: bool) -> Op
     }
 }
 
-fn line_height(ui: &egui::Ui, size: f32) -> f32 {
-    let font = egui::FontId::proportional(size);
-    ui.fonts_mut(|fonts| fonts.row_height(&font))
-}
-
 /// Rows are two lines (alias + endpoint) plus an optional third line for tags or notes.
 pub(super) fn host_row_height(ui: &egui::Ui, three_lines: bool) -> f32 {
     let alias = ui.text_style_height(&egui::TextStyle::Body);
-    let detail = line_height(ui, DETAIL_SIZE);
+    let detail = ui.text_style_height(&egui::TextStyle::Body);
     let mut height = ROW_PADDING_Y * 2.0 + alias + ROW_LINE_GAP + detail;
     if three_lines {
-        height += ROW_LINE_GAP + line_height(ui, SECONDARY_SIZE);
+        height += ROW_LINE_GAP + ui.text_style_height(&egui::TextStyle::Small);
     }
     height
 }
@@ -553,7 +546,7 @@ pub(super) fn host_row(
                 alias_line(ui, model, catalog);
                 // `ui.horizontal` would reserve `interact_size.y`; allocate the exact line
                 // height instead so the third line stays inside the row.
-                let detail_height = line_height(ui, DETAIL_SIZE);
+                let detail_height = ui.text_style_height(&egui::TextStyle::Body);
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), detail_height),
                     egui::Layout::left_to_right(egui::Align::Center),
@@ -574,7 +567,7 @@ pub(super) fn host_row(
                         let reserved = markers
                             .iter()
                             .map(|(glyph, _)| {
-                                let font = egui::FontId::proportional(DETAIL_SIZE);
+                                let font = egui::TextStyle::Body.resolve(ui.style());
                                 ui.painter()
                                     .layout_no_wrap((*glyph).to_owned(), font, Color32::PLACEHOLDER)
                                     .size()
@@ -588,21 +581,21 @@ pub(super) fn host_row(
                             ui.set_max_width((ui.available_width() - reserved).max(0.0));
                             ui.add(row_label(
                                 RichText::new(&model.detail)
-                                    .size(DETAIL_SIZE)
+                                    .text_style(egui::TextStyle::Body)
                                     .color(detail_color),
                             ));
                         });
                         for (glyph, color) in markers {
                             ui.add(row_label(
-                                RichText::new(glyph).size(DETAIL_SIZE).color(color),
+                                RichText::new(glyph)
+                                    .text_style(egui::TextStyle::Body)
+                                    .color(color),
                             ));
                         }
                     },
                 );
                 if !model.secondary.is_empty() {
-                    ui.add(row_label(
-                        RichText::new(&model.secondary).size(SECONDARY_SIZE).weak(),
-                    ));
+                    ui.add(row_label(RichText::new(&model.secondary).small().weak()));
                 }
             });
         }
@@ -613,7 +606,8 @@ pub(super) fn host_row(
 
 impl HostsApp {
     pub(super) fn host_list(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(10.0);
+        super::theme::host_pane_type(ui);
+        ui.add_space(super::theme::PANE_HEADER_TOP);
         ui.horizontal(|ui| {
             ui.add_space(LIST_INSET);
             ui.label(
@@ -1572,7 +1566,7 @@ mod tests {
             let three = host_row_height(ui, true);
             let body = ui.text_style_height(&egui::TextStyle::Body);
             assert!(two > body * 2.0);
-            assert!(three > two + SECONDARY_SIZE * 0.8);
+            assert!(three >= two + ui.text_style_height(&egui::TextStyle::Small));
         });
     }
 

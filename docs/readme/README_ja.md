@@ -3,7 +3,7 @@
 <p align="center">保存したホストへ。資格情報は手元に。作業は Codex に。</p>
 
 <p align="center">
-  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.4.0"><img src="https://img.shields.io/badge/version-0.4.0-2563eb" alt="v0.4.0" /></a>
+  <a href="../../Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.4-2563eb" alt="v0.4.4" /></a>
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="Build release" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 ライセンス" /></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D4?logo=windows&logoColor=white" alt="Windows 10 以降" />
@@ -37,13 +37,10 @@ Codex 向けの Windows SSH / Telnet ホスト管理ツール兼 MCP サーバ�
 | 呼び出し承認 | SSH の呼び出しを接続前に毎回確認可能。 |
 | 一時シークレット | API Key や Token をメモリだけに保持し、ローカルプログラムの環境変数に注入。 |
 
-## 0.4.0 の主な変更点
+## 0.4.4 の主な変更点
 
-- **Bitwarden ホスト：** 選んだフォルダーのログインアイテムがすべてホストになります（名前 = エイリアス、`ssh://` / `telnet://` URI = 接続先、ユーザー名とパスワード = ログイン）。公式 `bw` CLI で読み取ります。
-- **1Password ホスト：** 選んだ 1Password 保管庫のログインアイテムも同様にホストになり、公式 `op` CLI と 1Password デスクトップアプリ経由で読み取ります。ロック解除は 1Password 側で行います。
-- **ウィンドウで管理：** 保管庫ホストもローカルホストと同じエディターで作成、編集、削除できます。踏み台、呼び出し承認、詳細設定は `codex-hosts` に保存されます。
-
-[変更を比較](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
+- 複数のホストを Windows 資格情報マネージャー、Bitwarden、1Password の間でまとめて移動またはコピーできます。
+- Codex は保存した API キーやトークンを繰り返し利用できます。保存した値を手動で消去できるのは、一時シークレット画面を操作するユーザーだけです。
 
 ## インストール
 
@@ -52,16 +49,18 @@ Codex 向けの Windows SSH / Telnet ホスト管理ツール兼 MCP サーバ�
 ```text
 https://github.com/Torinomii/codex-hosts/releases/latest から codex-hosts の最新リリースをインストールしてください。codex-hosts-windows-x86_64.zip と codex-hosts-windows-x86_64.zip.sha256 をダウンロードし、チェックサムが一致しなければ中止してください。
 インストール先のディレクトリを私に尋ね、インストールされた Skill がそこへリンクするため移動してはいけないことを伝えてください。ZIP をそこに展開して install-local-skill.ps1 -ReleasePackage を実行し、以前のインストールを置き換える前に私に確認してください。
-インストールされた codex-hosts Skill ディレクトリがそのディレクトリへの単一のシンボリックリンクであることを確認し、SKILL.md に従って config.toml に codex-hosts MCP サーバーを登録してください。
+インストールされたスキルのディレクトリが、展開したパッケージの skill/codex-hosts へのシンボリックリンクであることを確認してください。config.toml の [mcp_servers.codex-hosts] に、そのスキル内の bin/codex-hosts.exe の絶対パスを command として登録し、args = ["--mcp"]、startup_timeout_sec = 20、tool_timeout_sec = 86400 を設定してください。
 ```
 
-Codex が最新の Release をダウンロードして検証し、指定した場所にインストールして MCP サーバーを登録します。コンパイルは行いません。手動でインストールする場合は、表の後の 2 つの手順に従ってください。
+Codex が最新の Release をダウンロードして検証し、指定した場所にインストールして MCP サーバーを登録します。コンパイルは行いません。
 
 | 方法 | 必要な環境 | 開始方法 |
 | --- | --- | --- |
 | Codex に依頼（推奨） | Codex + 「GitHub Release」の環境 | 上のプロンプト |
 | GitHub Release | 64 ビット Windows 10+、PowerShell 7.2+ | `install.cmd` または以下のコマンド |
 | ソースからビルド | 上記 + Rust 1.92+、MSVC、Windows SDK | `scripts/install.cmd` または `scripts/install-local-skill.ps1` |
+
+**手動でインストールする場合**は、まずパッケージをインストールし、次に MCP サーバーを登録します。
 
 ### 1. パッケージをインストール
 
@@ -87,6 +86,8 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
+MCP サーバーは、`hosts.json` の所有者が `codex-hosts` を実行する Windows アカウントまたは Windows の組み込みグループ `BUILTIN\Administrators` であれば起動します。別の所有者が確認された場合は起動を停止し、修復用の `icacls /setowner` コマンドをログに出力します。所有者を確認できない場合は警告を記録して起動を続けます。どちらの場合も、アプリの画面には警告が表示されます。
+
 <details>
 <summary><strong>ソースからビルド</strong></summary>
 
@@ -98,7 +99,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 スクリプトは PowerShell、Rust、MSVC ツールチェーン、Windows SDK を確認し、不足があれば説明したうえで、コンパイル前とリンク作成前に確認を求めます。インストールされた Skill は `skill\codex-hosts` に、Skill の `bin\codex-hosts.exe` はビルド結果にリンクされるため、再ビルドするとインストール済みのプログラムも更新されます。置き換えたパスは `.codex-hosts.backup-*` として残ります。
 
-手動でビルドする場合は `cargo build --locked --release` の後、`-SkipBuild` を付けてインストールします。
+手動でビルドする場合は `cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir target` の後、`-SkipBuild` を付けてインストールします。
 
 シンボリックリンクを作成できない場合は、開発者モードを有効にするか管理者権限の PowerShell を使ってください。スクリプトがシステム設定を変更することはありません。
 
@@ -112,9 +113,34 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 ## クイックスタート
 
-### 1. ホストを追加
+### 1. ホストの保存先を選ぶ（ローカル、Bitwarden、1Password）
 
-`codex-hosts.exe` を開いて「ホストを追加」を選び、エイリアス、アドレス、ポート、ユーザー名、プロトコル、認証方式を入力して保存します。
+`codex-hosts.exe` を開きます。ローカルにはそのまま保存できます。Bitwarden または 1Password に保存する場合は、「資格情報サービス」で使いたいサービスの「設定を開始…」を選びます。
+
+| 保存先 | 必要なもの | ホスト情報の保存場所 |
+| --- | --- | --- |
+| ローカル（既定） | Windows 標準機能 | ホスト設定は `hosts.json`、保存したログインパスワードは Windows 資格情報マネージャー |
+| Bitwarden | 公式 Bitwarden CLI（`bw.exe`）、bitwarden.com、bitwarden.eu または独自サーバーのアカウント | 1 つのフォルダーのログインアイテム |
+| 1Password | 「設定 › 開発者 › 1Password CLI と連携」をオンにした 1Password デスクトップアプリと公式 1Password CLI（`op.exe`） | 1 つの保管庫のログインアイテム。専用の保管庫を推奨 |
+
+<details>
+<summary><strong>保存先の間でホストを移動・コピーする</strong></summary>
+
+ホストを右クリックし、**移動先** または **コピー先** から保存先を選びます。複数のホストを扱う場合は、**一括管理** で対象を選び、**移動/コピー…** を選択します。
+
+ログインパスワードは保存先から保存先へ直接渡され、鍵のパスフレーズ、sudo と su のパスワード、ホスト鍵の信頼、詳細設定も引き継がれます。ホスト名はすべての保存先で一意のため、コピーの名前は `<エイリアス>-copy` になります。移動では、コピーの保存後に元のホストを削除し、Bitwarden / 1Password の元アイテムはゴミ箱またはアーカイブへ移ります。
+
+移動・コピー先に同じ名前のホスト、または同じ接続先とユーザーのホストがある場合はダイアログに表示され、**スキップ**（既定。どちらも変更しない）、**上書き**（既存のホストに書き込む。移動では名前も引き継ぎ、このホストにパスワードがなければ既存のパスワードを残す）、**両方残す**（名前の末尾に番号を付けて追加）から選べます。**一括管理 › 削除** でも、Bitwarden / 1Password のホストのアイテムはゴミ箱またはアーカイブへ移ります。
+
+Bitwarden / 1Password のホストはそのログインアイテムそのものです。エイリアス、接続先、ユーザー名、パスワード、説明、タグはアイテムに、その他の設定は `codex-hosts` に保存されます。ウィンドウでホストを保存するとアイテムに書き込み、削除すると Bitwarden のアイテムはゴミ箱へ、1Password のアイテムはアーカイブへ移るため、どちらも復元できます。保管庫側でその間に変更されたアイテムを上書きすることはありません。
+
+保管庫への書き込みをキャンセルした場合やタイムアウトした場合は、一部の変更が保存されていることがあります。再試行する前に保管庫を更新して結果を確認してください。
+
+</details>
+
+### 2. ホストを追加
+
+「ホストを追加」を選びます。保管庫を設定済みの場合は、ここで保存先を選びます。エイリアス、アドレス、ポート、ユーザー名、プロトコル、認証方式を入力して保存します。
 
 | 認証方式 | 使うもの |
 | --- | --- |
@@ -122,15 +148,6 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 | OpenSSH Key | OpenSSH 秘密鍵ファイル |
 | FIDO / セキュリティキー | ハードウェアキー上の OpenSSH FIDO Handle |
 | SSH Agent | Windows OpenSSH Agent または Pageant に読み込まれた ID |
-
-### 2. 任意：Bitwarden または 1Password にホストを置く
-
-ツールバーの「資格情報サービス」を開き、「設定を開始…」を選びます。設定後は「ホストを追加」からそのサービスのホストも作成できます。
-
-| サービス | 必要なもの | ホストになるもの |
-| --- | --- | --- |
-| Bitwarden | 公式 Bitwarden CLI（`bw.exe`）、bitwarden.com、bitwarden.eu または独自サーバーのアカウント | 1 つのフォルダーのログインアイテム |
-| 1Password | 「設定 › 開発者 › 1Password CLI と連携」をオンにした 1Password デスクトップアプリと公式 1Password CLI（`op.exe`） | 1 つの保管庫のログインアイテム。専用の保管庫を推奨 |
 
 ### 3. Codex からホストを使う
 
@@ -157,22 +174,13 @@ Skill がホストを調べ、ホスト鍵を検証して認証し、構造化�
 > **Telnet は暗号化されません。** 資格情報、コマンド、出力が平文で送信される可能性があります。信頼できるネットワークでのみ使用し、SSH を優先してください。
 
 <details>
-<summary><strong>資格情報の保存とパスワードマネージャー</strong></summary>
+<summary><strong>ログイン情報の保存とキャッシュ</strong></summary>
 
 ローカルホストのパスワードと鍵のパスフレーズは、サインイン中の Windows アカウントの資格情報マネージャーに保存します。FIDO PIN はその操作の間だけ使います。
 
-ホストストア（`hosts.json`）は `codex-hosts` を実行する Windows アカウントが所有している必要があります。そうでない場合、MCP サーバーは起動せず、修復用の `icacls /setowner` コマンドをログに出力します。ウィンドウは警告のみ表示します。
+Bitwarden では再びロック解除を求めるタイミングを設定できます。セッションを保持すると、その鍵は Windows 資格情報マネージャーに保存されます。1Password のロック解除と許可の有効期間は、1Password デスクトップアプリが管理します。
 
-Bitwarden / 1Password のホストはそのログインアイテムそのものです。エイリアス、接続先、ユーザー名、パスワード、説明、タグはアイテムに、その他の設定は `codex-hosts` に保存されます。ウィンドウでホストを保存するとアイテムに書き込み、削除すると Bitwarden のアイテムはゴミ箱へ、1Password のアイテムはアーカイブへ移るため、どちらも復元できます。保管庫側でその間に変更されたアイテムを上書きすることはありません。
-
-Windows 資格情報マネージャー、Bitwarden、1Password の間でホストを移動・コピーするには、ホストを右クリックして **移動先** または **コピー先** を選ぶか、**一括管理** で複数選んで **移動/コピー…** を選びます。ログインパスワードは保存先から保存先へ直接渡され、鍵のパスフレーズ、sudo と su のパスワード、ホスト鍵の信頼、詳細設定も引き継がれます。ホスト名はすべての保存先で一意のため、コピーの名前は `<エイリアス>-copy` になります。移動では、コピーの保存後に元のホストを削除し、Bitwarden / 1Password の元アイテムはゴミ箱またはアーカイブへ移ります。移動・コピー先に同じ名前のホスト、または同じ接続先とユーザーのホストがある場合はダイアログに表示され、**スキップ**（既定。どちらも変更しない）、**上書き**（既存のホストに書き込む。移動では名前も引き継ぎ、このホストにパスワードがなければ既存のパスワードを残す）、**両方残す**（名前の末尾に番号を付けて追加）から選べます。**一括管理 › 削除** でも、Bitwarden / 1Password のホストのアイテムはゴミ箱またはアーカイブへ移ります。
-
-保管庫の繰り返し読み取りでは、ホスト情報とログインパスワードを既定で **アイドル 60 分間** プロセスメモリに保持し、利用するたびに期限を更新します。**資格情報サービス › ログイン情報のキャッシュ** で各サービスを 0–1440 分（0 は無効）に設定し、**今すぐキャッシュを消去** できます。他の GUI/MCP インスタンスにも通知され、アイドル中のキャッシュも約 1 秒以内に消去されます。各サービス最大 128 ホストを保持し、期限切れのパスワードはアイドル中も消去し、ディスクには書き込みません。グループの更新、編集、設定変更で関連するキャッシュは無効になります。Bitwarden は毎回セッションポリシーを確認し、「毎回」ではログイン情報をキャッシュしません。1Password の外部変更やロックは、キャッシュの期限切れまたは消去後に反映され、利用が続く間は期限も更新されます。編集前には常に現在のアイテムを読み、競合を確認します。
-
-資格情報サービスのバックグラウンド処理では、承認・同期・読み取り・書き込みの段階、全体と段階ごとの経過時間、および **キャンセル** ボタンを表示します。CLI 子プロセスを停止して回収するまで実行中の状態を保ちます。各処理の全体期限は 120 秒で、より短い CLI の期限も有効です。書き込み中のキャンセルやタイムアウトでは、一部の変更が完了している可能性があります。再試行する前に更新して結果を確認してください。
-
-- **Bitwarden：** 「再認証」で保管庫のロック解除を保つ期間を選びます（毎回、指定時間アイドルになるまで、`codex-hosts` を閉じるまで、ロックするまで）。保持中のセッションキーは Windows 資格情報マネージャーに保存し、終了時には `bw lock` も実行します。
-- **1Password：** `codex-hosts` がアカウントのパスワードを扱うことはありません。1Password アプリが codex-hosts の許可を求め、その有効期間も 1Password が決めます。アプリに接続できない場合、登録済み MSIX パッケージと一般的なインストール先から探して起動します。サインイン、ロック解除、認証は引き続き 1Password アプリで行います。
+保管庫のホスト情報とログインパスワードはメモリにキャッシュされます。既定の有効期間は最後にキャッシュを利用してから 60 分です。**資格情報サービス › ログイン情報のキャッシュ** ではサービスごとに有効期間を変更でき、0 にすると無効になります。その場で消去することもできます。Bitwarden の設定が「毎回」の場合はログイン情報をキャッシュしません。1Password をロックしたり、アプリの外でアイテムを変更したりしても、キャッシュが失効するか手動で消去するまでは以前のログイン情報が返ることがあります。
 
 </details>
 
@@ -198,7 +206,7 @@ Windows 資格情報マネージャー、Bitwarden、1Password の間でホス�
 
 `codex-hosts` はホストのログインとは無関係な API Key や Token などの値も保持できます。値は `codex-hosts` のプロセスメモリだけに置かれ、Codex には返されず、Codex が実行するローカルプログラムの環境変数に注入されます。
 
-各フィールドは初期状態で承認が必要で、それを使うプログラムの起動前にダイアログで確認します。フィールドごと、またはウィンドウ全体のスイッチですべてのフィールドの承認をまとめてオフにすると直接実行できます（全体スイッチは後から追加するフィールドにも適用され、再起動後も保持されます。オフにする前に確認があります）。エディター下部のバーに実行中の操作、最新の結果、実行履歴が表示されます。値はトレイアプリの終了、サインアウト、Windows の再起動で失効し、Codex の再起動では消えません。
+各フィールドは初期状態で承認が必要で、それを使うプログラムの起動前にダイアログで確認します。フィールドごと、またはウィンドウ全体のスイッチですべてのフィールドの承認をまとめてオフにすると直接実行できます（全体スイッチは後から追加するフィールドにも適用され、再起動後も保持されます。オフにする前に確認があります）。値はトレイアプリの終了、サインアウト、Windows の再起動で失効し、Codex の再起動では消えません。
 
 詳細は [`temporary-secrets.md`](../../skill/codex-hosts/references/temporary-secrets.md) を参照してください。
 
@@ -276,11 +284,11 @@ Windows 資格情報マネージャー、Bitwarden、1Password の間でホス�
 | `list_hosts` | 保存済みホストの非機密情報、`credential_source`、信頼状態、`auth_persistence`、`require_call_approval`、sudo/su の権限、`max_channels`、`remote_env` |
 | `agent_identities`、`fido_identities` | 読み込まれた Agent 鍵と FIDO Handle の公開情報 |
 | `probe`、`batch_probe` | 認証して `hostname` を実行し、未知または変更されたホスト鍵を報告 |
-| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | コマンド実行。stdin の内容はコマンドのように確認できないため `exec_stdin` は別ツール |
+| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | コマンドを実行します。標準入力を渡すには `exec_stdin` を使います。コマンドの自動審査ルールでは、任意の標準入力の意味を判断できません。SSH 呼び出しの承認が有効な場合は、承認ダイアログで入力の全文を確認できます。 |
 | `exec_sudo`、`exec_su` | 呼び出しごとに指定した `user` として、絶対パスのプログラムを正確な引数で実行 |
 | `disconnect` | 保持中のセッションを切断 |
 | `open_host_editor` | 非機密情報を入力済みのエディターを開く、または報告されたホスト鍵を確認 |
-| `temporary_secrets_open`、`_status`、`_run`、`_clear` | トレイアプリが保持するメモリ内シークレット |
+| `temporary_secrets_open`、`_status`、`_run` | トレイアプリのメモリに保持した値を再利用します。保存した値を消去できるのは、一時シークレット画面を操作するユーザーだけです。 |
 
 引数にパスワード、パスフレーズ、PIN が含まれることはありません。タイムアウト（`connect_timeout_ms`、`command_timeout_ms`、`batch_timeout_ms`）は呼び出しごとに指定し、既定は接続 120 秒、コマンド 10 分、またはホストの詳細設定の値です。`open_host_editor` の認証方式は `password`、`private-key`（FIDO Handle も含む）、`ssh-agent` です。
 
@@ -327,10 +335,12 @@ CSV のインポートとエクスポートには任意の `description` 列と 
 <details>
 <summary><strong>制限、タイムアウト、長時間の作業</strong></summary>
 
-- 1 コマンドの出力は最大 **1 MiB**、`exec_many` やバッチの結果は最大 **8 MiB** です。`output_truncated` を確認してください。
+- SSH の `exec` 1 回で取得できる標準出力と標準エラー出力は合計 **1 MiB** です。出力の切り捨ては `output_truncated` で確認できます。
+- `exec_many` では全コマンドで **8 MiB** を共有します。`batch_exec` と `batch_probe` では **8 MiB** をホスト数で等分し、1 台あたりの上限は **2 MiB** です。これら 3 ツールはいずれも、最終的な JSON 全体を **8 MiB** 以内に収めます。各結果の `output_truncated` を確認してください。
+- Telnet では、コマンドの完了マーカーを読み取る前に受信記録が **1 MiB** に達すると、`OUTPUT_LIMIT` が返ります。
 - `tool_timeout_sec` は上限にすぎず、各呼び出しはそれより短い独自のタイムアウトを持ちます。
 - リモートコマンドは 2 回実行して安全とは限らないため、自動で再試行しません。
-- Codex の呼び出しをキャンセルするとチャネルを閉じて `CANCELLED` を返します。開始済みのコマンドは動き続ける場合があります。
+- 呼び出しをキャンセルすると、クライアントが `CANCELLED` を受け取る場合があります。すでに応答の待機を終了していれば、結果が届かないこともあります。リモートで開始済みのコマンドは動き続ける場合があるため、再実行する前に状態を確認してください。
 - 数分を超える作業はリモートホストの `tmux` / `screen` で行ってください。[`long-running.md`](../../skill/codex-hosts/references/long-running.md) を参照。
 
 `probe` と `batch_probe` は読み取り専用ですが認証は行うため、セキュリティキーのタッチが必要な場合があります。Codex 側でも確認させるには次のようにします。

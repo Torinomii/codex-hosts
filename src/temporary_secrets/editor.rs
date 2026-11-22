@@ -160,6 +160,10 @@ fn secret_cell(
                 )
             })
             .inner;
+        #[cfg(test)]
+        ui.ctx().data_mut(|data| {
+            data.insert_temp(egui::Id::new(("temporary_clear", &field.name)), clear.rect)
+        });
         if clear.clicked() {
             field.clear();
             *change = Some("ok");

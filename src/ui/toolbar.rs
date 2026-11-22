@@ -185,7 +185,8 @@ impl HostsApp {
         let mut export_batch = false;
         let mut transfer_batch = false;
         let can_transfer = self.transfer_stores().len() > 1;
-        let mut cancel_batch = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        let mut cancel_batch =
+            !self.version.open && ui.input(|input| input.key_pressed(egui::Key::Escape));
         egui::Frame::new()
             .fill(theme::accent_bar_fill(ui.visuals()))
             .inner_margin(egui::Margin::symmetric(12, 6))

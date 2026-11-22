@@ -108,12 +108,19 @@ impl HostsApp {
     }
 
     pub(super) fn status_bar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
             ui.add_space(12.0);
             let color = status_color(self.status.kind, ui.visuals());
             ui.label(RichText::new("●").color(color).small());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(12.0);
+                let notify = !self.launch.codex_edit
+                    && !self.hidden
+                    && !self.any_dialog_open()
+                    && !self
+                        .temporary
+                        .as_ref()
+                        .is_some_and(|secrets| secrets.visible);
+                self.version.show(ui, &self.catalog, notify);
                 let summary = if self.testing_all {
                     let running = self.test_operations.len();
                     self.catalog.format(

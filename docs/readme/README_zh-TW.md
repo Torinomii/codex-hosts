@@ -3,7 +3,7 @@
 <p align="center">儲存主機，掌握憑據，讓 Codex 完成遠端任務。</p>
 
 <p align="center">
-  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.4.0"><img src="https://img.shields.io/badge/version-0.4.0-2563eb" alt="v0.4.0" /></a>
+  <a href="../../Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.4-2563eb" alt="v0.4.4" /></a>
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="Build release" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 授權條款" /></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D4?logo=windows&logoColor=white" alt="Windows 10 或更新版本" />
@@ -37,13 +37,10 @@
 | 呼叫審批 | 可在每次 SSH 呼叫連線前進行審閱。 |
 | 臨時秘密 | 將 API Key、Token 只保存在記憶體中，並注入本機程式的環境變數。 |
 
-## 0.4.0 更新亮點
+## 0.4.4 更新亮點
 
-- **Bitwarden 主機：** 所選資料夾中的每個登入項目都是一台主機（名稱 = 別名，`ssh://` 或 `telnet://` URI = 連線位址，使用者名稱與密碼 = 登入憑據），透過官方 `bw` CLI 讀取。
-- **1Password 主機：** 所選 1Password 保管庫中的登入項目同樣作為主機，透過官方 `op` CLI 與 1Password 桌面 App 讀取。解鎖始終在 1Password 中完成。
-- **在視窗中管理：** 保管庫主機與本地主機使用同一個編輯器新增、編輯與刪除。跳板主機、呼叫審批與進階設定儲存在 `codex-hosts` 中。
-
-[查看版本差異](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
+- 可在 Windows 認證管理員、Bitwarden 與 1Password 之間批次移動或複製主機。
+- Codex 可重複使用已儲存的 API 金鑰與權杖。只有你能在臨時密碼視窗中手動清除這些值。
 
 ## 安裝
 
@@ -52,16 +49,18 @@
 ```text
 從 https://github.com/Torinomii/codex-hosts/releases/latest 安裝 codex-hosts 的最新發行版：下載 codex-hosts-windows-x86_64.zip 與 codex-hosts-windows-x86_64.zip.sha256，檢查碼不一致就停止。
 先問我要安裝到哪個目錄，並告訴我已安裝的 Skill 會連結到該目錄，因此之後不能移動它。把 ZIP 解壓縮到那裡並執行 install-local-skill.ps1 -ReleasePackage；取代舊安裝前先讓我確認。
-確認已安裝的 codex-hosts Skill 目錄是指向該目錄的單一符號連結，然後依 SKILL.md 在 config.toml 中註冊 codex-hosts MCP 伺服器。
+確認已安裝的 Skill 目錄是指向解壓縮目錄下 skill/codex-hosts 的符號連結。在 config.toml 的 [mcp_servers.codex-hosts] 中，將 command 設為已安裝 Skill 內 bin/codex-hosts.exe 的絕對路徑，並設定 args = ["--mcp"]、startup_timeout_sec = 20 和 tool_timeout_sec = 86400。
 ```
 
-Codex 會下載並驗證最新 Release，安裝到你選擇的位置，並註冊 MCP 伺服器，全程無需編譯。如需手動安裝，請依表格後的兩個步驟操作。
+Codex 會下載並驗證最新 Release，安裝到你選擇的位置，並註冊 MCP 伺服器，全程無需編譯。
 
 | 方式 | 所需環境 | 入口 |
 | --- | --- | --- |
 | 讓 Codex 安裝（建議） | Codex + 「GitHub Release」的環境 | 上方提示詞 |
 | GitHub Release | 64 位元 Windows 10+、PowerShell 7.2+ | `install.cmd` 或下方命令 |
 | 原始碼建置 | 上述環境，加 Rust 1.92+、MSVC 與 Windows SDK | `scripts/install.cmd` 或 `scripts/install-local-skill.ps1` |
+
+若要**手動安裝**，請先安裝程式套件，再註冊 MCP 伺服器。
 
 ### 1. 安裝程式套件
 
@@ -87,6 +86,8 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
+若 `hosts.json` 的擁有者是執行 `codex-hosts` 的 Windows 帳戶或內建的 `BUILTIN\Administrators` 群組，MCP 伺服器會接受該檔案。若 Windows 確認檔案屬於其他擁有者，MCP 會拒絕啟動，並在記錄中提供修復用的 `icacls /setowner` 命令。若無法讀取擁有者，MCP 會記錄警告並繼續啟動。這兩種情況下，應用程式視窗都會顯示警告。
+
 <details>
 <summary><strong>從原始碼建置</strong></summary>
 
@@ -98,7 +99,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 指令碼會檢查 PowerShell、Rust、MSVC 工具鏈與 Windows SDK，說明缺少的部分，並在編譯與建立連結前分別徵求確認。已安裝的 Skill 連結到 `skill\codex-hosts`，Skill 中的 `bin\codex-hosts.exe` 連結到建置產物，因此重新建置即可更新已安裝的程式。被取代的路徑保留為 `.codex-hosts.backup-*`。
 
-手動建置時，先執行 `cargo build --locked --release`，再加 `-SkipBuild` 安裝。
+手動建置時，先執行 `cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir target`，再加 `-SkipBuild` 安裝。
 
 無法建立符號連結時，請開啟開發人員模式或使用系統管理員 PowerShell；指令碼不會自行修改系統設定。
 
@@ -112,9 +113,34 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 ## 快速上手
 
-### 1. 新增主機
+### 1. 選擇主機儲存位置（本機、Bitwarden 或 1Password）
 
-開啟 `codex-hosts.exe`，選擇「新增主機」，填寫別名、位址、連接埠、使用者名稱、協定與驗證方式，再儲存。
+開啟 `codex-hosts.exe`。本機儲存可直接使用。若要將主機存入 Bitwarden 或 1Password，請在「憑據服務」中為該服務選擇「開始設定…」。
+
+| 儲存位置 | 所需環境 | 主機資料存放處 |
+| --- | --- | --- |
+| 本機（預設） | Windows 內建 | 主機設定存於 `hosts.json`，已儲存的登入密碼由 Windows 認證管理員保管 |
+| Bitwarden | 官方 Bitwarden CLI（`bw.exe`）；bitwarden.com、bitwarden.eu 或自架伺服器上的帳戶 | 一個資料夾中的登入項目 |
+| 1Password | 開啟「設定 › 開發者 › 與 1Password CLI 整合」的 1Password 桌面 App，以及官方 1Password CLI（`op.exe`） | 一個保管庫中的登入項目；建議使用專用保管庫 |
+
+<details>
+<summary><strong>在儲存位置之間轉移或複製主機</strong></summary>
+
+在主機上按右鍵，選擇 **轉移到** 或 **複製到**，再指定目的地。若要一次處理多台主機，可在 **批次管理** 中選取主機，再選 **轉移/複製…**。
+
+登入密碼直接從一個儲存位置寫入另一個，金鑰密碼片語、sudo 和 su 密碼、主機金鑰信任及進階設定也會一併帶過去。主機名稱在所有儲存位置中必須唯一，因此副本名為 `<別名>-copy`。轉移會在副本儲存後才移除原主機，Bitwarden / 1Password 中的原項目會移至垃圾桶或封存。
+
+若目標中已有同名主機，或有相同伺服器和使用者的主機，對話框會列出它們，並可選擇：**略過**（預設，兩者都不改動）、**覆蓋**（寫入現有主機；轉移時還會改用此主機的名稱，若此主機沒有密碼則保留現有密碼）、**保留兩者**（在名稱後加編號另行新增）。**批次管理 › 刪除** 也會把 Bitwarden / 1Password 主機的項目移至垃圾桶或封存。
+
+Bitwarden / 1Password 主機就是其登入項目本身：別名、連線位址、使用者名稱、密碼、備註與標籤儲存在項目中，其餘設定儲存在 `codex-hosts`。在視窗中儲存主機會寫入項目；刪除主機會把 Bitwarden 項目移到垃圾桶、把 1Password 項目封存，兩者都可還原。若項目在此期間已在保管庫中被改動，編輯不會覆寫它。
+
+若寫入保管庫時取消或逾時，部分變更可能已儲存。重試前請先重新整理並確認結果。
+
+</details>
+
+### 2. 新增主機
+
+選擇「新增主機」。若已設定保管庫，請選擇要使用的儲存位置。填寫別名、位址、連接埠、使用者名稱、協定與驗證方式，再儲存。
 
 | 驗證方式 | 使用 |
 | --- | --- |
@@ -122,15 +148,6 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 | OpenSSH Key | OpenSSH 私鑰檔案 |
 | FIDO / 安全金鑰 | 硬體金鑰上的 OpenSSH FIDO Handle |
 | SSH Agent | 已載入 Windows OpenSSH Agent 或 Pageant 的身分 |
-
-### 2. 選用：把主機放在 Bitwarden 或 1Password
-
-在工具列開啟「憑據服務」，選擇「開始設定…」。設定完成後，「新增主機」也能在該服務中新增主機。
-
-| 服務 | 需要 | 哪些項目是主機 |
-| --- | --- | --- |
-| Bitwarden | 官方 Bitwarden CLI（`bw.exe`）；bitwarden.com、bitwarden.eu 或自架伺服器上的帳戶 | 一個資料夾中的登入項目 |
-| 1Password | 開啟「設定 › 開發者 › 與 1Password CLI 整合」的 1Password 桌面 App，以及官方 1Password CLI（`op.exe`） | 一個保管庫中的登入項目；建議使用專用保管庫 |
 
 ### 3. 讓 Codex 使用主機
 
@@ -157,22 +174,13 @@ Skill 會查詢主機、驗證主機指紋、完成驗證並回傳結構化結�
 > **Telnet 不提供加密。** 憑據、命令與輸出可能以明文傳輸。僅在可信網路中使用，優先選擇 SSH。
 
 <details>
-<summary><strong>憑據儲存與密碼管理器</strong></summary>
+<summary><strong>登入憑據的儲存與快取</strong></summary>
 
 本地主機的密碼與私鑰密碼片語儲存在目前登入 Windows 帳戶的認證管理員中。FIDO PIN 只用於當次操作。
 
-主機庫（`hosts.json`）必須屬於執行 `codex-hosts` 的 Windows 帳戶。否則 MCP 伺服器拒絕啟動，並在記錄中給出修復用的 `icacls /setowner` 命令；視窗只顯示警告。
+Bitwarden 可設定重新解鎖的時機。若選擇保留工作階段，工作階段金鑰會存入 Windows 認證管理員。1Password 的解鎖與授權期限由其桌面應用程式管理。
 
-Bitwarden / 1Password 主機就是其登入項目本身：別名、連線位址、使用者名稱、密碼、備註與標籤儲存在項目中，其餘設定儲存在 `codex-hosts`。在視窗中儲存主機會寫入項目；刪除主機會把 Bitwarden 項目移到垃圾桶、把 1Password 項目封存，兩者都可還原。若項目在此期間已在保管庫中被改動，編輯不會覆寫它。
-
-要在 Windows 認證管理員、Bitwarden 和 1Password 之間轉移或複製主機，可在主機上按右鍵並選擇 **轉移到** 或 **複製到**，或在 **批次管理** 中選取多個主機後選擇 **轉移/複製…**。登入密碼直接從一個儲存位置寫入另一個，金鑰密碼片語、sudo 和 su 密碼、主機金鑰信任及進階設定也會一併帶過去。主機名稱在所有儲存位置中必須唯一，因此副本名為 `<別名>-copy`。轉移會在副本儲存後才移除原主機，Bitwarden / 1Password 中的原項目會移至垃圾桶或封存。若目標中已有同名主機，或有相同伺服器和使用者的主機，對話框會列出它們，並可選擇：**略過**（預設，兩者都不改動）、**覆蓋**（寫入現有主機；轉移時還會改用此主機的名稱，若此主機沒有密碼則保留現有密碼）、**保留兩者**（在名稱後加編號另行新增）。**批次管理 › 刪除** 也會把 Bitwarden / 1Password 主機的項目移至垃圾桶或封存。
-
-重複讀取保管庫時，主機資訊與登入密碼預設在目前行程的記憶體中快取 **60 分鐘（閒置）**，每次命中後重新計時。在 **憑據服務 › 登入資訊快取** 中，可依服務設定 0–1440 分鐘（0 關閉）或選擇 **立即清除快取**。清除也會通知其他 GUI/MCP 實例，其閒置快取約一秒內擦除。每個服務最多快取 128 台主機，閒置時也會清除到期密碼，快取密碼不寫入磁碟。重新整理主機群組、編輯項目或變更設定會使相關快取失效。Bitwarden 每次呼叫仍檢查工作階段策略，「每次調取」不快取登入憑據。1Password 的外部變更或鎖定會在快取到期或清除後反映，持續命中會持續續期。編輯前一律讀取目前項目以檢查衝突。
-
-憑據服務背景工作會顯示授權、同步、讀取或寫入階段、總耗時及本階段耗時，並提供 **取消** 按鈕。CLI 子行程停止並回收後才解除忙碌狀態。每項工作有 120 秒總時限，同時保留更短的 CLI 時限。寫入期間取消或逾時，部分變更可能已完成；請重新整理核對後再決定是否重試。
-
-- **Bitwarden：** 「重新驗證」決定保管庫保持解鎖多久：每次調取、閒置達到設定時間、直到 `codex-hosts` 關閉，或直到你鎖定。保留的工作階段金鑰存於 Windows 認證管理員，結束時也會執行 `bw lock`。
-- **1Password：** `codex-hosts` 從不接觸你的帳戶密碼。由 1Password App 請求你允許 codex-hosts，並由它決定授權的有效期。App 無法連線時，codex-hosts 會從已註冊的 MSIX 套件及常用安裝目錄尋找並啟動它；登入、解鎖及授權仍在 1Password App 中完成。
+保管庫主機資訊與登入密碼預設快取在記憶體中，閒置 60 分鐘後到期，每次讀取快取都會重新計時。可在 **憑據服務 › 登入資訊快取** 調整各服務的期限、設為 0 以停用快取，或立即清除。Bitwarden 設為「每次調取」時不會快取登入資訊。在 1Password 中鎖定保管庫或修改項目後，讀取快取仍可能取得原來的登入資訊，直到快取到期或手動清除。
 
 </details>
 
@@ -198,7 +206,7 @@ Bitwarden / 1Password 主機就是其登入項目本身：別名、連線位址�
 
 `codex-hosts` 也能保存與主機登入無關的 API Key、Token 等值。它們只存在於 `codex-hosts` 行程記憶體中，不會回傳給 Codex，而是注入 Codex 執行的本機程式的環境變數。
 
-每個欄位預設需要審批：使用它的程式啟動前會跳出對話框詢問。可依欄位關閉審批，或用視窗層級開關一次關閉所有欄位的審批（也套用於之後新增的欄位，重新啟動後仍保留；關閉前會先確認），以直接執行。編輯器底部列顯示正在執行的操作、最新結果和執行歷史。退出系統匣程式、登出或重新啟動 Windows 後這些值失效；Codex 重新啟動不會清除它們。
+每個欄位預設需要審批：使用它的程式啟動前會跳出對話框詢問。可依欄位關閉審批，或用視窗層級開關一次關閉所有欄位的審批（也套用於之後新增的欄位，重新啟動後仍保留；關閉前會先確認），以直接執行。退出系統匣程式、登出或重新啟動 Windows 後這些值失效；Codex 重新啟動不會清除它們。
 
 請見 [`temporary-secrets.md`](../../skill/codex-hosts/references/temporary-secrets.md)。
 
@@ -276,11 +284,11 @@ Bitwarden / 1Password 主機就是其登入項目本身：別名、連線位址�
 | `list_hosts` | 已儲存主機的非敏感資訊、`credential_source`、信任狀態、`auth_persistence`、`require_call_approval`、sudo/su 權限、`max_channels`、`remote_env` |
 | `agent_identities`、`fido_identities` | 已載入 Agent 金鑰與 FIDO Handle 的公開資訊 |
 | `probe`、`batch_probe` | 驗證並執行 `hostname`，回報未知或變更的主機指紋 |
-| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 執行命令；stdin 內容無法像命令一樣審閱，因此 `exec_stdin` 單獨提供 |
+| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 執行命令。使用 `exec_stdin` 傳入標準輸入。自動命令審查規則無法判讀任意輸入的含義。啟用 SSH 呼叫審批後，使用者可在審批視窗查看輸入全文。 |
 | `exec_sudo`、`exec_su` | 以每次呼叫指定的 `user` 執行絕對路徑程式與原樣參數 |
 | `disconnect` | 斷開保持的工作階段 |
 | `open_host_editor` | 開啟預填非敏感資訊的編輯器，或確認回報的主機指紋 |
-| `temporary_secrets_open`、`_status`、`_run`、`_clear` | 系統匣程式保存的記憶體秘密 |
+| `temporary_secrets_open`、`_status`、`_run` | 重複使用系統匣程式保存在記憶體中的臨時密碼。只有使用者可以在臨時密碼視窗手動清除已儲存的值。 |
 
 參數中從不包含密碼、密碼片語或 PIN。逾時（`connect_timeout_ms`、`command_timeout_ms`、`batch_timeout_ms`）依呼叫設定，預設連線 120 秒、每條命令 10 分鐘，或採用主機進階設定中的預設值。`open_host_editor` 的驗證方式為 `password`、`private-key`（也用於 FIDO Handle）與 `ssh-agent`。
 
@@ -327,10 +335,12 @@ CSV 匯入匯出包含選用的 `description` 與 `tags` 欄；標籤儲存格�
 <details>
 <summary><strong>限制、逾時與長時間任務</strong></summary>
 
-- 單條命令最多擷取 **1 MiB** 輸出；`exec_many` 或批次結果最多 **8 MiB**。請檢查 `output_truncated`。
+- 單次 SSH `exec` 最多擷取合計 **1 MiB** 的標準輸出與標準錯誤。查看 `output_truncated` 可確認輸出是否遭截斷。
+- `exec_many` 的所有命令共用 **8 MiB**。`batch_exec` 與 `batch_probe` 將 **8 MiB** 按主機數均分，每台主機最多 **2 MiB**。這三項工具各自回傳的 JSON 總大小上限為 **8 MiB**。請逐項檢查 `output_truncated`。
+- 若 Telnet 在讀到命令完成標記前，接收的紀錄已達 **1 MiB**，就會回傳 `OUTPUT_LIMIT`。
 - `tool_timeout_sec` 只是上限；每次呼叫都帶有自己更短的逾時。
 - 遠端命令重複執行不一定安全，因此從不自動重試。
-- 取消 Codex 呼叫會關閉通道並回傳 `CANCELLED`；已經開始的命令可能繼續執行。
+- 取消呼叫後，用戶端可能收到 `CANCELLED`。若用戶端已停止等待，也可能收不到結果。已啟動的遠端命令可能仍在執行，重試前請先檢查其狀態。
 - 超過幾分鐘的工作應放進遠端主機的 `tmux` / `screen`，見 [`long-running.md`](../../skill/codex-hosts/references/long-running.md)。
 
 `probe` 與 `batch_probe` 標示為唯讀，但仍會驗證，因此可能需要觸碰安全金鑰。如需 Codex 也確認這兩個工具：

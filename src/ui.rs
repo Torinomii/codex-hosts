@@ -29,6 +29,7 @@ mod toolbar;
 mod transfer;
 mod vault_cache;
 mod vaults;
+mod version;
 
 pub(crate) use theme::{configure_fonts, forget_password_history};
 
@@ -602,6 +603,7 @@ pub struct HostsApp {
     selected: Option<Uuid>,
     editor: Option<HostEditor>,
     status: StatusMessage,
+    version: version::VersionPopover,
     test_operations: HashMap<Uuid, TestOperation>,
     test_hosts_snapshot: Option<Arc<Vec<HostProfile>>>,
     test_states: HashMap<Uuid, HostTestState>,
@@ -803,6 +805,7 @@ impl HostsApp {
             selected,
             editor,
             status,
+            version: version::VersionPopover::default(),
             test_operations: HashMap::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
@@ -2427,6 +2430,9 @@ impl eframe::App for HostsApp {
 
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_tests();
+        if !self.hidden && !self.exiting {
+            self.version.poll(context, !self.launch.codex_edit);
+        }
         let mut restore = false;
         let mut open_secrets = false;
         if let Some(tray) = &self.tray {
@@ -2518,17 +2524,16 @@ impl HostsApp {
                 .show(ui, |ui| self.selection_bar(ui));
         }
         egui::Panel::bottom("status_bar")
-            .frame(
-                egui::Frame::new()
-                    .fill(panel_fill)
-                    .inner_margin(egui::Margin::symmetric(0, 5)),
+            .exact_size(
+                theme::control_height(ui).max(ui.text_style_height(&egui::TextStyle::Body)) + 10.0,
             )
+            .frame(egui::Frame::new().fill(panel_fill))
             .show(ui, |ui| self.status_bar(ui));
         let window_width = ui.available_width();
         let sidebar_max = (window_width * 0.36).clamp(240.0, 440.0);
         let sidebar_width = self
             .sidebar_width
-            .unwrap_or((window_width * 0.30).clamp(240.0, 340.0))
+            .unwrap_or((64.0 + window_width * 0.24).clamp(254.0, 384.0))
             .clamp(240.0, sidebar_max);
         let list_response = egui::Panel::left("host_list")
             // Rows run edge to edge; the list inset is applied per row so the selection bar
@@ -2789,6 +2794,24 @@ mod tests {
         shapes.iter().find_map(|shape| find(&shape.shape, text))
     }
 
+    pub(super) fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            },
+        ]
+    }
+
     /// Re-runs the named test in a child process with its own data directory, so the real
     /// save path never touches this user's host list. Only the child gets `true`.
     pub(super) fn in_isolated_store(test: &str) -> bool {
@@ -2852,6 +2875,7 @@ mod tests {
             selected: Some(profile.id),
             editor: Some(editor),
             status: StatusMessage::info(""),
+            version: version::VersionPopover::default(),
             test_operations: HashMap::new(),
             test_hosts_snapshot: None,
             test_states: HashMap::new(),
@@ -2963,14 +2987,14 @@ mod tests {
         size: [f32; 2],
     ) -> egui::FullOutput {
         let mut output = None;
-        for frame in 0..4 {
+        for _ in 0..4 {
             output = Some(context.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
                         egui::vec2(size[0], size[1]),
                     )),
-                    time: Some(frame as f64 * 0.1),
+                    predicted_dt: 0.1,
                     ..Default::default()
                 },
                 |ui| app.render(ui),
@@ -3052,6 +3076,12 @@ mod tests {
             list_title.1
         );
         assert!(find("section_basic").left() > list_title.1.right());
+        let details_title = find("editor_edit_title");
+        assert!(
+            (list_title.1.center().y - details_title.center().y).abs() <= 3.0
+                && (list_title.1.height() - details_title.height()).abs() <= 1.0,
+            "{label}: pane title text must share a size and baseline"
+        );
         // The row for the selected host must be readable in the list.
         assert!(
             texts
@@ -3095,6 +3125,245 @@ mod tests {
                 alias_field_top > alias_label.bottom(),
                 "{label}: alias field should stack under its label"
             );
+        }
+    }
+
+    #[test]
+    fn toolbar_shows_only_enabled_credential_services() {
+        let ctx = egui::Context::default();
+        configure_fonts(&ctx, "en");
+        let mut app = layout_test_app(&ctx, "en");
+        app.store.bitwarden.cli_path = Some("bw.exe".into());
+        app.store.bitwarden.profile = Some(Default::default());
+        app.store.onepassword.cli_path = Some("op.exe".into());
+        app.store.onepassword.account = Some(Default::default());
+        for (bitwarden, onepassword) in [(true, true), (false, true), (false, false), (true, false)]
+        {
+            app.store.bitwarden.enabled = bitwarden;
+            app.store.onepassword.enabled = onepassword;
+            let frame = run_full_window(&mut app, &ctx, WINDOW_SIZES[2]);
+            let texts = painted_texts(&frame.shapes);
+            for (name, enabled) in [("Bitwarden ·", bitwarden), ("1Password ·", onepassword)] {
+                let visible = texts
+                    .iter()
+                    .any(|(text, rect, _)| rect.top() < 60.0 && text.contains(name));
+                assert_eq!(visible, enabled, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn version_cell_toggles_across_the_entire_painted_footer_cell() {
+        for (size, scale) in [(WINDOW_SIZES[0], 1.0), (WINDOW_SIZES[2], 1.5)] {
+            let ctx = egui::Context::default();
+            ctx.set_pixels_per_point(scale);
+            configure_fonts(&ctx, "en");
+            apply_style(&ctx);
+            let mut app = layout_test_app(&ctx, "en");
+            let shown = run_full_window(&mut app, &ctx, size);
+            let label =
+                find_text_rect(&shown.shapes, concat!("v", env!("CARGO_PKG_VERSION"))).unwrap();
+            let bar = egui::containers::panel::PanelState::load(&ctx, egui::Id::new("status_bar"))
+                .unwrap()
+                .outer_rect;
+            // Locate the visible divider, independently of the button's own hit rectangle.
+            let divider = shown
+                .shapes
+                .iter()
+                .filter_map(|shape| {
+                    if let egui::Shape::LineSegment { points: [a, b], .. } = &shape.shape
+                        && a.x == b.x
+                        && a.x < label.left()
+                        && a.y.min(b.y) <= label.center().y
+                        && a.y.max(b.y) >= label.center().y
+                        && a.y.min(b.y) >= bar.top() - 1.0
+                    {
+                        Some(a.x)
+                    } else {
+                        None
+                    }
+                })
+                .max_by(f32::total_cmp)
+                .expect("version cell divider");
+            let cell = egui::Rect::from_min_max(egui::pos2(divider, bar.top()), bar.right_bottom());
+            assert!(label.width() > 10.0 && cell.contains_rect(label));
+            for x in [cell.left() + 1.0, label.center().x, cell.right() - 1.0] {
+                for y in [cell.top() + 1.0, label.center().y, cell.bottom() - 1.0] {
+                    let pos = egui::pos2(x, y);
+                    for expected in [true, false] {
+                        click_full_window(&mut app, &ctx, pos);
+                        assert_eq!(
+                            app.version.open, expected,
+                            "click {pos:?}, cell {cell:?}, label {label:?}"
+                        );
+                    }
+                }
+            }
+            click_full_window(
+                &mut app,
+                &ctx,
+                egui::pos2(cell.left() - 12.0, cell.center().y),
+            );
+            assert!(
+                !app.version.open,
+                "the neighboring host count opened the popup"
+            );
+        }
+    }
+
+    fn click_full_window(app: &mut HostsApp, ctx: &egui::Context, pos: egui::Pos2) {
+        // A native backend may deliver movement, press and release in separate frames.
+        for event in click_events(pos) {
+            let _ = ctx.run_ui(
+                egui::RawInput {
+                    events: vec![event],
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn version_cell_stays_clickable_beside_the_secret_editor_and_respects_modals() {
+        let ctx = egui::Context::default();
+        configure_fonts(&ctx, "en");
+        apply_style(&ctx);
+        let size = WINDOW_SIZES[2];
+        let mut app = layout_test_app(&ctx, "en");
+        let mut secrets = crate::temporary_secrets::isolated_test_app();
+        secrets.visible = true;
+        app.temporary = Some(secrets);
+        let shown = run_full_window(&mut app, &ctx, size);
+        let pos = find_text_rect(&shown.shapes, concat!("v", env!("CARGO_PKG_VERSION")))
+            .unwrap()
+            .center();
+        let editor = ctx
+            .memory(|m| m.area_rect(egui::Id::new("temporary_secrets_window")))
+            .unwrap();
+        assert!(!editor.contains(pos));
+        click_full_window(&mut app, &ctx, pos);
+        assert!(
+            app.version.open,
+            "the uncovered version number did not open beside the editor"
+        );
+        assert!(app.temporary.as_ref().unwrap().visible);
+
+        app.import_window_open = true;
+        run_full_window(&mut app, &ctx, size);
+        click_full_window(&mut app, &ctx, pos);
+        assert!(
+            !app.version.open,
+            "the version popup should yield to a modal"
+        );
+        app.import_window_open = false;
+        run_full_window(&mut app, &ctx, size);
+        click_full_window(&mut app, &ctx, pos);
+        assert!(
+            app.version.open,
+            "the cell should respond after the modal closes"
+        );
+    }
+
+    #[test]
+    fn version_button_opens_an_anchored_popover_and_keeps_batch_selection() {
+        let size = WINDOW_SIZES[0];
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            configure_fonts(&context, locale);
+            apply_style(&context);
+            let mut app = layout_test_app(&context, locale);
+            app.batch_mode = true;
+            let initial = run_full_window(&mut app, &context, size);
+            let about =
+                find_text_rect(&initial.shapes, concat!("v", env!("CARGO_PKG_VERSION"))).unwrap();
+            assert!(
+                about.left() > size[0] * 0.8 && about.top() > size[1] - 40.0,
+                "{locale}"
+            );
+            assert!(find_text_rect(&initial.shapes, app.catalog.text("version_title")).is_none());
+
+            let frame = |app: &mut HostsApp, events| {
+                context.run_ui(
+                    egui::RawInput {
+                        events,
+                        ..Default::default()
+                    },
+                    |ui| app.render(ui),
+                )
+            };
+            frame(&mut app, click_events(about.center()));
+            assert!(app.version.open, "{locale}");
+            let shown = frame(&mut app, Vec::new());
+            let dialog = context
+                .memory(|memory| memory.area_rect(egui::Id::new("version_popover")))
+                .unwrap();
+            assert!(dialog.bottom() < about.top() && about.top() - dialog.bottom() < 25.0);
+            assert!(dialog.left() < about.center().x && dialog.right() > about.center().x);
+            for key in [
+                "version_title",
+                "version_local",
+                "version_stable",
+                "version_skill",
+                "version_project",
+            ] {
+                let text = find_text_rect(&shown.shapes, app.catalog.text(key)).unwrap();
+                assert!(dialog.contains_rect(text), "{locale} {key}");
+            }
+            let close = find_text_rect(&shown.shapes, app.catalog.text("close")).unwrap();
+            assert!(dialog.contains_rect(close), "{locale}");
+            let link = find_text_rect(&shown.shapes, app.catalog.text("version_project")).unwrap();
+            let clicked = frame(&mut app, click_events(link.center()));
+            assert!(clicked.platform_output.commands.iter().any(|command| matches!(
+                command, egui::OutputCommand::OpenUrl(url) if url.url == env!("CARGO_PKG_REPOSITORY")
+            )), "{locale}");
+            let events = if matches!(locale, "en" | "zh-TW") {
+                vec![egui::Event::Key {
+                    key: egui::Key::Escape,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }]
+            } else {
+                let close = find_text_rect(&clicked.shapes, app.catalog.text("close")).unwrap();
+                click_events(close.center())
+            };
+            frame(&mut app, events);
+            assert!(!app.version.open, "{locale}: version popover still open");
+            assert!(app.batch_mode, "{locale}: batch selection was cleared");
+        }
+    }
+
+    #[test]
+    fn batch_cancel_button_works_on_the_first_click_with_version_open() {
+        for locale in ["en", "zh-CN", "zh-TW", "ja"] {
+            let context = egui::Context::default();
+            configure_fonts(&context, locale);
+            apply_style(&context);
+            let mut app = layout_test_app(&context, locale);
+            app.begin_batch_mode();
+            let initial = run_full_window(&mut app, &context, WINDOW_SIZES[0]);
+            let about =
+                find_text_rect(&initial.shapes, concat!("v", env!("CARGO_PKG_VERSION"))).unwrap();
+            click_full_window(&mut app, &context, about.center());
+            assert!(app.version.open, "{locale}");
+            let shown = context.run_ui(Default::default(), |ui| app.render(ui));
+            let cancel = find_text_rect(
+                &shown.shapes,
+                &format!("{}  (Esc)", app.catalog.text("cancel")),
+            )
+            .unwrap();
+            let _ = context.run_ui(
+                egui::RawInput {
+                    events: click_events(cancel.center()),
+                    ..Default::default()
+                },
+                |ui| app.render(ui),
+            );
+            assert!(!app.batch_mode, "{locale}: cancel required a second click");
+            assert!(!app.version.open, "{locale}");
         }
     }
 
@@ -3473,6 +3742,41 @@ mod tests {
         let updates = editor.sudo_updates().unwrap();
         assert_eq!(updates.len(), 1);
         assert!(matches!(updates[0], (CredentialKind::SudoPassword(record), None) if record == id));
+    }
+
+    #[test]
+    fn closing_a_new_codex_editor_keeps_its_prefilled_profile() {
+        if !in_isolated_store("ui::tests::closing_a_new_codex_editor_keeps_its_prefilled_profile") {
+            return;
+        }
+        let alias = "editor-fixture";
+        let address = "editor.example.invalid";
+        let result_path = crate::storage::data_directory()
+            .unwrap()
+            .join("result.json");
+        let launch = LaunchOptions {
+            codex_edit: true,
+            prefill: Prefill {
+                alias: Some(alias.into()),
+                address: Some(address.into()),
+                ..Default::default()
+            },
+            result_path: Some(result_path.clone()),
+            ..Default::default()
+        };
+        let context = eframe::CreationContext::_new_kittest(egui::Context::default());
+        let app = HostsApp::new(&context, launch).unwrap();
+        let stored = HostStore::load().unwrap();
+        let profile = stored.find_alias(alias).unwrap();
+        assert_eq!(profile.address, address);
+        assert!(!result_path.exists());
+
+        drop(app);
+        let result: serde_json::Value =
+            serde_json::from_slice(&fs::read(result_path).unwrap()).unwrap();
+        assert_eq!(result["status"], "cancelled");
+        assert_eq!(result["alias"], alias);
+        assert_eq!(HostStore::load().unwrap().find_alias(alias), Some(profile));
     }
 
     #[test]

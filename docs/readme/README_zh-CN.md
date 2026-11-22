@@ -3,7 +3,7 @@
 <p align="center">保存主机，掌握凭据，让 Codex 完成远程任务。</p>
 
 <p align="center">
-  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.4.0"><img src="https://img.shields.io/badge/version-0.4.0-2563eb" alt="v0.4.0" /></a>
+  <a href="../../Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.4-2563eb" alt="v0.4.4" /></a>
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="Build release" /></a>
   <a href="../../LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 许可证" /></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D4?logo=windows&logoColor=white" alt="Windows 10 或更高版本" />
@@ -37,13 +37,10 @@
 | 调用审批 | 可在每次 SSH 调用连接前进行审阅。 |
 | 临时秘密 | 将 API Key、Token 只保存在内存中，并注入本地程序的环境变量。 |
 
-## 0.4.0 更新亮点
+## 0.4.4 更新亮点
 
-- **Bitwarden 主机：** 所选文件夹中的每个登录项目都是一台主机（名称 = 别名，`ssh://` 或 `telnet://` URI = 连接地址，用户名和密码 = 登录凭据），通过官方 `bw` CLI 读取。
-- **1Password 主机：** 所选 1Password 保险库中的登录项目同样作为主机，通过官方 `op` CLI 与 1Password 桌面 App 读取。解锁始终在 1Password 中完成。
-- **在窗口中管理：** 保管库主机与本地主机使用同一个编辑器新建、编辑和删除。跳板主机、调用审批和高级设置保存在 `codex-hosts` 中。
-
-[查看版本差异](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
+- 可在 Windows 凭据管理器、Bitwarden 和 1Password 之间批量移动或复制主机。
+- Codex 可重复使用已保存的 API 密钥和令牌。只有你能在临时密码窗口中手动清除这些值。
 
 ## 安装
 
@@ -52,16 +49,18 @@
 ```text
 从 https://github.com/Torinomii/codex-hosts/releases/latest 安装 codex-hosts 的最新发布版：下载 codex-hosts-windows-x86_64.zip 和 codex-hosts-windows-x86_64.zip.sha256，校验和不一致就停止。
 先问我要安装到哪个目录，并告诉我已安装的 Skill 会链接到该目录，因此之后不能移动它。把 ZIP 解压到那里并运行 install-local-skill.ps1 -ReleasePackage；替换旧安装前先让我确认。
-确认已安装的 codex-hosts Skill 目录是指向该目录的单一符号链接，然后按 SKILL.md 在 config.toml 中注册 codex-hosts MCP 服务器。
+确认已安装的 Skill 目录是指向解压目录下 skill/codex-hosts 的符号链接。在 config.toml 的 [mcp_servers.codex-hosts] 中，将 command 设为已安装 Skill 内 bin/codex-hosts.exe 的绝对路径，并设置 args = ["--mcp"]、startup_timeout_sec = 20 和 tool_timeout_sec = 86400。
 ```
 
-Codex 会下载并校验最新 Release，安装到你选择的位置，并注册 MCP 服务器，全程无需编译。如需手动安装，请按表格后的两步操作。
+Codex 会下载并校验最新 Release，安装到你选择的位置，并注册 MCP 服务器，全程无需编译。
 
 | 方式 | 所需环境 | 入口 |
 | --- | --- | --- |
 | 让 Codex 安装（推荐） | Codex + “GitHub Release”的环境 | 上方提示词 |
 | GitHub Release | 64 位 Windows 10+、PowerShell 7.2+ | `install.cmd` 或下方命令 |
 | 源码构建 | 上述环境，加 Rust 1.92+、MSVC 和 Windows SDK | `scripts/install.cmd` 或 `scripts/install-local-skill.ps1` |
+
+如需**手动安装**，请先安装程序包，再注册 MCP 服务器。
 
 ### 1. 安装程序包
 
@@ -87,6 +86,8 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
+当 `hosts.json` 的所有者是运行 `codex-hosts` 的 Windows 账户或内置的 `BUILTIN\Administrators` 组时，MCP 服务器会接受该文件。如果 Windows 确认文件属于其他所有者，MCP 会拒绝启动，并在日志中给出修复用的 `icacls /setowner` 命令。如果无法读取所有者，MCP 会记录警告并继续启动。这两种情况下，应用窗口都会显示警告。
+
 <details>
 <summary><strong>从源码构建</strong></summary>
 
@@ -98,7 +99,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 脚本会检查 PowerShell、Rust、MSVC 工具链和 Windows SDK，说明缺少的部分，并在编译和创建链接前分别征求确认。已安装的 Skill 链接到 `skill\codex-hosts`，Skill 中的 `bin\codex-hosts.exe` 链接到构建产物，因此重新构建即可更新已安装的程序。被替换的路径保留为 `.codex-hosts.backup-*`。
 
-手动构建时，先运行 `cargo build --locked --release`，再加 `-SkipBuild` 安装。
+手动构建时，先运行 `cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir target`，再加 `-SkipBuild` 安装。
 
 无法创建符号链接时，请开启开发者模式或使用管理员 PowerShell；脚本不会自行修改系统设置。
 
@@ -112,9 +113,34 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 ## 快速上手
 
-### 1. 添加主机
+### 1. 选择主机存储位置（本地、Bitwarden 或 1Password）
 
-打开 `codex-hosts.exe`，选择“新建主机”，填写别名、地址、端口、用户名、协议和认证方式，然后保存。
+打开 `codex-hosts.exe`。本地存储可直接使用。如需将主机存入 Bitwarden 或 1Password，请在“凭据服务”中为该服务选择“开始设置…”。
+
+| 存储位置 | 所需环境 | 主机数据存放处 |
+| --- | --- | --- |
+| 本地（默认） | Windows 内置 | 主机配置保存在 `hosts.json` 中，已保存的登录密码由 Windows 凭据管理器保管 |
+| Bitwarden | 官方 Bitwarden CLI（`bw.exe`）；bitwarden.com、bitwarden.eu 或自托管服务器上的账户 | 一个文件夹中的登录项目 |
+| 1Password | 开启“设置 › 开发者 › 与 1Password CLI 集成”的 1Password 桌面 App，以及官方 1Password CLI（`op.exe`） | 一个保险库中的登录项目；建议使用专用保险库 |
+
+<details>
+<summary><strong>在存储位置之间转移或复制主机</strong></summary>
+
+右键单击主机，选择 **转移到** 或 **复制到**，再指定目标位置。如需一次处理多台主机，可在 **批量管理** 中选中主机，再选择 **转移/复制…**。
+
+登录密码直接从一个存储位置写入另一个，密钥口令、sudo 和 su 密码、主机密钥信任及高级设置也会一并带过去。主机名在所有存储位置中必须唯一，因此副本名为 `<别名>-copy`。转移会在副本保存后才移除原主机，Bitwarden / 1Password 中的原项目会移至回收站或归档。
+
+若目标中已有同名主机，或有相同服务器和用户的主机，对话框会列出它们，并可选择：**跳过**（默认，两者都不改动）、**覆盖**（写入现有主机；转移时还会改用此主机的名称，若此主机没有密码则保留现有密码）、**保留两者**（在名称后加编号另行添加）。**批量管理 › 删除** 也会把 Bitwarden / 1Password 主机的项目移至回收站或归档。
+
+Bitwarden / 1Password 主机就是其登录项目本身：别名、连接地址、用户名、密码、备注和标签保存在项目中，其余设置保存在 `codex-hosts`。在窗口中保存主机会写入项目；删除主机会把 Bitwarden 项目移到回收站、把 1Password 项目归档，两者都可恢复。若项目在此期间已在保管库中被改动，编辑不会覆盖它。
+
+如果写入保管库时取消或超时，部分更改可能已经保存。重试前请先刷新并核对结果。
+
+</details>
+
+### 2. 添加主机
+
+选择“新建主机”。如果已设置保管库，请选择要使用的存储位置。填写别名、地址、端口、用户名、协议和认证方式，然后保存。
 
 | 认证方式 | 使用 |
 | --- | --- |
@@ -122,15 +148,6 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 | OpenSSH Key | OpenSSH 私钥文件 |
 | FIDO / 安全密钥 | 硬件密钥上的 OpenSSH FIDO Handle |
 | SSH Agent | 已加载到 Windows OpenSSH Agent 或 Pageant 的身份 |
-
-### 2. 可选：把主机放在 Bitwarden 或 1Password
-
-在工具栏打开“凭据服务”，选择“开始设置…”。设置完成后，“新建主机”也能在该服务中新建主机。
-
-| 服务 | 需要 | 哪些项目是主机 |
-| --- | --- | --- |
-| Bitwarden | 官方 Bitwarden CLI（`bw.exe`）；bitwarden.com、bitwarden.eu 或自托管服务器上的账户 | 一个文件夹中的登录项目 |
-| 1Password | 开启“设置 › 开发者 › 与 1Password CLI 集成”的 1Password 桌面 App，以及官方 1Password CLI（`op.exe`） | 一个保险库中的登录项目；建议使用专用保险库 |
 
 ### 3. 让 Codex 使用主机
 
@@ -157,22 +174,13 @@ Skill 会查找主机、验证主机指纹、完成认证并返回结构化结�
 > **Telnet 不提供加密。** 凭据、命令和输出可能以明文传输。仅在可信网络中使用，优先选择 SSH。
 
 <details>
-<summary><strong>凭据存储与密码管理器</strong></summary>
+<summary><strong>登录凭据的存储与缓存</strong></summary>
 
 本地主机的密码和私钥口令保存在当前登录 Windows 账户的凭据管理器中。FIDO PIN 只用于当次操作。
 
-主机库（`hosts.json`）必须属于运行 `codex-hosts` 的 Windows 账户。否则 MCP 服务器拒绝启动，并在日志中给出修复用的 `icacls /setowner` 命令；窗口只显示警告。
+Bitwarden 可设置重新解锁的时机。如果选择保留会话，会话密钥会存入 Windows 凭据管理器。1Password 的解锁和授权期限由其桌面应用管理。
 
-Bitwarden / 1Password 主机就是其登录项目本身：别名、连接地址、用户名、密码、备注和标签保存在项目中，其余设置保存在 `codex-hosts`。在窗口中保存主机会写入项目；删除主机会把 Bitwarden 项目移到回收站、把 1Password 项目归档，两者都可恢复。若项目在此期间已在保管库中被改动，编辑不会覆盖它。
-
-要在 Windows 凭据管理器、Bitwarden 和 1Password 之间转移或复制主机，可右键单击主机并选择 **转移到** 或 **复制到**，或在 **批量管理** 中选中多个主机后选择 **转移/复制…**。登录密码直接从一个存储位置写入另一个，密钥口令、sudo 和 su 密码、主机密钥信任及高级设置也会一并带过去。主机名在所有存储位置中必须唯一，因此副本名为 `<别名>-copy`。转移会在副本保存后才移除原主机，Bitwarden / 1Password 中的原项目会移至回收站或归档。若目标中已有同名主机，或有相同服务器和用户的主机，对话框会列出它们，并可选择：**跳过**（默认，两者都不改动）、**覆盖**（写入现有主机；转移时还会改用此主机的名称，若此主机没有密码则保留现有密码）、**保留两者**（在名称后加编号另行添加）。**批量管理 › 删除** 也会把 Bitwarden / 1Password 主机的项目移至回收站或归档。
-
-重复读取保管库时，主机信息和登录密码默认在当前进程内存中缓存 **60 分钟（闲置）**，每次命中后重新计时。在 **凭据服务 › 登录信息缓存** 中，可按服务设置 0–1440 分钟（0 关闭）或选择 **立即清除缓存**。清除也会通知其他 GUI/MCP 实例，其闲置缓存约一秒内擦除。每个服务最多缓存 128 台主机，空闲时也会清除到期密码，缓存密码不写入磁盘。刷新主机分组、编辑项目或修改设置会使相关缓存失效。Bitwarden 每次调用仍检查会话策略，“每次调取”不缓存登录凭据。1Password 外部修改或锁定在缓存到期或清除后反映，持续命中会持续续期。编辑前始终读取当前项目以检查冲突。
-
-凭据服务后台任务会显示授权、同步、读取或写入阶段、总耗时及本阶段耗时，并提供 **取消** 按钮。CLI 子进程停止并回收后才解除忙碌状态。每项任务有 120 秒总时限，同时保留更短的 CLI 时限。写入期间取消或超时，部分改动可能已完成；请刷新核对后再决定是否重试。
-
-- **Bitwarden：** “重新验证”决定保管库保持解锁多久：每次调取、闲置达到设定时间、直到 `codex-hosts` 关闭，或直到你锁定。保留的会话密钥存于 Windows 凭据管理器，结束时也会执行 `bw lock`。
-- **1Password：** `codex-hosts` 从不接触你的账户密码。由 1Password App 请求你允许 codex-hosts，并由它决定授权的有效期。App 无法连接时，codex-hosts 会从已注册的 MSIX 包及常用安装目录查找并启动它；登录、解锁和授权仍在 1Password App 中完成。
+保管库主机信息和登录密码默认缓存在内存中，闲置 60 分钟后到期，每次读取缓存都会重新计时。可在 **凭据服务 › 登录信息缓存** 调整各服务的期限、设为 0 以停用缓存，或立即清除。Bitwarden 设为“每次调取”时不会缓存登录信息。在 1Password 中锁定保管库或修改项目后，读取缓存仍可能得到原来的登录信息，直到缓存到期或手动清除。
 
 </details>
 
@@ -198,7 +206,7 @@ Bitwarden / 1Password 主机就是其登录项目本身：别名、连接地址�
 
 `codex-hosts` 还能保存与主机登录无关的 API Key、Token 等值。它们只存在于 `codex-hosts` 进程内存中，不会返回给 Codex，而是注入 Codex 运行的本地程序的环境变量。
 
-每个字段默认需要审批：使用它的程序启动前会弹窗询问。可按字段关闭审批，或用窗口级开关一次关闭所有字段的审批（也用于之后新增的字段，重启后仍保留；关闭前会先确认），以直接运行。编辑器底部栏显示正在运行的操作、最新结果和运行历史。退出托盘程序、注销或重启 Windows 后这些值失效；Codex 重启不会清除它们。
+每个字段默认需要审批：使用它的程序启动前会弹窗询问。可按字段关闭审批，或用窗口级开关一次关闭所有字段的审批（也用于之后新增的字段，重启后仍保留；关闭前会先确认），以直接运行。退出托盘程序、注销或重启 Windows 后这些值失效；Codex 重启不会清除它们。
 
 见 [`temporary-secrets.md`](../../skill/codex-hosts/references/temporary-secrets.md)。
 
@@ -276,11 +284,11 @@ Bitwarden / 1Password 主机就是其登录项目本身：别名、连接地址�
 | `list_hosts` | 已保存主机的非敏感信息、`credential_source`、信任状态、`auth_persistence`、`require_call_approval`、sudo/su 权限、`max_channels`、`remote_env` |
 | `agent_identities`、`fido_identities` | 已加载 Agent 密钥和 FIDO Handle 的公开信息 |
 | `probe`、`batch_probe` | 认证并执行 `hostname`，报告未知或变化的主机指纹 |
-| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 执行命令；stdin 内容无法像命令一样审阅，因此 `exec_stdin` 单独提供 |
+| `exec`、`exec_stdin`、`exec_many`、`batch_exec` | 执行命令。使用 `exec_stdin` 传入标准输入。自动命令审查规则无法判断任意输入的含义。启用 SSH 调用审批后，用户可在审批窗口查看输入全文。 |
 | `exec_sudo`、`exec_su` | 以每次调用指定的 `user` 运行绝对路径程序和原样参数 |
 | `disconnect` | 断开保持的会话 |
 | `open_host_editor` | 打开预填非敏感信息的编辑器，或确认报告的主机指纹 |
-| `temporary_secrets_open`、`_status`、`_run`、`_clear` | 托盘程序保存的内存秘密 |
+| `temporary_secrets_open`、`_status`、`_run` | 复用托盘程序在内存中保存的临时密码。只有用户可以在临时密码窗口手动清除已保存的值。 |
 
 参数中从不包含密码、口令或 PIN。超时（`connect_timeout_ms`、`command_timeout_ms`、`batch_timeout_ms`）按调用设置，默认连接 120 秒、每条命令 10 分钟，或采用主机高级设置中的默认值。`open_host_editor` 的认证方式为 `password`、`private-key`（也用于 FIDO Handle）和 `ssh-agent`。
 
@@ -327,10 +335,12 @@ CSV 导入导出包含可选的 `description` 和 `tags` 列；标签单元格�
 <details>
 <summary><strong>限制、超时与长时间任务</strong></summary>
 
-- 单条命令最多捕获 **1 MiB** 输出；`exec_many` 或批量结果最多 **8 MiB**。请检查 `output_truncated`。
+- 单次 SSH `exec` 最多捕获合计 **1 MiB** 的标准输出和标准错误。查看 `output_truncated` 可确认输出是否被截断。
+- `exec_many` 的所有命令共享 **8 MiB**。`batch_exec` 和 `batch_probe` 将 **8 MiB** 按主机数均分，每台主机最多 **2 MiB**。这三个工具各自返回的 JSON 总大小上限为 **8 MiB**。请逐项检查 `output_truncated`。
+- 如果 Telnet 在读到命令完成标记前，接收的记录已达到 **1 MiB**，则会返回 `OUTPUT_LIMIT`。
 - `tool_timeout_sec` 只是上限；每次调用都带有自己更短的超时。
 - 远程命令重复执行不一定安全，因此从不自动重试。
-- 取消 Codex 调用会关闭通道并返回 `CANCELLED`；已经开始的命令可能继续运行。
+- 取消调用后，客户端可能收到 `CANCELLED`。如果客户端已停止等待，也可能收不到结果。已启动的远程命令可能仍在运行，重试前请先检查其状态。
 - 超过几分钟的工作应放进远端主机的 `tmux` / `screen`，见 [`long-running.md`](../../skill/codex-hosts/references/long-running.md)。
 
 `probe` 和 `batch_probe` 标记为只读，但仍会认证，因此可能需要触碰安全密钥。如需 Codex 也确认这两个工具：

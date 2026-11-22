@@ -27,16 +27,6 @@ pub(super) struct StatusParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ClearParams {
-    /// Session UUID returned by temporary_secrets_open.
-    pub session: uuid::Uuid,
-    /// Names to clear; an empty list clears every value.
-    #[serde(default)]
-    pub fields: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub(super) struct RunParams {
     /// Session UUID returned by temporary_secrets_open.
     pub session: uuid::Uuid,
@@ -57,7 +47,7 @@ pub(super) struct RunParams {
 pub(super) async fn open(params: OpenParams) -> Result<Response, RemoteFailure> {
     blocking(move || {
         temporary_secrets::open(params.fields).map_err(|code| {
-            RemoteFailure::new(
+            window_failure(
                 code,
                 "Temporary secret window unavailable or invalid field names.",
             )
@@ -68,16 +58,6 @@ pub(super) async fn open(params: OpenParams) -> Result<Response, RemoteFailure> 
 
 pub(super) async fn status(params: StatusParams) -> Result<Response, RemoteFailure> {
     call(params.session, Request::Status).await
-}
-
-pub(super) async fn clear(params: ClearParams) -> Result<Response, RemoteFailure> {
-    call(
-        params.session,
-        Request::Clear {
-            fields: params.fields,
-        },
-    )
-    .await
 }
 
 pub(super) async fn run(params: RunParams) -> Result<Response, RemoteFailure> {
@@ -116,13 +96,22 @@ pub(super) fn flag_errors(
 async fn call(session: uuid::Uuid, request: Request) -> Result<Response, RemoteFailure> {
     blocking(move || {
         temporary_secrets::call(session, request).map_err(|code| {
-            RemoteFailure::new(
+            window_failure(
                 code,
                 "Temporary session unavailable; open a new window if it was closed.",
             )
         })
     })
     .await
+}
+
+fn window_failure(code: &'static str, message: &'static str) -> RemoteFailure {
+    let message = if code == temporary_secrets::INCOMPATIBLE_HOLDER {
+        "When ready to discard this session's values, exit the older codex-hosts from the system tray and start the updated app."
+    } else {
+        message
+    };
+    RemoteFailure::new(code, message)
 }
 
 async fn blocking<T: Send + 'static>(
@@ -138,7 +127,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn run_params_build_the_same_execute_request_as_the_file_protocol() {
+    fn run_params_form_an_execute_request_and_unknown_fields_are_rejected() {
         let params = RunParams {
             session: uuid::Uuid::nil(),
             program: PathBuf::from(r"C:\py\python.exe"),

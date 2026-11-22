@@ -527,7 +527,7 @@ pub(crate) fn keep_approved_target(
     Err(RemoteFailure::new(
         "APPROVAL_TARGET_CHANGED",
         format!(
-            "The password manager item for {} changed its endpoint or login after the call was approved; nothing was sent. Call again to review the new target.",
+            "The password manager item for {} changed its endpoint or login after approval. Execution stopped for this target. Review the updated destination and any per-host batch results before retrying affected work.",
             shown.alias
         ),
     ))

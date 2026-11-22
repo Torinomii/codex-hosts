@@ -196,7 +196,7 @@ fn section(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::
         .inner_margin(egui::Margin::symmetric(12, 10))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).strong().size(15.0));
+            ui.label(RichText::new(title).strong().size(theme::SECTION_TEXT_SIZE));
             ui.add_space(2.0);
             ui.separator();
             ui.add_space(4.0);
@@ -413,20 +413,24 @@ fn connection_section(
         form.required_row(ui, "address", address_missing, None, |ui, width| {
             ui.horizontal(|ui| {
                 let port_width = 72.0;
-                let port_label_width = ui
-                    .painter()
-                    .layout_no_wrap(
-                        catalog.text("port").to_owned(),
-                        egui::TextStyle::Body.resolve(ui.style()),
-                        egui::Color32::PLACEHOLDER,
-                    )
-                    .size()
-                    .x;
+                let label_width = |text: &str| {
+                    ui.painter()
+                        .layout_no_wrap(
+                            text.to_owned(),
+                            egui::TextStyle::Body.resolve(ui.style()),
+                            egui::Color32::PLACEHOLDER,
+                        )
+                        .size()
+                        .x
+                };
                 let spacing = ui.spacing().item_spacing.x;
-                let address_width =
-                    (width - port_width - port_label_width - spacing * 3.0).max(120.0);
+                let address_width = (width
+                    - port_width
+                    - label_width(catalog.text("port"))
+                    - label_width("*")
+                    - spacing * 3.0)
+                    .max(120.0);
                 required_text_field(ui, "address", &mut editor.profile.address, address_width);
-                ui.add_space(spacing);
                 ui.label(RichText::new(catalog.text("port")).strong());
                 ui.label(
                     RichText::new("*")
@@ -735,7 +739,7 @@ fn advanced_section(
             ui.set_width(ui.available_width());
             let title = RichText::new(catalog.text("section_advanced"))
                 .strong()
-                .size(15.0);
+                .size(theme::SECTION_TEXT_SIZE);
             egui::CollapsingHeader::new(title)
                 .id_salt("advanced_section")
                 .default_open(false)
@@ -1415,6 +1419,7 @@ fn warning_callout(ui: &mut egui::Ui, text: &str) {
 
 impl HostsApp {
     pub(super) fn editor_panel(&mut self, ui: &mut egui::Ui, context: &egui::Context) {
+        theme::host_pane_type(ui);
         let catalog = self.catalog.clone();
         let hosts = self.store.hosts.clone();
         let testing =
@@ -1505,15 +1510,14 @@ impl HostsApp {
             .id_salt("host_editor_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(16.0);
-                let form_width = (ui.available_width() - 40.0).min(MAX_FORM_WIDTH);
-                let margin = ((ui.available_width() - form_width) / 2.0).max(20.0);
-                ui.horizontal(|ui| {
-                    ui.add_space(margin);
-                    ui.vertical(|ui| {
-                        ui.set_max_width(form_width);
-                        self.editor_contents(ui, &catalog, &hosts, codex_edit, &mut action);
-                    });
+                ui.add_space(theme::PANE_HEADER_TOP);
+                let form_width = (ui.available_width() - 32.0).clamp(0.0, MAX_FORM_WIDTH);
+                ui.vertical_centered(|ui| {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(form_width, 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| self.editor_contents(ui, &catalog, &hosts, codex_edit, &mut action),
+                    );
                 });
                 ui.add_space(16.0);
             });
@@ -1606,7 +1610,11 @@ impl HostsApp {
         // Where local secrets live; a vault host says so in its banner.
         if !editor.is_vault_host() {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(catalog.text("editor_subtitle")).weak());
+                ui.label(
+                    RichText::new(catalog.text("editor_subtitle"))
+                        .small()
+                        .weak(),
+                );
             });
         }
         ui.horizontal(|ui| {
@@ -1653,7 +1661,7 @@ impl HostsApp {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{find_text_rect, in_isolated_store, metadata_test_app};
+    use super::super::tests::{click_events, find_text_rect, in_isolated_store, metadata_test_app};
     use super::*;
     use crate::model::VaultHostRef;
 
@@ -1938,24 +1946,6 @@ mod tests {
                 );
             },
         )
-    }
-
-    fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
-        vec![
-            egui::Event::PointerMoved(pos),
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: Default::default(),
-            },
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: Default::default(),
-            },
-        ]
     }
 
     #[test]

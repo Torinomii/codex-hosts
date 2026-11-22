@@ -190,10 +190,21 @@ fn call_named_with_timeout(
             // Only connection acquisition is retried. A lost response may already have effects.
             write_frame(&mut client, &bytes).await?;
             let bytes = read_frame(&mut client).await?;
-            let response: Response =
+            let mut response: Response =
                 serde_json::from_slice(&bytes).map_err(|_| io::Error::other("response invalid"))?;
             if expected.is_some_and(|session| response.session != session) {
                 return Err(io::Error::other("session mismatch"));
+            }
+            if response.code.as_deref() == Some("TEMPORARY_REQUEST_INVALID")
+                && matches!(
+                    request,
+                    Request::Declare { .. }
+                        | Request::Status
+                        | Request::Execute(_)
+                        | Request::Restore { .. }
+                )
+            {
+                response.code = Some(super::INCOMPATIBLE_HOLDER.into());
             }
             Ok(response)
         })
@@ -342,6 +353,53 @@ fn discovery_name() -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_holder_rejects_vault_operations_and_gui_handoff_before_dispatch() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let run = serde_json::from_value(serde_json::json!({
+            "action":"execute", "program":r"C:\test.exe", "cwd":r"C:\", "env":{}
+        }))
+        .unwrap();
+        for request in [
+            Request::Declare {
+                fields: vec!["test".into()],
+            },
+            Request::Status,
+            run,
+            Request::Restore { temporary: false },
+        ] {
+            let session = Uuid::new_v4();
+            let mut listener = create_private_pipe(&pipe_name(session), true).unwrap();
+            let action = serde_json::to_value(&request).unwrap()["action"].clone();
+            let caller = thread::spawn(move || super::super::call(session, request));
+            runtime.block_on(async {
+                tokio::time::timeout(IO_TIMEOUT, listener.connect())
+                    .await
+                    .unwrap_or_else(|_| panic!("no connection for {action}"))
+                    .unwrap();
+                let message: serde_json::Value =
+                    serde_json::from_slice(&read_frame(&mut listener).await.unwrap()).unwrap();
+                // These actions would reach the old holder's vault or restore its window.
+                assert!(!matches!(
+                    message["action"].as_str().unwrap(),
+                    "request" | "status" | "execute" | "show" | "clear"
+                ));
+                let reply = Response::error(session, "TEMPORARY_REQUEST_INVALID");
+                write_frame(&mut listener, &serde_json::to_vec(&reply).unwrap())
+                    .await
+                    .unwrap();
+            });
+            assert_eq!(
+                caller.join().unwrap().unwrap_err(),
+                super::super::INCOMPATIBLE_HOLDER
+            );
+        }
+    }
 
     #[test]
     fn busy_pipe_connects_when_a_new_listener_becomes_available() {

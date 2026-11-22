@@ -9,7 +9,7 @@ Read this when an SSH call awaits app authorization, a temporary-secret run is p
 | Codex/client tool approval | Client configuration | The client invoking a tool; separate from the app's dialog |
 | **Approve each Codex call** / `require_call_approval` | Off; user changes it in the host's Advanced settings | One complete SSH tool call, including its listed hosts and commands |
 | **Allow saved passwords for sudo** / **Allow saved passwords for su** | Off; independently confirmed in the host editor | Use of saved account passwords for that mechanism, not remote execution permission |
-| Temporary field **Call approval** / `requires_approval` | On for a new field; user changes it in the app | One local run that references this field |
+| Temporary field **Call approval** / `requires_approval` | Inherits the window-wide setting (initially on). The user can override individual fields in the app. | One local run that references this field |
 | Host-key trust and remote sudoers/PAM policy | User-confirmed pin and remote host policy | Which host is trusted, and whether native authentication/execution is allowed |
 
 An app approval does not supply a password, trust a host key, or override sudoers/PAM. A saved password, a successful prior call, or a retained SSH connection does not authorize the next call. Passwordless sudo/su can work with password supply off but still requires call approval if that separate policy is enabled.
@@ -28,12 +28,12 @@ An app approval does not supply a password, trust a host key, or override sudoer
 
 ## Temporary-secret runs
 
-- New fields require approval. `temporary_secrets_open` / `_status` exposes readiness and `requires_approval`, never values. If any field named by the run's `env` mapping requires approval, that run waits for the user's decision. Tools cannot change field approval settings.
+- Read `ready` and `requires_approval` for each field from `temporary_secrets_open` or `temporary_secrets_status`. If any field named in the run's `env` mapping requires approval, the run waits for the user's decision.
 - The blue authorization popup is inside the temporary-secret editor. Its top red **Allow this run** and white **Reject this run** buttons decide only that operation, not every waiting local operation. The summary shows distinct field count, pending count and the five-minute deadline.
 - Command details show program, JSON argv, working directory, execution timeout and environment-variable-to-field mappings. Secrets are never shown. Back/Escape in details makes no decision; Escape in the overview rejects the displayed run. SSH review takes precedence if both kinds are pending.
 - Only one local child runs at a time. While another runs, Allow is disabled and Stop is available. If all referenced fields have approval off, the run starts directly or waits as `queued`, then starts automatically. See [temporary-secrets.md](temporary-secrets.md) for child isolation and lifetime limits.
 - `temporary_secrets_run` returns an `operation_id`; poll that session's `_status` for that operation. `saved`, Allowed, `pending`, `queued`, and `running` are not success. Only `completed` with exit code 0 means successful completion.
-- Saving/replacing/clearing a field or changing its approval switch revokes pending and queued local runs; an already-running child keeps its original environment. Reopening/clearing a field preserves its approval choice within that vault session; a new field defaults on.
+- Saving, replacing or clearing a value, or changing field approval settings, cancels pending and queued local runs. An already-running child keeps its original environment. Reopening a field or clearing its value preserves its approval setting.
 
 ## Failures and retries
 
@@ -42,7 +42,8 @@ An app approval does not supply a password, trust a host key, or override sudoer
 | `APPROVAL_CANCELLED` | The SSH call was not authorized. Report the rejection/cancellation and stop; do not resubmit or bypass it. |
 | `APPROVAL_EXPIRED` | The SSH review expired before execution. Ask whether the user wants a new call; never re-prompt automatically. |
 | `APPROVAL_UNAVAILABLE` | The GUI/IPC may be unavailable, the running holder incompatible, or the review queue full. Report the exact result and resolve the app state with the user; do not disable policy or treat this as a password error. |
-| Local run `cancelled` or `expired` | Report the terminal operation state; do not create a replacement run automatically. |
+| `APPROVAL_TARGET_CHANGED` | Verify the new destination. For a batch, check results per host and request fresh approval only for affected work confirmed unstarted. |
+| Local run `cancelled` or `expired` | Report the terminal operation state and wait for a new request before submitting another run. |
 | Missing response, timeout, or client cancellation | Do not infer no execution. SSH has no resumable approval handle. For a local run, reconcile through its session's operations when possible; never blindly resubmit. |
 
-The three `APPROVAL_*` failures stop before SSH connection/command execution for that call. After approval, normal host-key, credential, connection, sudo/su, and command failures can still occur. Always wait for the structured execution result and inspect `status` and `exit_code`; neither permission feedback nor a hidden/closed dialog proves success.
+Review cancellation, expiry and unavailability stop the call before SSH execution. `APPROVAL_TARGET_CHANGED` can arise after approval while other batch targets execute. Wait for the structured result and inspect individual outcomes, including `status` and `exit_code` where available.

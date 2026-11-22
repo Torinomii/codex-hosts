@@ -3,7 +3,7 @@
 <p align="center">Your saved hosts. Your credentials. Codex at work.</p>
 
 <p align="center">
-  <a href="https://github.com/Torinomii/codex-hosts/tree/v0.4.0"><img src="https://img.shields.io/badge/version-0.4.0-2563eb" alt="v0.4.0" /></a>
+  <a href="Cargo.toml"><img src="https://img.shields.io/badge/version-0.4.4-2563eb" alt="v0.4.4" /></a>
   <a href="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml"><img src="https://github.com/Torinomii/codex-hosts/actions/workflows/release.yml/badge.svg" alt="Build release" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-D22128.svg" alt="Apache 2.0 License" /></a>
   <img src="https://img.shields.io/badge/Windows-10%2B-0078D4?logo=windows&logoColor=white" alt="Windows 10 or newer" />
@@ -37,13 +37,10 @@ A Windows SSH / Telnet host manager and MCP server for Codex. Save a host once, 
 | Call approval | Optionally review every SSH call before it connects. |
 | Temporary secrets | Keep API keys and tokens in memory only and inject them into a local program's environment. |
 
-## What's new in 0.4.0
+## What's new in 0.4.4
 
-- **Bitwarden hosts:** every Login item in a chosen folder is a host (name = alias, `ssh://` or `telnet://` URI = endpoint, username and password = login), read through the official `bw` CLI.
-- **1Password hosts:** the same for the Login items of a chosen 1Password vault, read through the official `op` CLI and the 1Password desktop app. Unlocking stays in 1Password.
-- **Managed in the window:** create, edit and delete vault hosts in the same editor as local ones. Jump hosts, call approval and Advanced settings stay in `codex-hosts`.
-
-[Compare changes](https://github.com/Torinomii/codex-hosts/compare/v0.3.3...v0.4.0)
+- Move or copy multiple hosts at once between Windows Credential Manager, Bitwarden and 1Password.
+- Codex can reuse saved API keys and tokens across runs. Only you can clear those values in the temporary secrets window.
 
 ## Installation
 
@@ -52,16 +49,18 @@ The quickest way is to ask Codex. Paste this into Codex:
 ```text
 Install the latest release of codex-hosts from https://github.com/Torinomii/codex-hosts/releases/latest: download codex-hosts-windows-x86_64.zip and codex-hosts-windows-x86_64.zip.sha256, and stop if the checksum does not match.
 Ask me which directory to install it in, and tell me it must stay in place because the installed Skill links to it. Extract the ZIP there and run install-local-skill.ps1 -ReleasePackage; ask me before replacing an earlier installation.
-Confirm that the installed codex-hosts Skill directory is one symbolic link to that directory, then register the codex-hosts MCP server in config.toml as described in SKILL.md.
+Confirm that the installed Skill directory links to skill/codex-hosts in the extracted package. In config.toml, register the absolute path to bin/codex-hosts.exe inside the installed Skill under [mcp_servers.codex-hosts], with args = ["--mcp"], startup_timeout_sec = 20 and tool_timeout_sec = 86400.
 ```
 
-Codex downloads and verifies the latest Release, installs it where you choose and registers the MCP server. Nothing is compiled. To install by hand, follow the two steps after the table.
+Codex downloads and verifies the latest Release, installs it where you choose and registers the MCP server. Nothing is compiled.
 
 | Route | Requirements | Entry point |
 | --- | --- | --- |
 | Ask Codex (recommended) | Codex + the GitHub Release requirements | The prompt above |
 | GitHub Release | 64-bit Windows 10+ · PowerShell 7.2+ | `install.cmd` or the command below |
 | Source checkout | The above + Rust 1.92+, MSVC and Windows SDK | `scripts/install.cmd` or `scripts/install-local-skill.ps1` |
+
+For a **manual installation**, install the package first, then register the MCP server.
 
 ### 1. Install the package
 
@@ -87,6 +86,8 @@ startup_timeout_sec = 20
 tool_timeout_sec = 86400
 ```
 
+The MCP server accepts `hosts.json` when its owner is the Windows account running `codex-hosts` or the built-in `BUILTIN\Administrators` group. If Windows reports a different owner, MCP refuses to start and logs the `icacls /setowner` repair command. If Windows cannot report the owner, MCP logs a warning and continues. The app window shows a warning in either case.
+
 <details>
 <summary><strong>Build from source</strong></summary>
 
@@ -98,7 +99,7 @@ pwsh -NoProfile -File .\scripts\install-local-skill.ps1
 
 The script checks PowerShell, Rust, the MSVC toolchain and the Windows SDK, explains anything missing, then asks before compiling and before installing links. It links the installed Skill to `skill\codex-hosts` and the Skill's `bin\codex-hosts.exe` to the build, so a rebuild updates the installed program. Replaced paths are kept as `.codex-hosts.backup-*`.
 
-To build manually, run `cargo build --locked --release`, then install with `-SkipBuild`.
+To build manually, run `cargo build --locked --release --target x86_64-pc-windows-msvc --target-dir target`, then install with `-SkipBuild`.
 
 If symbolic links cannot be created, enable Developer Mode or use an elevated PowerShell; the script never changes system settings itself.
 
@@ -112,9 +113,34 @@ If symbolic links cannot be created, enable Developer Mode or use an elevated Po
 
 ## Quick start
 
-### 1. Add a host
+### 1. Choose where to store hosts (local, Bitwarden or 1Password)
 
-Open `codex-hosts.exe`, choose **New host**, enter the alias, address, port, user, protocol and authentication, and save.
+Open `codex-hosts.exe`. Local storage is ready to use. To store hosts in Bitwarden or 1Password, open **Credential services** and choose **Start setup…** for that provider.
+
+| Storage option | Requirements | Where host data is stored |
+| --- | --- | --- |
+| Local (default) | Included with Windows | Host profiles in `hosts.json`, saved login passwords in Windows Credential Manager |
+| Bitwarden | The official Bitwarden CLI (`bw.exe`); an account on bitwarden.com, bitwarden.eu or a self-hosted server | Login items in one folder |
+| 1Password | The 1Password desktop app with **Settings › Developer › Integrate with 1Password CLI** on, and the official 1Password CLI (`op.exe`) | Login items in one vault; a dedicated vault is recommended |
+
+<details>
+<summary><strong>Moving or copying hosts between stores</strong></summary>
+
+Right-click a host, choose **Move to** or **Copy to**, then select the destination. For several hosts, select them under **Batch manage** and choose **Move / copy…**.
+
+The login password goes straight from one store to the other; key passphrases, sudo and su passwords, host-key trust and the Advanced settings come along. A copy gets the name `<alias>-copy`, because names are unique across all stores. A move removes the original only after the copy is saved, and a Bitwarden or 1Password original goes to the trash or archive.
+
+When the target already has a host with the same name, or one reaching the same server as the same user, the dialog lists it and you choose: **Skip** (the default) leaves both alone, **Overwrite** writes the host over the existing one (a moved host also gives it its name; an existing password stays if the host has none), and **Keep both** adds it with a number after its name. **Batch manage › Delete** sends the items of Bitwarden and 1Password hosts to the trash or archive too.
+
+A Bitwarden or 1Password host is its Login item: alias, endpoint, username, password, description and tags live in the item, the remaining settings in `codex-hosts`. Saving the host in the window writes the item; deleting it moves the Bitwarden item to the trash or archives the 1Password item, so both can be restored. An edit never overwrites an item that was changed in the vault in the meantime.
+
+If a vault write is cancelled or times out, some changes may already have been saved. Refresh the vault and check before retrying.
+
+</details>
+
+### 2. Add a host
+
+Choose **New host**. If a vault is configured, select where to save the host. Enter the alias, address, port, username, protocol and authentication method, then save.
 
 | Authentication | Uses |
 | --- | --- |
@@ -122,15 +148,6 @@ Open `codex-hosts.exe`, choose **New host**, enter the alias, address, port, use
 | OpenSSH Key | An OpenSSH private-key file |
 | FIDO / Security Key | An OpenSSH FIDO handle on a hardware key |
 | SSH Agent | An identity loaded in Windows OpenSSH Agent or Pageant |
-
-### 2. Optional: keep hosts in Bitwarden or 1Password
-
-Open **Credential services** in the toolbar and choose **Start setup…**. Afterwards **New host** can also create hosts in that store.
-
-| Store | Requirements | Hosts |
-| --- | --- | --- |
-| Bitwarden | The official Bitwarden CLI (`bw.exe`); an account on bitwarden.com, bitwarden.eu or a self-hosted server | Login items in one folder |
-| 1Password | The 1Password desktop app with **Settings › Developer › Integrate with 1Password CLI** on, and the official 1Password CLI (`op.exe`) | Login items in one vault; a dedicated vault is recommended |
 
 ### 3. Use the host from Codex
 
@@ -157,22 +174,13 @@ The Skill looks up the host, verifies its key, authenticates and returns structu
 > **Telnet has no encryption.** Credentials, commands and output may cross the network in plaintext. Use it only on networks you trust; prefer SSH.
 
 <details>
-<summary><strong>Credential storage and password managers</strong></summary>
+<summary><strong>Login credential storage and caching</strong></summary>
 
 Passwords and key passphrases of local hosts are stored in Windows Credential Manager under the signed-in Windows account. A FIDO PIN is used for the current operation only.
 
-The host store (`hosts.json`) must be owned by the Windows account running `codex-hosts`. Otherwise the MCP server refuses to start and logs the `icacls /setowner` command that repairs it; the window only warns.
+Bitwarden lets you choose when to unlock again. If you keep the session, its key is stored in Windows Credential Manager. The 1Password desktop app handles unlocking and decides how long access lasts.
 
-A Bitwarden or 1Password host is its Login item: alias, endpoint, username, password, description and tags live in the item, the remaining settings in `codex-hosts`. Saving the host in the window writes the item; deleting it moves the Bitwarden item to the trash or archives the 1Password item, so both can be restored. An edit never overwrites an item that was changed in the vault in the meantime.
-
-To move or copy hosts between Windows Credential Manager, Bitwarden and 1Password, right-click a host and choose **Move to** or **Copy to**, or select several under **Batch manage** and choose **Move / copy…**. The login password goes straight from one store to the other; key passphrases, sudo and su passwords, host-key trust and the Advanced settings come along. A copy gets the name `<alias>-copy`, because names are unique across all stores. A move removes the original only after the copy is saved, and a Bitwarden or 1Password original goes to the trash or archive. When the target already has a host with the same name, or one reaching the same server as the same user, the dialog lists it and you choose: **Skip** (the default) leaves both alone, **Overwrite** writes the host over the existing one (a moved host also gives it its name; an existing password stays if the host has none), and **Keep both** adds it with a number after its name. **Batch manage › Delete** sends the items of Bitwarden and 1Password hosts to the trash or archive too.
-
-Repeated vault reads reuse a process-local snapshot of the host facts and login password for **60 idle minutes by default**; every cache hit renews the expiry. Under **Credential services › Login information cache**, set each provider to 0–1440 minutes (0 disables caching) or choose **Clear cache now**. Clearing also notifies other GUI/MCP instances, whose idle caches are erased within about a second. Each provider holds at most 128 hosts, clears expired passwords even while idle, and never writes them to disk. Refreshing the host group, editing an item or changing settings invalidates the relevant snapshots. Bitwarden still checks its session policy on every call and never caches logins under **every call**. External 1Password changes or locks affect cached reads when the cache expires or is cleared; continued cache hits keep renewing it. Editing always reads the current item before checking for conflicts.
-
-Credential-service background tasks show their authorization, sync, read or write stage, total and stage elapsed time, and a **Cancel** button. CLI processes stop and are reaped before the task leaves its busy state. Each task has a 120-second total deadline in addition to shorter CLI limits. Cancellation or timeout during a write may leave completed changes; refresh and check before repeating the action.
-
-- **Bitwarden:** **Ask again** sets how long the vault stays unlocked: every call, until idle for a set time, until `codex-hosts` closes, or until you lock it. The kept session key is stored in Windows Credential Manager, and ending it also runs `bw lock`.
-- **1Password:** `codex-hosts` never handles your account password. The 1Password app asks you to allow codex-hosts and decides how long that lasts. If the app cannot be reached, codex-hosts finds and opens it from registered MSIX packages or common installation folders. Sign-in, unlocking and authorization stay in the 1Password app.
+Vault host details and login passwords are cached in memory for 60 idle minutes by default. Each cache hit restarts the timer. In **Credential services › Login information cache**, you can change the timeout per provider, set it to 0 to disable caching, or clear the cache immediately. Bitwarden does not cache logins when set to ask on every call. If you lock 1Password or change an item outside the app, cached reads can still return the previous login until the cache expires or you clear it.
 
 </details>
 
@@ -198,7 +206,7 @@ While a session is kept, later commands on that host run without authenticating 
 
 `codex-hosts` can hold API keys, tokens and other values unrelated to host login. They live only in the `codex-hosts` process memory, are never returned to Codex, and are injected into the environment of a local program that Codex runs.
 
-Every field requires approval by default: before a program that uses it starts, a dialog asks you. Turn approval off per field, or for every field at once with the window-wide switch (which also applies to fields added later and is kept after a restart; switching it off asks first), to let runs start directly. The editor's bottom bar shows the current run, the latest result and the run history. Values expire when the tray application exits, you sign out or Windows restarts; Codex restarting does not clear them.
+Every field requires approval by default: before a program that uses it starts, a dialog asks you. Turn approval off per field, or for every field at once with the window-wide switch (which also applies to fields added later and is kept after a restart; switching it off asks first), to let runs start directly. Values expire when the tray application exits, you sign out or Windows restarts; Codex restarting does not clear them.
 
 See [`temporary-secrets.md`](skill/codex-hosts/references/temporary-secrets.md).
 
@@ -276,11 +284,11 @@ Every tool returns the same JSON as `structuredContent` and as text, and carries
 | `list_hosts` | Saved hosts with non-secret details, `credential_source`, trust state, `auth_persistence`, `require_call_approval`, sudo/su permissions, `max_channels`, `remote_env` |
 | `agent_identities`, `fido_identities` | Public details of loaded Agent keys and FIDO handles |
 | `probe`, `batch_probe` | Authenticate and run `hostname`; report unknown or changed host keys |
-| `exec`, `exec_stdin`, `exec_many`, `batch_exec` | Run commands; `exec_stdin` is separate because stdin content cannot be reviewed like a command |
+| `exec`, `exec_stdin`, `exec_many`, `batch_exec` | Run commands. Use `exec_stdin` to supply standard input. Automated command rules cannot interpret arbitrary stdin. When SSH call approval is enabled, the user can review the full input in the approval dialog. |
 | `exec_sudo`, `exec_su` | Run an absolute program with exact arguments as the `user` given on each call |
 | `disconnect` | Drop kept sessions |
 | `open_host_editor` | Open the editor prefilled with non-secret details, or to confirm a reported host key |
-| `temporary_secrets_open`, `_status`, `_run`, `_clear` | Memory-only secrets held by the tray application |
+| `temporary_secrets_open`, `_status`, `_run` | Reuse secrets held in tray app memory. Only the user can clear saved values in the temporary secrets window. |
 
 Parameters never contain a password, passphrase or PIN. Timeouts (`connect_timeout_ms`, `command_timeout_ms`, `batch_timeout_ms`) are per call and default to 120 s to connect and 10 minutes per command, or to the host's Advanced defaults. `open_host_editor` accepts `password`, `private-key` (also for FIDO handles) and `ssh-agent` as authentication.
 
@@ -327,10 +335,12 @@ CSV import and export include optional `description` and `tags` columns; the tag
 <details>
 <summary><strong>Limits, timeouts and long-running work</strong></summary>
 
-- One command captures at most **1 MiB** of output; an `exec_many` or batch result at most **8 MiB**. Check `output_truncated`.
+- A single SSH `exec` captures up to **1 MiB** across stdout and stderr. Check `output_truncated` for discarded output.
+- All commands in `exec_many` share **8 MiB**. In `batch_exec` and `batch_probe`, the **8 MiB** budget is divided equally among hosts, up to **2 MiB** per host. The final JSON for each of these three tools is limited to **8 MiB**. Check `output_truncated` on each entry.
+- Telnet returns `OUTPUT_LIMIT` if the captured transcript reaches **1 MiB** before the command completion marker can be read.
 - `tool_timeout_sec` is only a ceiling; each call carries its own, shorter timeout.
 - Commands are never retried automatically, because a remote command may not be safe to run twice.
-- Cancelling a Codex call closes the channel and returns `CANCELLED`; a command that already started may keep running.
+- On cancellation, the client may receive `CANCELLED` or, if it has stopped waiting, no result. A remote command that already started may keep running. Check its state before retrying.
 - Work longer than a few minutes belongs in the remote host's `tmux` / `screen`; see [`long-running.md`](skill/codex-hosts/references/long-running.md).
 
 `probe` and `batch_probe` are marked read-only but still authenticate, so a security key may need a touch. To have Codex confirm them too:

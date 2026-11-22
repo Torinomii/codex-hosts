@@ -294,31 +294,24 @@ impl HostsApp {
         }
     }
 
-    /// The toolbar's state word for a password manager that is set up.
+    /// The toolbar status for a configured and enabled password manager.
     pub(super) fn service_chip(
         &self,
         group: HostGroup,
         visuals: &egui::Visuals,
     ) -> Option<(String, Color32)> {
-        if group == HostGroup::Local || !self.service_configured(group) {
+        if !self.service_ready(group) {
             return None;
         }
-        let provider = group.provider()?;
-        let (key, color) = if !self.store.provider_enabled(provider) {
-            ("service_status_disabled", visuals.weak_text_color())
-        } else {
-            match group {
-                HostGroup::Local => return None,
-                HostGroup::Bitwarden => match self.vault_state {
-                    Some(VaultState::Unlocked) => {
-                        ("bw_status_unlocked", theme::success_color(visuals))
-                    }
-                    Some(VaultState::Locked) => ("bw_status_locked", visuals.warn_fg_color),
-                    Some(VaultState::SignedOut) => ("bw_status_signed_out", visuals.warn_fg_color),
-                    None => ("bw_status_unknown", visuals.weak_text_color()),
-                },
-                HostGroup::OnePassword => self.onepassword_chip(visuals),
-            }
+        let (key, color) = match group {
+            HostGroup::Local => return None,
+            HostGroup::Bitwarden => match self.vault_state {
+                Some(VaultState::Unlocked) => ("bw_status_unlocked", theme::success_color(visuals)),
+                Some(VaultState::Locked) => ("bw_status_locked", visuals.warn_fg_color),
+                Some(VaultState::SignedOut) => ("bw_status_signed_out", visuals.warn_fg_color),
+                None => ("bw_status_unknown", visuals.weak_text_color()),
+            },
+            HostGroup::OnePassword => self.onepassword_chip(visuals),
         };
         Some((
             format!(
